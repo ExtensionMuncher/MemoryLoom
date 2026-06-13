@@ -1,0 +1,1924 @@
+/**
+ * style.css — Memory Loom UI styles
+ *
+ * All styles replicate the approved memory-loom-mockup.html blueprint faithfully.
+ * Colors reference ST's CSS variables where possible, falling back to the mockup's
+ * monochrome dark palette where ST variables don't cover functional colors.
+ *
+ * Typography rules (DO NOT MIX):
+ *   - Prose content (memory entries, scene summaries): Lora, italic
+ *   - UI chrome, labels, metadata, monospace fields: IBM Plex Mono
+ *   - Headings and entry titles: Lora, weight 600
+ *   - Body fallback: Inter (system-ui)
+ *
+ * Color rules:
+ *   - Monochrome dark theme throughout. No decorative color.
+ *   - Functional color only:
+ *     Pinned badge: #cdb97a (muted gold)
+ *     Consolidation entry accent: #4a5a50 (muted green border)
+ *     Low delta flag: #c8884a (amber)
+ *     Commit/approve buttons: #999 border, #e8e4dc text
+ *     Danger/discard buttons: neutral until hover, then muted red
+ */
+
+/* ─── Base Reset ─────────────────────────────────────────── */
+
+/* Prevent other extension panels from bleeding into Memory Loom.
+   Creates a new stacking context and isolates ML from the rest of the drawer. */
+#ml_container {
+    position: relative;
+    z-index: 1;
+}
+
+#ml_container .inline-drawer-content {
+    position: relative;
+    z-index: 1;
+}
+
+.ml-shell, .ml-shell * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+.ml-shell {
+    font-family: 'Inter', system-ui, sans-serif;
+    font-size: 14px;
+    color: #f0ece4;
+    -webkit-font-smoothing: antialiased;
+    position: relative;
+    background: #2c2c2c;
+}
+
+/* ─── Note Banner ────────────────────────────────────────── */
+
+.ml-note {
+    background: #333;
+    border: 1px solid #555;
+    border-left: 3px solid #aaa;
+    border-radius: 4px;
+    padding: 12px 16px;
+    margin-bottom: 14px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #bbb;
+    line-height: 1.7;
+}
+
+/* ─── Inline SVG Icons ───────────────────────────────────── */
+
+.ml-ico {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.ml-ico svg {
+    display: block;
+}
+
+/* ─── Tabs ───────────────────────────────────────────────── */
+
+.ml-tabs {
+    display: flex;
+}
+
+.ml-tab {
+    padding: 8px 16px;
+    cursor: pointer;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    color: #777;
+    border-bottom: 2px solid transparent;
+    text-transform: uppercase;
+    transition: color 0.15s;
+    white-space: nowrap;
+}
+
+.ml-tab:hover {
+    color: #bbb;
+}
+
+.ml-tab.on {
+    color: #f0ece4;
+    border-bottom-color: #ccc8be;
+}
+
+/* ─── Panes ──────────────────────────────────────────────── */
+
+.ml-pane {
+    display: none;
+    padding: 16px;
+}
+
+.ml-pane.on {
+    display: block;
+}
+
+/* ─── Labels ─────────────────────────────────────────────── */
+
+.ml-lbl {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #888;
+    margin-bottom: 10px;
+    display: block;
+}
+
+.ml-rule {
+    border: none;
+    border-top: 1px solid #3a3a3a;
+    margin: 14px 0;
+}
+
+/* ─── Toggle Switch ──────────────────────────────────────── */
+
+.ml-toggle {
+    position: relative;
+    width: 42px;
+    height: 23px;
+    flex-shrink: 0;
+}
+
+.ml-toggle input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+    position: absolute;
+}
+
+.ml-slider {
+    position: absolute;
+    inset: 0;
+    border-radius: 23px;
+    background: #3a3a3a;
+    border: 1px solid #585858;
+    cursor: pointer;
+    transition: .2s;
+}
+
+.ml-slider:before {
+    content: '';
+    position: absolute;
+    width: 17px;
+    height: 17px;
+    left: 2px;
+    top: 2px;
+    border-radius: 50%;
+    background: #777;
+    transition: .2s;
+}
+
+.ml-toggle input:checked + .ml-slider {
+    background: #484848;
+    border-color: #ccc8be;
+}
+
+.ml-toggle input:checked + .ml-slider:before {
+    background: #ccc8be;
+    transform: translateX(19px);
+}
+
+/* ─── Buttons ────────────────────────────────────────────── */
+
+.ml-btn {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    padding: 6px 13px;
+    border: 1px solid #585858;
+    border-radius: 4px;
+    background: transparent;
+    color: #ccc;
+    cursor: pointer;
+    letter-spacing: 0.03em;
+    transition: all 0.15s;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.ml-btn:hover {
+    border-color: #999;
+    color: #f0ece4;
+    background: #363636;
+}
+
+.ml-btn-confirm {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    padding: 6px 13px;
+    border: 1px solid #999;
+    border-radius: 4px;
+    background: transparent;
+    color: #e8e4dc;
+    cursor: pointer;
+    letter-spacing: 0.03em;
+    transition: all 0.15s;
+    white-space: nowrap;
+}
+
+.ml-btn-confirm:hover {
+    border-color: #ccc8be;
+    color: #f0ece4;
+    background: #363636;
+}
+
+.ml-btn-danger {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    padding: 6px 13px;
+    border: 1px solid #585858;
+    border-radius: 4px;
+    background: transparent;
+    color: #aaa;
+    cursor: pointer;
+    letter-spacing: 0.03em;
+    transition: all 0.15s;
+    white-space: nowrap;
+}
+
+.ml-btn-danger:hover {
+    border-color: #884444;
+    color: #dd9999;
+}
+
+.ml-btn-row {
+    display: flex;
+    gap: 7px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+.ml-icon-btn {
+    width: 30px;
+    height: 30px;
+    border: 1px solid #4a4a4a;
+    border-radius: 4px;
+    background: transparent;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+    padding: 0;
+}
+
+.ml-icon-btn:hover {
+    border-color: #888;
+    background: #363636;
+}
+
+.ml-icon-btn:hover svg path,
+.ml-icon-btn:hover svg rect,
+.ml-icon-btn:hover svg circle,
+.ml-icon-btn:hover svg polyline,
+.ml-icon-btn:hover svg line {
+    stroke: #ccc8be !important;
+}
+
+/* ─── Home Tab Control Rows ──────────────────────────────── */
+
+.ml-control-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 0;
+    border-bottom: 1px solid #3a3a3a;
+    gap: 14px;
+}
+
+.ml-control-label {
+    font-size: 15px;
+    font-weight: 500;
+    color: #ece8e0;
+}
+
+.ml-control-sub {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #888;
+    margin-top: 3px;
+}
+
+/* ─── Writer Active Indicator ────────────────────────────── */
+
+.ml-writer-active {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 13px;
+    border: 1px solid #4a4a4a;
+    border-radius: 4px;
+    background: #323232;
+    margin-bottom: 14px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    color: #bbb;
+}
+
+.ml-pulse {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #ccc8be;
+    flex-shrink: 0;
+    animation: ml-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes ml-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.15; }
+}
+
+/* ─── Pending Badge ──────────────────────────────────────── */
+
+.ml-pending-badge {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    padding: 2px 8px;
+    border: 1px solid #585858;
+    border-radius: 3px;
+    color: #bbb;
+}
+
+/* ─── Message Button Demo ────────────────────────────────── */
+
+.ml-msg-btn-demo {
+    background: #323232;
+    border: 1px solid #484848;
+    border-radius: 4px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+}
+
+.ml-msg-btn-demo-title {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #999;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: 13px;
+}
+
+.ml-msg-btn-states {
+    display: flex;
+    gap: 28px;
+    flex-wrap: wrap;
+}
+
+.ml-msg-btn-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 7px;
+}
+
+.ml-msg-btn {
+    width: 36px;
+    height: 36px;
+    border: 1px solid #585858;
+    border-radius: 4px;
+    background: #3a3a3a;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+.ml-msg-btn:hover {
+    border-color: #aaa;
+    background: #444;
+}
+
+.ml-msg-btn.active {
+    border-color: #ccc8be;
+    background: #404040;
+}
+
+.ml-msg-btn.locked {
+    border-color: #383838;
+    background: #2e2e2e;
+    cursor: default;
+}
+
+.ml-msg-btn-label {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    color: #888;
+    text-align: center;
+    line-height: 1.5;
+}
+
+/* ─── Entry Card (Home tab pending entries) ──────────────── */
+
+.ml-entry-card {
+    border: 1px solid #404040;
+    border-radius: 4px;
+    margin-bottom: 8px;
+    overflow: hidden;
+    background: #303030;
+}
+
+.ml-entry-card-hdr {
+    padding: 12px 14px;
+    cursor: pointer;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    transition: background 0.1s;
+}
+
+.ml-entry-card-hdr:hover {
+    background: #363636;
+}
+
+.ml-entry-card.open .ml-entry-card-hdr {
+    border-bottom: 1px solid #3a3a3a;
+}
+
+.ml-entry-title {
+    font-family: 'Lora', Georgia, serif;
+    font-size: 16px;
+    font-weight: 600;
+    color: #f0ece4;
+    line-height: 1.3;
+    margin-bottom: 4px;
+}
+
+.ml-entry-meta {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #888;
+}
+
+.ml-entry-card-body {
+    padding: 14px;
+    display: none;
+}
+
+.ml-entry-card.open .ml-entry-card-body {
+    display: block;
+}
+
+.ml-entry-prose {
+    white-space: pre-wrap; /* preserve line breaks from saved content */
+    font-family: 'Lora', Georgia, serif;
+    font-size: 14px;
+    font-style: italic;
+    line-height: 1.85;
+    color: #ccc8c0;
+    margin-bottom: 13px;
+    border-left: 2px solid #484848;
+    padding-left: 14px;
+}
+
+.ml-entry-chars {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #888;
+    margin-bottom: 12px;
+    line-height: 1.7;
+}
+
+.ml-entry-chars span {
+    color: #bbb;
+}
+
+.ml-regen-box {
+    background: #2a2a2a;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    padding: 11px;
+    margin-top: 10px;
+    display: none;
+}
+
+.ml-regen-box.open {
+    display: block;
+}
+
+.ml-regen-hint {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #888;
+    margin-bottom: 8px;
+}
+
+.ml-chevron-icon {
+    transition: transform 0.2s;
+    flex-shrink: 0;
+    margin-top: 2px;
+}
+
+.ml-entry-card.open .ml-chevron-icon {
+    transform: rotate(180deg);
+}
+
+/* ─── Library: Segmented Control ─────────────────────────── */
+
+.ml-seg-control {
+    display: flex;
+    border: 1px solid #484848;
+    border-radius: 4px;
+    overflow: hidden;
+    width: fit-content;
+}
+
+.ml-seg-btn {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    padding: 7px 18px;
+    background: transparent;
+    border: none;
+    color: #888;
+    cursor: pointer;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    transition: all 0.15s;
+}
+
+.ml-seg-btn.on {
+    background: #3e3e3e;
+    color: #e8e4dc;
+}
+
+.ml-seg-btn:not(.on):hover {
+    color: #bbb;
+}
+
+/* ─── Library: Filter Bar ────────────────────────────────── */
+
+.ml-filter-bar {
+    display: flex;
+    gap: 7px;
+    margin-bottom: 13px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.ml-filter-input {
+    flex: 1;
+    min-width: 120px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    padding: 7px 10px;
+    background: #282828;
+    border: 1px solid #484848;
+    border-radius: 4px;
+    color: #ccc;
+}
+
+.ml-filter-input::placeholder {
+    color: #555;
+}
+
+.ml-filter-input:focus {
+    outline: none;
+    border-color: #777;
+    color: #f0ece4;
+}
+
+.ml-filter-select {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    padding: 7px 9px;
+    background: #282828;
+    border: 1px solid #484848;
+    border-radius: 4px;
+    color: #aaa;
+    cursor: pointer;
+}
+
+/* ─── Library: Folder Tree ───────────────────────────────── */
+
+.ml-folder {
+    border: 1px solid #3e3e3e;
+    border-radius: 4px;
+    margin-bottom: 7px;
+    overflow: hidden;
+}
+
+.ml-folder-hdr {
+    padding: 11px 13px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    cursor: pointer;
+    background: #323232;
+    transition: background 0.1s;
+}
+
+.ml-folder-hdr:hover {
+    background: #383838;
+}
+
+.ml-folder-name {
+    font-size: 15px;
+    font-weight: 500;
+    color: #e0dcd4;
+    flex: 1;
+}
+
+.ml-folder-count {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #666;
+}
+
+.ml-folder-chevron {
+    transition: transform 0.2s;
+    flex-shrink: 0;
+}
+
+.ml-folder.open > .ml-folder-hdr .ml-folder-chevron {
+    transform: rotate(180deg);
+}
+
+.ml-folder-body {
+    display: none;
+    border-top: 1px solid #383838;
+}
+
+.ml-folder.open > .ml-folder-body {
+    display: block;
+}
+
+/* ─── Library: Character Subfolder ───────────────────────── */
+
+.ml-char-subfolder {
+    border-bottom: 1px solid #383838;
+}
+
+.ml-char-subfolder:last-child {
+    border-bottom: none;
+}
+
+.ml-char-subfolder-hdr {
+    padding: 10px 13px 10px 26px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    background: #2e2e2e;
+    transition: background 0.1s;
+}
+
+.ml-char-subfolder-hdr:hover {
+    background: #343434;
+}
+
+.ml-char-subfolder.open > .ml-char-subfolder-hdr {
+    border-bottom: 1px solid #383838;
+}
+
+.ml-sub-arrow {
+    transition: transform 0.2s;
+    flex-shrink: 0;
+}
+
+.ml-char-subfolder.open > .ml-char-subfolder-hdr .ml-sub-arrow {
+    transform: rotate(90deg);
+}
+
+.ml-char-subfolder-name {
+    font-size: 14px;
+    color: #d4d0c8;
+    flex: 1;
+    font-weight: 500;
+}
+
+.ml-char-subfolder-count {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #666;
+}
+
+.ml-char-subfolder-body {
+    display: none;
+}
+
+.ml-char-subfolder.open > .ml-char-subfolder-body {
+    display: block;
+}
+
+/* ─── Library: Character Banner ──────────────────────────── */
+
+.ml-char-banner {
+    width: 100%;
+    height: 110px;
+    overflow: hidden;
+    position: relative;
+    background: #222;
+}
+
+.ml-char-banner img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: center top;
+    filter: brightness(0.92);
+    display: block;
+}
+
+.ml-char-banner-gradient {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 55px;
+    background: linear-gradient(to bottom, transparent, #2e2e2e);
+    pointer-events: none;
+}
+
+/* ─── Library: Character Info Row ────────────────────────── */
+
+.ml-char-info-row {
+    display: flex;
+    align-items: center;
+    padding: 10px 13px;
+    background: #2a2a2a;
+    border-bottom: 1px solid #383838;
+    gap: 10px;
+}
+
+.ml-char-name {
+    font-family: 'Lora', Georgia, serif;
+    font-size: 16px;
+    font-weight: 600;
+    color: #ece8e0;
+    flex: 1;
+}
+
+.ml-char-stats-line {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #777;
+    margin-top: 3px;
+}
+
+/* ─── Library: Memory Entries ────────────────────────────── */
+
+.ml-mem-entry {
+    border-bottom: 1px solid #383838;
+    padding: 12px 13px;
+    cursor: pointer;
+    transition: background 0.1s;
+}
+
+.ml-mem-entry:last-child {
+    border-bottom: none;
+}
+
+.ml-mem-entry:hover {
+    background: #333;
+}
+
+.ml-mem-entry-title {
+    font-family: 'Lora', Georgia, serif;
+    font-size: 15px;
+    font-weight: 600;
+    color: #e4e0d8;
+    margin-bottom: 3px;
+    line-height: 1.3;
+}
+
+.ml-mem-entry-date {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #666;
+    margin-bottom: 7px;
+}
+
+.ml-mem-entry-preview {
+    font-family: 'Lora', Georgia, serif;
+    font-size: 13px;
+    font-style: italic;
+    color: #888;
+    line-height: 1.6;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.ml-mem-entry-tags {
+    display: flex;
+    gap: 5px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+}
+
+.ml-tag {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    padding: 2px 7px;
+    border: 1px solid #3e3e3e;
+    border-radius: 3px;
+    color: #777;
+}
+
+/* ─── Library: Expanded Memory ───────────────────────────── */
+
+.ml-mem-full {
+    display: none;
+    padding: 14px;
+    background: #282828;
+    border-bottom: 1px solid #383838;
+}
+
+.ml-mem-full.open {
+    display: block;
+}
+
+.ml-mem-full-title {
+    font-family: 'Lora', Georgia, serif;
+    font-size: 17px;
+    font-weight: 600;
+    color: #f0ece4;
+    margin-bottom: 3px;
+}
+
+.ml-mem-full-date {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #777;
+    margin-bottom: 12px;
+}
+
+.ml-mem-full-rule {
+    border: none;
+    border-top: 1px solid #383838;
+    margin: 10px 0;
+}
+
+.ml-mem-full-prose {
+    white-space: pre-wrap; /* preserve line breaks from saved content */
+    font-family: 'Lora', Georgia, serif;
+    font-size: 14px;
+    font-style: italic;
+    line-height: 1.9;
+    color: #bab6ae;
+    margin-bottom: 13px;
+}
+
+.ml-mem-full-chars {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #777;
+    line-height: 1.8;
+    margin-bottom: 11px;
+}
+
+.ml-mem-full-chars span {
+    color: #bbb;
+}
+
+/* ─── Status Badges ──────────────────────────────────────── */
+
+.ml-status-badge {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    padding: 2px 7px;
+    border-radius: 3px;
+    letter-spacing: 0.03em;
+    flex-shrink: 0;
+}
+
+.ml-status-consolidated {
+    border: 1px solid #555;
+    color: #999;
+    background: #2a2a2a;
+}
+
+.ml-status-archived {
+    border: 1px solid #3a3a3a;
+    color: #666;
+    background: #222;
+}
+
+.ml-status-pinned {
+    border: 1px solid #8a8060;
+    color: #cdb97a;
+    background: #2a2820;
+}
+
+.ml-status-superseded {
+    border: 1px solid #3a3a3a;
+    color: #555;
+    background: #222;
+    text-decoration: line-through;
+}
+
+/* ─── Delta Flag (low-delta warning) ─────────────────────── */
+
+.ml-delta-flag {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 3px;
+    letter-spacing: 0.03em;
+    border: 1px solid #6a4f30;
+    color: #c8884a;
+    background: #231a10;
+    flex-shrink: 0;
+}
+
+/* ─── Library: Scene Summaries ───────────────────────────── */
+
+.ml-scene-info {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    color: #aaa;
+    margin-bottom: 14px;
+    line-height: 1.7;
+    padding: 11px 13px;
+    background: #323232;
+    border: 1px solid #484848;
+    border-radius: 4px;
+}
+
+.ml-scene-entry {
+    border: 1px solid #3e3e3e;
+    border-radius: 4px;
+    margin-bottom: 7px;
+    overflow: hidden;
+}
+
+.ml-scene-hdr {
+    padding: 11px 13px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+    background: #323232;
+    transition: background 0.1s;
+}
+
+.ml-scene-hdr:hover {
+    background: #383838;
+}
+
+.ml-scene-entry.open .ml-scene-hdr {
+    border-bottom: 1px solid #383838;
+}
+
+.ml-scene-num {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    color: #999;
+    flex-shrink: 0;
+}
+
+.ml-scene-title {
+    font-size: 14px;
+    color: #d0ccc4;
+    flex: 1;
+    font-weight: 500;
+}
+
+.ml-scene-badge {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    padding: 2px 8px;
+    border: 1px solid #484848;
+    border-radius: 3px;
+    color: #888;
+    flex-shrink: 0;
+}
+
+.ml-scene-body {
+    padding: 14px;
+    display: none;
+    background: #282828;
+}
+
+.ml-scene-entry.open .ml-scene-body {
+    display: block;
+}
+
+/* ─── Settings: Accordion ────────────────────────────────── */
+
+.ml-accordion {
+    margin-bottom: 5px;
+}
+
+.ml-acc-hdr {
+    padding: 12px 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    border: 1px solid #3e3e3e;
+    border-radius: 4px;
+    background: #323232;
+    transition: background 0.1s;
+}
+
+.ml-acc-hdr:hover {
+    background: #383838;
+}
+
+.ml-accordion.open .ml-acc-hdr {
+    border-radius: 4px 4px 0 0;
+    border-bottom-color: #242424;
+}
+
+.ml-acc-title {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    color: #ccc;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.ml-acc-chevron {
+    transition: transform 0.2s;
+}
+
+.ml-accordion.open .ml-acc-chevron {
+    transform: rotate(180deg);
+}
+
+.ml-acc-body {
+    border: 1px solid #3e3e3e;
+    border-top: none;
+    border-radius: 0 0 4px 4px;
+    padding: 13px;
+    display: none;
+    background: #282828;
+}
+
+.ml-accordion.open .ml-acc-body {
+    display: block;
+}
+
+.ml-setting-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 0;
+    border-bottom: 1px solid #363636;
+    gap: 14px;
+}
+
+.ml-setting-row:last-child {
+    border-bottom: none;
+}
+
+.ml-setting-label {
+    font-size: 14px;
+    font-weight: 500;
+    color: #ddd8d0;
+}
+
+.ml-setting-sub {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #777;
+    margin-top: 3px;
+}
+
+/* ─── Form Elements ──────────────────────────────────────── */
+
+.ml-shell textarea,
+.ml-shell select,
+.ml-shell input[type=number],
+.ml-shell input[type=text] {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    padding: 7px 10px;
+    background: #222;
+    border: 1px solid #484848;
+    border-radius: 4px;
+    color: #ccc;
+    width: 100%;
+    resize: vertical;
+    line-height: 1.6;
+}
+
+.ml-shell select {
+    width: auto;
+    cursor: pointer;
+}
+
+.ml-shell input[type=number] {
+    width: 64px;
+    text-align: center;
+    resize: none;
+}
+
+.ml-shell textarea:focus,
+.ml-shell select:focus,
+.ml-shell input:focus {
+    outline: none;
+    border-color: #777;
+    color: #f0ece4;
+}
+
+/* ─── Decay Sub-Settings ─────────────────────────────────── */
+
+.ml-decay-settings {
+    display: none;
+    background: #222;
+    border: 1px solid #3e3e3e;
+    border-radius: 4px;
+    margin-top: 9px;
+    overflow: hidden;
+    width: 100%;
+}
+
+.ml-decay-settings.open {
+    display: block;
+}
+
+.ml-decay-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 9px 12px;
+    border-bottom: 1px solid #333;
+    gap: 14px;
+}
+
+.ml-decay-row:last-child {
+    border-bottom: none;
+}
+
+.ml-decay-label {
+    font-size: 13px;
+    color: #ccc8c0;
+    font-weight: 500;
+}
+
+.ml-decay-sub {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    color: #666;
+    margin-top: 2px;
+}
+
+/* ─── Crop Modal ─────────────────────────────────────────── */
+
+.ml-crop-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.72);
+    z-index: 1000;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+}
+
+.ml-crop-overlay.open {
+    display: flex;
+}
+
+.ml-crop-modal {
+    background: #2c2c2c;
+    border: 1px solid #555;
+    border-radius: 6px;
+    padding: 18px;
+    width: 560px;
+    max-width: 95vw;
+    max-height: 90vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.ml-crop-title {
+    font-family: 'Lora', Georgia, serif;
+    font-size: 16px;
+    font-weight: 600;
+    color: #f0ece4;
+}
+
+.ml-crop-sub {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #888;
+}
+
+.ml-crop-wrap {
+    position: relative;
+    overflow: hidden;
+    background: #111;
+    border-radius: 4px;
+    user-select: none;
+}
+
+.ml-crop-wrap img {
+    display: block;
+    max-width: 100%;
+    pointer-events: none;
+    draggable: false;
+}
+
+.ml-crop-overlay-box {
+    position: absolute;
+    border: 2px dashed #fff;
+    box-shadow: 0 0 0 9999px rgba(0,0,0,0.5);
+    pointer-events: none;
+    box-sizing: border-box;
+}
+
+.ml-crop-handle {
+    position: absolute;
+    width: 14px;
+    height: 14px;
+    background: #fff;
+    border: 2px solid #333;
+    border-radius: 2px;
+    z-index: 2;
+}
+
+.ml-crop-handle.nw { cursor: nwse-resize; }
+.ml-crop-handle.ne { cursor: nesw-resize; }
+.ml-crop-handle.sw { cursor: nesw-resize; }
+.ml-crop-handle.se { cursor: nwse-resize; }
+
+/* ─── Expand Popout Button ───────────────────────────────── */
+
+.ml-expand-btn {
+    width: 18px;
+    height: 18px;
+    border: none;
+    background: transparent;
+    color: #bbb;
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+    padding: 0;
+    flex-shrink: 0;
+}
+
+.ml-expand-btn:hover {
+    color: #ccc8be;
+}
+
+/* Label + expand button row above each editable field */
+.ml-field-hdr {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    margin-bottom: 5px;
+}
+
+.ml-field-hdr .ml-form-label {
+    margin-bottom: 0;
+}
+
+/* ─── Popout Editor ──────────────────────────────────────── */
+
+.ml-popout-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.75);
+    z-index: 2000;
+    align-items: center;
+    justify-content: center;
+    padding: 30px 20px;
+}
+
+.ml-popout-overlay.open {
+    display: flex;
+}
+
+.ml-popout-box {
+    background: #2c2c2c;
+    border: 1px solid #555;
+    border-radius: 6px;
+    padding: 16px;
+    width: 600px;
+    max-width: 96vw;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.ml-popout-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.ml-popout-title {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    color: #aaa;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}
+
+.ml-popout-close {
+    font-size: 16px;
+    color: #666;
+    cursor: pointer;
+    background: none;
+    border: none;
+    line-height: 1;
+    padding: 2px 4px;
+}
+
+.ml-popout-close:hover {
+    color: #ccc;
+}
+
+.ml-popout-textarea {
+    font-family: 'Lora', Georgia, serif;
+    font-size: 14px;
+    font-style: italic;
+    padding: 10px 12px;
+    background: #1e1e1e;
+    border: 1px solid #484848;
+    border-radius: 4px;
+    color: #ddd;
+    resize: vertical;
+    min-height: 280px;
+    line-height: 1.8;
+    width: 100%;
+}
+
+.ml-popout-textarea:focus {
+    outline: none;
+    border-color: #777;
+    color: #f0ece4;
+}
+
+/* ─── Shared Modal Overlay ───────────────────────────────── */
+
+.ml-modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.72);
+    z-index: 999;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 40px 20px;
+    overflow-y: auto;
+}
+
+.ml-modal-overlay.open {
+    display: flex;
+}
+
+.ml-modal {
+    background: #2c2c2c;
+    border: 1px solid #555;
+    border-radius: 6px;
+    padding: 20px;
+    width: 520px;
+    max-width: 95vw;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.ml-modal-title {
+    font-family: 'Lora', Georgia, serif;
+    font-size: 17px;
+    font-weight: 600;
+    color: #f0ece4;
+}
+
+.ml-modal-sub {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #aaa;
+    margin-top: 3px;
+}
+
+/* ─── Form Rows and Groups ───────────────────────────────── */
+
+.ml-form-group {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.ml-form-label {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #bbb;
+}
+
+.ml-form-hint {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    color: #999;
+    line-height: 1.5;
+}
+
+.ml-form-input,
+.ml-form-select,
+.ml-form-textarea {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    padding: 8px 10px;
+    background: #1e1e1e;
+    border: 1px solid #484848;
+    border-radius: 4px;
+    color: #ddd;
+    width: 100%;
+    line-height: 1.5;
+}
+
+.ml-form-textarea {
+    resize: vertical;
+    min-height: 110px;
+    font-family: 'Lora', Georgia, serif;
+    font-size: 13px;
+    font-style: italic;
+}
+
+.ml-form-input:focus,
+.ml-form-select:focus,
+.ml-form-textarea:focus {
+    outline: none;
+    border-color: #777;
+    color: #f0ece4;
+}
+
+.ml-form-select {
+    cursor: pointer;
+}
+
+.ml-form-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    align-items: start;
+}
+
+/* ─── Tag-Style Multi-Character Input ────────────────────── */
+
+.ml-char-tag-input {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 7px 10px;
+    background: #1e1e1e;
+    border: 1px solid #484848;
+    border-radius: 4px;
+    cursor: text;
+    min-height: 38px;
+    align-items: center;
+}
+
+.ml-char-tag {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    background: #333;
+    border: 1px solid #555;
+    border-radius: 3px;
+    padding: 2px 8px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #ddd;
+}
+
+.ml-char-tag-x {
+    color: #888;
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+}
+
+.ml-char-tag-x:hover {
+    color: #cc8888;
+}
+
+.ml-char-tag-ghost {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #555;
+    background: transparent;
+    border: none;
+    outline: none;
+    min-width: 80px;
+    flex: 1;
+}
+
+/* ─── Pill Selector (folder type) ────────────────────────── */
+
+.ml-pill-row {
+    display: flex;
+    gap: 7px;
+    flex-wrap: wrap;
+}
+
+.ml-pill {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    padding: 5px 14px;
+    border: 1px solid #484848;
+    border-radius: 20px;
+    background: transparent;
+    color: #888;
+    cursor: pointer;
+    letter-spacing: 0.03em;
+    transition: all 0.15s;
+}
+
+.ml-pill:hover {
+    border-color: #888;
+    color: #ccc;
+}
+
+.ml-pill.on {
+    border-color: #ccc8be;
+    color: #e8e4dc;
+    background: #333;
+}
+
+/* ─── Routing Preview ────────────────────────────────────── */
+
+.ml-route-preview {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #888;
+    padding: 8px 11px;
+    background: #1e1e1e;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    line-height: 1.6;
+}
+
+.ml-route-preview span {
+    color: #ccc8be;
+}
+
+/* ─── Loading Overlay ────────────────────────────────────── */
+
+.ml-loading-overlay {
+    position: relative;
+    padding: 12px 14px;
+    background: #2a2a2a;
+    border: 1px solid #484848;
+    border-radius: 4px;
+    margin-top: 8px;
+}
+
+.ml-loading-content {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    justify-content: center;
+}
+
+.ml-loading-spinner {
+    width: 14px;
+    height: 14px;
+    border: 2px solid #484848;
+    border-top: 2px solid #ccc8be;
+    border-radius: 50%;
+    animation: ml-spin 0.8s linear infinite;
+}
+
+@keyframes ml-spin {
+    to { transform: rotate(360deg); }
+}
+
+#ml-loading-text {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #aaa;
+}
+
+/* ─── Message Action Buttons (on chat messages) ──────────── */
+
+.ml-scene-btn {
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 4px;
+    flex-shrink: 0;
+    opacity: 0.65;
+    transition: opacity 0.2s, background 0.15s;
+    color: var(--SmartThemeBodyColor, #ccc);
+}
+
+.ml-scene-btn:hover {
+    opacity: 1;
+    background: var(--SmartThemeBlurTintColor, rgba(255,255,255,0.08));
+}
+
+.ml-scene-btn.ml-scene-active {
+    opacity: 1;
+    color: var(--SmartThemeBodyColor, #ccc);
+}
+
+.ml-scene-btn.ml-scene-locked {
+    opacity: 0.3;
+    cursor: default;
+    pointer-events: none;
+}
+
+.ml-scene-btn.ml-scene-processing {
+    opacity: 1;
+    cursor: wait;
+    animation: ml-pulse 1.2s ease-in-out infinite;
+}
+
+/* ─── Disabled State ─────────────────────────────────────── */
+
+body.ml-disabled .ml-scene-btn {
+    display: none !important;
+}
+
+/* ─── Magic Wand Popout ─────────────────────────────────── */
+/* Copied from RST's popout pattern. The popout is a floating
+   draggable window that contains the ML panel when opened from
+   the magic wand menu. Content is MOVED (not cloned) between
+   drawer and popout to avoid duplicate DOM IDs. */
+
+#ml-popout {
+    display: none;
+    position: fixed;
+    top: var(--topBarBlockSize, 45px);
+    left: 0;
+    width: calc((100vw - var(--sheldWidth, 800px)) / 2);
+    max-width: 90vw;
+    max-height: calc(100dvh - var(--topBarBlockSize, 45px));
+    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.85));
+    border: 0;
+    border-top: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 25%, transparent);
+    border-right: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 15%, transparent);
+    border-radius: 0;
+    box-shadow: 2px 0 15px color-mix(in srgb, var(--SmartThemeShadowColor, #000) 50%, transparent);
+    z-index: 10000;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    backdrop-filter: blur(var(--SmartThemeBlurStrength, 10px));
+    -webkit-backdrop-filter: blur(var(--SmartThemeBlurStrength, 10px));
+}
+
+#ml-popout:not([style*="display: none"]) {
+    display: flex !important;
+}
+
+.ml-popout-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 15px;
+    background: color-mix(in srgb, var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.5)) 80%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 25%, transparent);
+    cursor: move;
+    user-select: none;
+    flex-shrink: 0;
+}
+
+.ml-popout-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    color: var(--SmartThemeBodyColor, #ccc);
+    letter-spacing: 0.03em;
+}
+
+.ml-popout-title i {
+    font-size: 14px;
+    color: var(--SmartThemeBodyColor, #ccc);
+}
+
+.ml-popout-close {
+    font-size: 16px;
+    color: var(--SmartThemeBodyColor, #ccc);
+    cursor: pointer;
+    background: none;
+    border: none;
+    line-height: 1;
+    padding: 4px 6px;
+    border-radius: 3px;
+    transition: all 0.15s;
+    opacity: 0.6;
+}
+
+.ml-popout-close:hover {
+    opacity: 1;
+    background: color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 15%, transparent);
+}
+
+#ml-popout-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0;
+}
+
+/* Shell and drawer overrides inside popout */
+#ml-popout .ml-shell {
+    max-width: none;
+    border: none;
+    border-radius: 0;
+}
+
+/* Ensure inline-drawer content is always visible in the popout */
+#ml-popout .inline-drawer-content {
+    display: block !important;
+}
+
+/* Responsive: full-width on narrow screens */
+@media (max-width: 1000px) {
+    #ml-popout {
+        width: 100%;
+        max-width: 100vw;
+        left: 0;
+    }
+}
+
+/* Scene title & summary inputs — match ST dark theme */
+.ml-scene-title-input {
+    background: transparent !important;
+    color: var(--SmartThemeBodyColor, #ccc) !important;
+    border: none !important;
+    outline: none !important;
+    width: 100%;
+    font-weight: 600;
+}
+#ml-p-library textarea {
+    background: transparent !important;
+    color: var(--SmartThemeBodyColor, #ccc) !important;
+    border-color: var(--SmartThemeBorderColor, #444) !important;
+}
+
+/* Delta / Impact display in library entries */
+.ml-delta-display {
+    display: none;
+    background: rgba(127, 119, 221, 0.08);
+    border: 1px solid rgba(127, 119, 221, 0.2);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+    font-size: 12px;
+    line-height: 1.7;
+}
+.ml-delta-display.open {
+    display: block;
+}
+.ml-delta-header {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    color: #999;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+}
+.ml-delta-row {
+    margin-bottom: 5px;
+    color: var(--SmartThemeBodyColor, #ccc);
+}
+.ml-delta-label {
+    display: inline-block;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    color: #888;
+    min-width: 45px;
+    margin-right: 8px;
+}
+.ml-delta-tags {
+    display: flex;
+    gap: 5px;
+    flex-wrap: wrap;
+    margin-top: 6px;
+}
+
+/* Pending-entry edit form — match the Narrative textarea look exactly so no field
+   renders as a white box regardless of ST theme/css load order */
+.ml-edit-form input.form-input,
+.ml-edit-form input[type="text"],
+.ml-edit-form input {
+    background: var(--SmartThemeBlurTintColor, rgba(0,0,0,0.3)) !important;
+    color: var(--SmartThemeBodyColor, #ccc) !important;
+    border: 1px solid var(--SmartThemeBorderColor, #555) !important;
+    border-radius: 4px;
+    -webkit-appearance: none;
+    appearance: none;
+}
+
+
+/* Pending edit form — single-row textareas styled identically to the Narrative box */
+.ml-edit-form textarea.ml-edit-mini,
+.ml-edit-form textarea.ml-edit-narrative {
+    background: var(--SmartThemeBlurTintColor, rgba(0,0,0,0.3)) !important;
+    color: var(--SmartThemeBodyColor, #ccc) !important;
+    border: 1px solid var(--SmartThemeBorderColor, #555) !important;
+    border-radius: 4px;
+    width: 100%;
+    resize: vertical;
+    -webkit-appearance: none;
+    appearance: none;
+}
+.ml-edit-form .ml-field-row { display: flex; align-items: center; gap: 6px; }
+.ml-edit-form .ml-field-row .ml-fh { font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #666; }
+
+
+/* ─── Pending entry character groups ─── */
+.ml-pending-group {
+    border: 1px solid #333;
+    border-radius: 6px;
+    margin-bottom: 9px;
+    overflow: hidden;
+}
+.ml-pending-group-hdr {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 12px;
+    cursor: pointer;
+    background: #1d1d1d;
+    user-select: none;
+}
+.ml-pending-group-hdr:hover { background: #242424; }
+.ml-pending-group-hdr svg { transition: transform 0.18s ease; transform: rotate(-90deg); }
+.ml-pending-group.open .ml-pending-group-hdr svg { transform: rotate(0deg); }
+.ml-pending-group-name {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    font-weight: 600;
+    color: #ccc;
+}
+.ml-pending-group-body { display: none; padding: 10px 10px 4px; }
+.ml-pending-group.open .ml-pending-group-body { display: block; }
+
+/* ─── Character folder alias editor ─── */
+.ml-alias-row { padding: 8px 2px 10px; }
+.ml-alias-row .ml-alias-input {
+    width: 100%;
+    background: #1a1a1a;
+    border: 1px solid #333;
+    border-radius: 4px;
+    color: #ccc;
+    font-size: 12px;
+    padding: 6px 9px;
+    font-family: 'IBM Plex Mono', monospace;
+}
+
+/* ─── Entry move picker ─── */
+.ml-move-row select { font-size: 12px; }
+
+/* ─── Consolidation popout ─── */
+.ml-consld-cols { display: flex; gap: 12px; margin: 12px 0; }
+.ml-consld-col { flex: 1; min-width: 0; }
+.ml-consld-col-hdr {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 6px;
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.06em; color: #999;
+}
+.ml-consld-list {
+    border: 1px solid #333; border-radius: 6px;
+    max-height: 280px; overflow-y: auto; background: #181818;
+}
+.ml-consld-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 10px; cursor: pointer;
+    border-bottom: 1px solid #262626;
+}
+.ml-consld-row:last-child { border-bottom: none; }
+.ml-consld-row:hover { background: #202020; }
+.ml-consld-row input { flex-shrink: 0; }
+.ml-consld-row-title {
+    font-size: 12px; color: #ddd; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; flex: 1;
+}
+.ml-consld-row-meta {
+    font-family: 'IBM Plex Mono', monospace; font-size: 10px;
+    color: #777; flex-shrink: 0; max-width: 45%;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ml-consld-empty {
+    padding: 16px; text-align: center; color: #666;
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+}
+.ml-consld-count {
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+    color: #aaa; text-align: center; margin: 4px 0 12px;
+}
+
+/* ─── Core/important memory star ─── */
+.ml-star {
+    color: #e8b84b;
+    font-size: 12px;
+    margin-right: 2px;
+}
+.ml-important-row input { flex-shrink: 0; }
