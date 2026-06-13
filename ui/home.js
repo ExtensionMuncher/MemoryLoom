@@ -38,40 +38,55 @@ function renderPendingSection($pane) {
     const p = getPendingEntries(), pl = p ? (Array.isArray(p)?p:Object.values(p)) : [];
     if (!pl.length) { $pane.append('<div style="padding:20px 0;text-align:center;color:#666;font-family:\'IBM Plex Mono\',monospace;font-size:12px">No pending entries.<br><span style="font-size:11px;color:#555">Close a scene to generate memory entries.</span></div>'); return; }
     $pane.append(`<div style="display:flex;align-items:center;gap:9px;margin-bottom:12px"><span class="ml-lbl" style="margin-bottom:0">Pending entries</span><span class="ml-pending-badge">${pl.length} pending</span></div>`);
-    // ── Group pending entries by character ───────────────
-    // Temporary visual folders: one per character, holding that character's
-    // pending entries. They exist only while entries are pending — committing
-    // or discarding everything in a group makes it vanish on re-render.
-    // Cards keep their ORIGINAL index into the pending list, so commit /
-    // discard / edit / regen handlers are untouched by the grouping.
-    const groups = new Map();
+    // ── Split pending entries: World vs Character ────────
+    // World memories are kept in their own clearly-divided section so they
+    // never blend into the per-character groups. Every card keeps its ORIGINAL
+    // index into the full pending list, so commit/discard/edit/regen are
+    // untouched regardless of how we visually group.
+    const charItems = [];   // [entry, originalIndex]
+    const worldItems = [];
     pl.forEach((e, i) => {
-        const key = (e.primaryCharacter || (e.primaryCharacters || []).join(", ") || "Unassigned").trim() || "Unassigned";
-        if (!groups.has(key)) groups.set(key, []);
-        groups.get(key).push([e, i]);
+        if ((e.category || "character") === "world") worldItems.push([e, i]);
+        else charItems.push([e, i]);
     });
-    if (groups.size <= 1) {
-        // Single character (or none) — flat list, no folder chrome needed
-        pl.forEach((e,i) => $pane.append(renderCard(e,i,$pane)));
-    } else {
-        // Collapse by default on big batches (post-batch-scan), open on small ones
-        const startOpen = pl.length <= 8;
-        for (const [charName, items] of groups) {
-            const $grp = $(`
-                <div class="ml-pending-group${startOpen ? " open" : ""}">
-                    <div class="ml-pending-group-hdr">
-                        ${iconSvg("ico-chevron-down", 14, 14, "#666")}
-                        <span class="ml-pending-group-name">${h(charName)}</span>
-                        <span class="ml-pending-badge">${items.length}</span>
+
+    // Character section — grouped by character
+    if (charItems.length > 0) {
+        const groups = new Map();
+        charItems.forEach(([e, i]) => {
+            const key = (e.primaryCharacter || (e.primaryCharacters || []).join(", ") || "Unassigned").trim() || "Unassigned";
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push([e, i]);
+        });
+        $pane.append(`<div class="ml-pending-section-label">Character memories</div>`);
+        if (groups.size <= 1) {
+            charItems.forEach(([e, i]) => $pane.append(renderCard(e, i, $pane)));
+        } else {
+            const startOpen = charItems.length <= 8;
+            for (const [charName, items] of groups) {
+                const $grp = $(`
+                    <div class="ml-pending-group${startOpen ? " open" : ""}">
+                        <div class="ml-pending-group-hdr">
+                            ${iconSvg("ico-chevron-down", 14, 14, "#666")}
+                            <span class="ml-pending-group-name">${h(charName)}</span>
+                            <span class="ml-pending-badge">${items.length}</span>
+                        </div>
+                        <div class="ml-pending-group-body"></div>
                     </div>
-                    <div class="ml-pending-group-body"></div>
-                </div>
-            `);
-            const $gb = $grp.find(".ml-pending-group-body");
-            items.forEach(([e, i]) => $gb.append(renderCard(e, i, $pane)));
-            $grp.find(".ml-pending-group-hdr").on("click", function () { $grp.toggleClass("open"); });
-            $pane.append($grp);
+                `);
+                const $gb = $grp.find(".ml-pending-group-body");
+                items.forEach(([e, i]) => $gb.append(renderCard(e, i, $pane)));
+                $grp.find(".ml-pending-group-hdr").on("click", function () { $grp.toggleClass("open"); });
+                $pane.append($grp);
+            }
         }
+    }
+
+    // Divider + World section
+    if (worldItems.length > 0) {
+        $pane.append(`<div class="ml-pending-divider"></div>`);
+        $pane.append(`<div class="ml-pending-section-label ml-pending-world-label">${iconSvg("ico-globe", 13, 13, "#9fb0c4")} World memories <span class="ml-pending-badge">${worldItems.length}</span></div>`);
+        worldItems.forEach(([e, i]) => $pane.append(renderCard(e, i, $pane)));
     }
     const $ga = $('<div class="ml-btn-row" style="margin-top:11px"><button class="ml-btn-confirm" id="ml-commit-all" style="font-size:12px;padding:7px 18px">Commit all</button><button class="ml-btn-danger" id="ml-discard-all">Discard all</button></div>');
     $(document).on("click"+NS, "#ml-commit-all", async () => { const ok = await popup(`Commit all ${pl.length} entries?`); if(ok) { pl.forEach(e => { try{ const created = createEntry(e); embedEntry(created).catch(err => console.warn("[ML] Embed failed:", err)); }catch(err){console.error(err)} }); savePendingEntries(null); renderHomeTab($pane); }});

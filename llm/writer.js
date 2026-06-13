@@ -154,6 +154,19 @@ export async function runWriterFlow(sceneId) {
         return null;
     }
 
+    // World memories — separate, stricter pass. Usually produces nothing.
+    // Spaced out like the other calls for rate-limit safety.
+    if (getSetting("worldMemory.enabled", true)) {
+        await new Promise(r => setTimeout(r, 2500));
+        try {
+            const { generateWorldMemories } = await import("./worldWriter.js");
+            const world = await generateWorldMemories(sceneId);
+            if (world && world.length > 0) {
+                toastr?.info?.(`${world.length} world ${world.length === 1 ? "memory" : "memories"} detected — pending review.`, "Memory Loom");
+            }
+        } catch (e) { console.error("[ML] World memory generation failed:", e); }
+    }
+
     return entries;
 }
 
@@ -341,7 +354,7 @@ function normalizePrimaries(raw) {
  * @param {object} scene
  * @returns {string}
  */
-function getSceneMessages(scene) {
+export function getSceneMessages(scene) {
     if (!chat || !Array.isArray(chat)) return "";
     const msgs = chat.slice(scene.messageStart, (scene.messageEnd || chat.length) + 1)
         .filter(msg => !(msg.is_system && msg.extra?.hidden));

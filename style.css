@@ -890,10 +890,16 @@
     flex-shrink: 0;
 }
 
+.ml-status-synthesis {
+    border: 1px solid #c9a227;
+    color: #e8cf7a;
+    background: #2a2616;
+}
+
 .ml-status-consolidated {
-    border: 1px solid #555;
-    color: #999;
-    background: #2a2a2a;
+    border: 1px solid #5a6b82;
+    color: #9fb0c4;
+    background: #1f242b;
 }
 
 .ml-status-archived {
@@ -1922,3 +1928,60 @@ body.ml-disabled .ml-scene-btn {
     margin-right: 2px;
 }
 .ml-important-row input { flex-shrink: 0; }
+
+/* ─── Consolidated scene archive ─── */
+.ml-scene-archive-hdr {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: #888; margin: 18px 0 8px; padding-top: 12px;
+    border-top: 1px solid #333;
+}
+.ml-scene-archive-folder {
+    border: 1px solid #333; border-radius: 6px;
+    margin-bottom: 8px; overflow: hidden; background: #181818;
+}
+.ml-scene-archive-folder-hdr {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px; cursor: pointer; user-select: none;
+}
+.ml-scene-archive-folder-hdr:hover { background: #202020; }
+.ml-scene-archive-folder-hdr svg { transition: transform 0.18s ease; }
+.ml-scene-archive-folder.open .ml-scene-archive-folder-hdr svg { transform: rotate(90deg); }
+.ml-scene-archive-folder-name { font-size: 13px; font-weight: 600; color: #ddd; flex: 1; }
+.ml-scene-archive-folder-count {
+    font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #777;
+}
+.ml-scene-archive-folder-body { display: none; padding: 12px; border-top: 1px solid #262626; }
+.ml-scene-archive-folder.open .ml-scene-archive-folder-body { display: block; }
+.ml-scene-archive-members { margin-top: 4px; }
+
+/* ─── Exclude-from-consolidation indicator ─── */
+.ml-excl-mark {
+    color: #9fb0c4;
+    font-size: 12px;
+    margin-right: 2px;
+}
+
+/* ─── Pending section split (Character / World) ─── */
+.ml-pending-section-label {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: #999; margin: 4px 0 9px;
+    display: flex; align-items: center; gap: 6px;
+}
+.ml-pending-world-label { color: #9fb0c4; }
+.ml-pending-divider {
+    border-top: 1px solid #3a4250;
+    margin: 18px 0 12px;
+}
+
+/* ─── Token counter on library cards ─── */
+.ml-token-count {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    color: #777;
+    margin-left: 8px;
+    padding: 1px 6px;
+    border: 1px solid #333;
+    border-radius: 3px;
+}

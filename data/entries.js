@@ -131,6 +131,7 @@ export function createEntry(data) {
         sceneId: data.sceneId || null,
         consolidationId: data.consolidationId || null,  // links a consolidation-produced memory back to its consolidation record
         important: data.important || false,  // core/pivotal memory — exempt from decay and consolidation suppression
+        excludeFromConsolidation: data.excludeFromConsolidation || false,  // never used as a consolidation source
         source: data.source || "manual",
         createdAt: Date.now(),
         updatedAt: Date.now(),

@@ -18,7 +18,7 @@ import { makeRequest } from "./connections.js";
 import { getAllEntries, updateDelta } from "../data/entries.js";
 import { getScene } from "../data/scenes.js";
 import { getSetting } from "../settings.js";
-import { dlog } from "./debug.js";
+import { dlog } from "../lib/debug.js";
 
 /** True if an entry has no usable delta. */
 function isDeltaBlank(entry) {

@@ -130,6 +130,63 @@ function renderDebug($pane) {
         }
     });
 
+    // ── World memory generation toggle ───────────────────
+    const worldOn = getSetting("worldMemory.enabled", true);
+    $body.append(`
+        <div class="ml-setting-row">
+            <div style="flex:1;min-width:0">
+                <div class="ml-setting-label">World memory generation</div>
+                <div class="ml-setting-sub">On scene close, run a strict separate pass for new/changed world facts (organizations, locations, structures, world-altering events)</div>
+            </div>
+            <label class="ml-toggle"><input type="checkbox" id="ml-setting-worldEnabled" ${worldOn ? "checked" : ""}><span class="ml-slider"></span></label>
+        </div>
+    `);
+    $body.find("#ml-setting-worldEnabled").on("change", function () {
+        setSetting("worldMemory.enabled", this.checked);
+    });
+
+    // ── Scan for world memories (debug) ──────────────────
+    $body.append(`
+        <div class="ml-setting-row">
+            <div style="flex:1;min-width:0">
+                <div class="ml-setting-label">Scan chat for world memories</div>
+                <div class="ml-setting-sub">Run the strict world-memory pass over every closed scene · produces pending world entries on the Home tab</div>
+            </div>
+            <button class="ml-btn" id="ml-world-scan-btn">Scan world</button>
+        </div>
+    `);
+    $body.find("#ml-world-scan-btn").on("click", async function () {
+        const $btn = $(this);
+        $btn.prop("disabled", true).text("Scanning…");
+        const { showPanelLoading, hidePanelLoading, setProcessingStatus } = await import("./panel.js");
+        try {
+            const { getAllScenes } = await import("../data/scenes.js");
+            const { generateWorldMemories } = await import("../llm/worldWriter.js");
+            const scenes = getAllScenes().filter(s => s.status === "closed");
+            if (!scenes.length) { toastr?.warning?.("No closed scenes to scan.", "Memory Loom"); return; }
+            let total = 0;
+            for (let i = 0; i < scenes.length; i++) {
+                const msg = `Scanning scene ${i + 1}/${scenes.length} for world facts…`;
+                $btn.text(`${i + 1}/${scenes.length}`);
+                showPanelLoading(msg); setProcessingStatus(msg);
+                try {
+                    const w = await generateWorldMemories(scenes[i].id);
+                    if (w && w.length) total += w.length;
+                } catch (e) { console.error("[ML] World scan chunk failed:", e); }
+                await new Promise(r => setTimeout(r, 2500)); // rate-limit spacing
+            }
+            toastr?.success?.(`World scan complete — ${total} world ${total === 1 ? "memory" : "memories"} pending review.`, "Memory Loom", { timeOut: 6000 });
+            const { renderHomeTab } = await import("./home.js");
+            const $home = $("#ml-p-home"); if ($home.length) renderHomeTab($home);
+        } catch (err) {
+            console.error("[ML] World scan failed:", err);
+            toastr?.error?.("World scan failed. Check console.", "Memory Loom");
+        } finally {
+            hidePanelLoading(); setProcessingStatus(null);
+            $btn.prop("disabled", false).text("Scan world");
+        }
+    });
+
     // ── Set to default ───────────────────────────────────
     $body.append(`
         <div class="ml-setting-row" style="border-bottom:none">

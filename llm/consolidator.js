@@ -66,6 +66,91 @@ export async function generateConsolidation({ mode, sourceEntries, sourceScenes 
     return parseConsolidationResponse(response, sourceEntries, sourceScenes);
 }
 
+
+// ─── Per-Character Consolidated Memory ────────────────────
+/** Heuristic: does this text read as first-person narration? */
+function looksFirstPerson(text) {
+    // Count first-person pronouns as whole words, ignoring quoted dialogue
+    // (dialogue legitimately contains "I"). Strip quoted spans first.
+    const narration = String(text).replace(/"[^"]*"|'[^']*'|\u201c[^\u201d]*\u201d/g, " ");
+    const matches = narration.match(/\b(I|I'm|I'd|I've|I'll|me|my|myself|we|our|us)\b/g);
+    return !!matches && matches.length >= 2;
+}
+
+
+
+/**
+ * Generate ONE consolidated memory written from a single character's
+ * perspective, drawing only on the source memories that character actually
+ * appears in. This replaces the old behavior of pasting the same arc summary
+ * into every folder — each character now gets a distinct, personal memory.
+ *
+ * @param {string} charName
+ * @param {object[]} relevantEntries - source memories this character appears in
+ * @param {object} draft - the arc-level consolidation draft (for context)
+ * @returns {Promise<{title:string, content:string, datetime:string}|null>}
+ */
+export async function generateCharacterConsolidatedMemory(charName, relevantEntries, draft) {
+    const profileName = getSetting("connections.consolidationLLM", "");
+    if (!profileName) return null;
+    if (!relevantEntries || relevantEntries.length === 0) return null;
+
+    const system = `You are writing a single consolidated memory centered on ONE character: ${charName}. You are given several of that character's individual memories from one story arc. Fuse them into a SINGLE cohesive memory entry focused on ${charName} — what this arc meant to them specifically, what changed in them, what they now carry forward.
+
+POV — ABSOLUTE RULE:
+- Write in THIRD PERSON. Refer to ${charName} by name and by third-person pronouns (he/she/they).
+- NEVER write in first person. Do not use "I", "me", "my", "we", or "us" anywhere in the content. This is a narrated memory ABOUT ${charName}, not spoken BY ${charName}.
+- WRONG: "I remember the first time I saw her freeze."
+- RIGHT: "${charName} still remembered the first time he saw her freeze." (adjust pronoun to the character)
+
+OTHER RULES:
+- Center ${charName}'s experience and inner change. Other characters appear only as they relate to ${charName}.
+- Vivid, specific third-person prose in the same style as the source memories — sensory and emotionally precise, not a clinical report.
+- Present/past state only; never pose open questions.
+- Make it personal to ${charName} and distinct from a neutral arc summary.
+
+Output ONLY a JSON object, no markdown fences:
+{
+  "title": "An evocative 3-6 word title specific to ${charName}'s arc — NOT a generic arc name",
+  "content": "The consolidated memory, narrated in THIRD PERSON about ${charName}.",
+  "datetime": "The time period this covers."
+}`;
+
+    let user = `CHARACTER: ${charName}\n\nTHIS CHARACTER'S MEMORIES FROM THE ARC:\n\n`;
+    relevantEntries.forEach((e, i) => {
+        user += `--- Memory ${i + 1}: ${e.title} ---\n`;
+        if (e.datetime) user += `When: ${e.datetime}\n`;
+        user += `${e.content}\n\n`;
+    });
+    if (draft && draft.summary) {
+        user += `BROADER ARC CONTEXT (for reference only — write about ${charName} specifically):\n${draft.summary}\n\n`;
+    }
+    user += `Write ${charName}'s single consolidated memory of this arc as JSON.`;
+
+    const response = await makeRequest(profileName, system, user, getConsolidationTokens(), 0.6);
+    if (!response) return null;
+    try {
+        const raw = String(response).replace(/\`\`\`json\s*|\`\`\`/g, "").trim();
+        const s = raw.indexOf("{"), eIdx = raw.lastIndexOf("}");
+        if (s === -1 || eIdx === -1) return null;
+        const parsed = JSON.parse(raw.slice(s, eIdx + 1));
+        const contentText = String(parsed.content || "").trim();
+        if (!contentText) return null;
+        // First-person leak check — flag if the model ignored the POV ban.
+        if (looksFirstPerson(contentText)) {
+            console.warn(`[ML] Consolidation for ${charName} came back in first person — POV ban ignored by the model. Consider regenerating; flagged in title.`);
+        }
+        return {
+            title: String(parsed.title || "").trim() || `${charName}'s arc`,
+            content: contentText,
+            datetime: String(parsed.datetime || "").trim() || (draft?.timeRange || ""),
+        };
+    } catch (err) {
+        console.warn(`[ML] Per-character consolidation parse failed for ${charName}:`, err.message);
+        return null;
+    }
+}
+
 // ─── Prompt Builders ──────────────────────────────────────
 
 function buildConsolidationSystemPrompt() {

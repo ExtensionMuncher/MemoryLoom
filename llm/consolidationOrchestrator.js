@@ -23,10 +23,10 @@
  * funnel through runConsolidation().
  */
 
-import { generateConsolidation } from "./consolidator.js";
+import { generateConsolidation, generateCharacterConsolidatedMemory } from "./consolidator.js";
 import { createConsolidation } from "../data/consolidations.js";
 import { getEntry, getEntriesByFolder, getAllEntries, createEntry, setEntryStatus } from "../data/entries.js";
-import { getScene } from "../data/scenes.js";
+import { getScene, markSceneConsolidated } from "../data/scenes.js";
 import { embedEntry } from "../embed/embedder.js";
 import { getSetting } from "../settings.js";
 import { dlog } from "../lib/debug.js";
@@ -63,24 +63,36 @@ export async function runConsolidation({ entryIds = [], sceneIds = [], mode = "s
     const consolidation = createConsolidation(draft);
 
     // ── 1. Updated character memories ────────────────────
-    // One per distinct primary character across the sources. after_state +
-    // that character's slice of character_impact become the new memory body.
+    // ONE PER CHARACTER, each WRITTEN INDIVIDUALLY by the LLM from that
+    // character's perspective, using only the source memories that character
+    // actually appears in. (The old code pasted the same arc summary into every
+    // folder — that produced identical, doubled, generically-titled entries.)
     const updatedMemories = [];
     const charNames = collectPrimaryCharacters(sourceEntries);
     for (const charName of charNames) {
-        const impactLine = pickImpactFor(charName, draft.character_impact);
-        const body = [draft.after_state, impactLine].filter(Boolean).join(" ").trim()
-            || draft.summary;
-        if (!body) continue;
+        // memories this character is involved in (primary OR key)
+        const relevant = sourceEntries.filter(e => characterInEntry(e, charName));
+        if (relevant.length === 0) continue;
+
+        if (!silent) {
+            const msg = `Writing ${charName}'s consolidated memory…`;
+            try { const { showPanelLoading, setProcessingStatus } = await import("../ui/panel.js"); showPanelLoading(msg); setProcessingStatus(msg); } catch (e) {}
+        }
+
+        const written = await generateCharacterConsolidatedMemory(charName, relevant, draft);
+        if (!written) {
+            console.warn(`[ML] Consolidation: no per-character memory produced for ${charName} — skipping`);
+            continue;
+        }
         const mem = createEntry({
-            title: `${draft.title} — ${charName}`,
-            datetime: draft.timeRange || "",
-            content: body,
+            title: written.title,
+            datetime: written.datetime || draft.timeRange || "",
+            content: written.content,
             primaryCharacter: charName,
             primaryCharacters: [charName],
             keyCharacters: [],
             category: "character",
-            status: "consolidation",                // distinct from "consolidated": this is the NEW high-priority memory, badged but not demoted
+            status: "consolidation",
             tags: [...(draft.tags || [])],
             consolidationId: consolidation.id,
         });
@@ -112,6 +124,14 @@ export async function runConsolidation({ entryIds = [], sceneIds = [], mode = "s
         setEntryStatus(e.id, "consolidated");
     }
 
+    // ── 3b. Mark source scenes consolidated ──────────────
+    // Stamps consolidatedInto on each scene so it drops out of the consolidate
+    // modal AND moves into the consolidated-scenes folder under the Scenes tab.
+    dlog(`Consolidation: marking ${sourceScenes.length} scene(s) as consolidated into ${consolidation.id}`);
+    for (const s of sourceScenes) {
+        markSceneConsolidated(s.id, consolidation.id);
+    }
+
     dlog(`Consolidation done: ${updatedMemories.length} updated memories + 1 arc summary; ${sourceEntries.length} sources demoted`);
     if (!silent) {
         toastr?.success?.(
@@ -135,6 +155,7 @@ export async function maybeAutoConsolidate() {
     const byFolder = new Map();
     for (const e of getAllEntries()) {
         if (e.status !== "active") continue;
+        if (e.excludeFromConsolidation) continue;  // user opted this memory out
         if (e.category !== "character") continue; // auto only over character folders
         if (!e.folderId) continue;
         if (!byFolder.has(e.folderId)) byFolder.set(e.folderId, []);
@@ -158,6 +179,16 @@ export async function maybeAutoConsolidate() {
 }
 
 // ─── Helpers ──────────────────────────────────────────────
+
+/** True if a character appears as a primary OR key character in an entry. */
+function characterInEntry(entry, charName) {
+    const lower = String(charName).toLowerCase();
+    const prims = (entry.primaryCharacters && entry.primaryCharacters.length)
+        ? entry.primaryCharacters
+        : (entry.primaryCharacter ? [entry.primaryCharacter] : []);
+    const keys = entry.keyCharacters || [];
+    return [...prims, ...keys].some(n => String(n).toLowerCase() === lower);
+}
 
 function collectPrimaryCharacters(entries) {
     const set = new Set();

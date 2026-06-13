@@ -19,8 +19,9 @@ import { iconSvg } from "../lib/icons.js";
 import { getAllEntries, getEntriesByFolder, getEntry, updateEntry, deleteEntry, moveEntryToFolder, ENTRY_STATUSES } from "../data/entries.js";
 import { reEmbedEntry, deleteEntryVector, embedEntry } from "../embed/embedder.js";
 import { getAllFolders, getTopLevelFolders, getSubfolders, getFolder, getFolderIcon, getFolderButtons, isCharacterSubfolder, isGroupFolder, initDefaultFolders, setFolderAliases, deleteFolder } from "../data/folders.js";
-import { getAllScenes, getScene, deleteScene, updateSceneSummary } from "../data/scenes.js";
+import { getAllScenes, getScene, deleteScene, updateSceneSummary, markSceneConsolidated } from "../data/scenes.js";
 import { getScenes, saveScenes } from "../data/storage.js";
+import { getConsolidation, updateConsolidation } from "../data/consolidations.js";
 
 // ─── Main Render ──────────────────────────────────────────
 
@@ -185,6 +186,7 @@ function renderMemoriesView($pane) {
             <span id="ml-bulk-count" style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#ccc"></span>
             <select id="ml-bulk-move-select" class="ml-filter-select" style="min-width:170px"><option value="">Move selected to…</option></select>
             <button class="ml-btn" id="ml-bulk-important" title="Toggle core/important on selected memories">Toggle important</button>
+            <button class="ml-btn" id="ml-bulk-exclude" title="Toggle exclude-from-consolidation on selected memories">Toggle exclude</button>
             <button class="ml-btn-danger" id="ml-bulk-delete" title="Delete selected memories">Delete selected</button>
             <button class="ml-btn" id="ml-bulk-clear" style="margin-left:auto">Clear selection</button>
         </div>
@@ -238,6 +240,14 @@ function renderMemoriesView($pane) {
         const anyOff = ids.some(id => { const e = getEntry(id); return e && !e.important; });
         for (const id of ids) updateEntry(id, { important: anyOff });
         toastr?.success?.(`${anyOff ? "Marked" : "Unmarked"} ${ids.length} ${ids.length === 1 ? "memory" : "memories"} as core.`);
+        renderLibraryTab($("#ml-p-library"));
+    });
+    $bulkBar.find("#ml-bulk-exclude").on("click", function () {
+        const ids = [...bulkSelected];
+        if (!ids.length) { toastr?.warning?.("No memories selected."); return; }
+        const anyOff = ids.some(id => { const e = getEntry(id); return e && !e.excludeFromConsolidation; });
+        for (const id of ids) updateEntry(id, { excludeFromConsolidation: anyOff });
+        toastr?.success?.(`${anyOff ? "Excluded" : "Re-included"} ${ids.length} ${ids.length === 1 ? "memory" : "memories"}.`);
         renderLibraryTab($("#ml-p-library"));
     });
 
@@ -726,6 +736,12 @@ function renderCharacterSubfolder(folder) {
 
 // ─── Memory Entry Rendering ───────────────────────────────
 
+/** Rough token estimate (~4 chars/token) for a memory entry's injected text. */
+function estimateTokens(entry) {
+    const text = `${entry.title || ""}\n${entry.datetime || ""}\n${entry.content || ""}\n${(entry.primaryCharacters||[entry.primaryCharacter]).join(", ")}\n${(entry.keyCharacters||[]).join(", ")}`;
+    return Math.max(1, Math.round(text.length / 4));
+}
+
 /**
  * Render a single memory entry as an expandable card.
  *
@@ -768,11 +784,11 @@ function renderMemoryEntry(entry) {
             <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px">
                 <div style="display:flex;align-items:flex-start;gap:8px;min-width:0">
                     <input type="checkbox" class="ml-bulk-check" data-entry-id="${entry.id}" title="Select for bulk move" ${bulkSelected.has(entry.id) ? "checked" : ""} style="margin-top:2px;flex-shrink:0">
-                    <div class="ml-mem-entry-title">${entry.important ? '<span class="ml-star" title="Core memory">★</span> ' : ''}${escapeHtml(entry.title)}</div>
+                    <div class="ml-mem-entry-title">${entry.important ? '<span class="ml-star" title="Core memory">★</span> ' : ''}${entry.excludeFromConsolidation ? '<span class="ml-excl-mark" title="Excluded from consolidation">⊘</span> ' : ''}${escapeHtml(entry.title)}</div>
                 </div>
                 ${statusBadge}
             </div>
-            <div class="ml-mem-entry-date">${escapeHtml(entry.datetime)}</div>
+            <div class="ml-mem-entry-date">${escapeHtml(entry.datetime)}<span class="ml-token-count" title="Estimated injection tokens">~${estimateTokens(entry)} tok</span></div>
             <div class="ml-mem-entry-preview">${escapeHtml(truncateText(entry.content, 200))}</div>
             ${tagsHtml ? `<div class="ml-mem-entry-tags">${tagsHtml}</div>` : ""}
         </div>
@@ -790,6 +806,7 @@ function renderMemoryEntry(entry) {
                 <button class="ml-btn ml-edit-entry-btn" data-entry-id="${entry.id}">Edit</button>
                 ${hasDelta(entry) ? '<button class="ml-btn ml-impact-btn" data-entry-id="' + entry.id + '">Show Impact</button>' : ''}
                 <button class="ml-btn ml-important-entry-btn" data-entry-id="${entry.id}">${entry.important ? "★ Core" : "☆ Mark core"}</button>
+                <button class="ml-btn ml-exclude-entry-btn" data-entry-id="${entry.id}">${entry.excludeFromConsolidation ? "⊘ Excluded" : "Exclude from consld."}</button>
                 <button class="ml-btn ml-move-entry-btn" data-entry-id="${entry.id}">Move</button>
                 <button class="ml-btn-danger ml-delete-entry-btn" data-entry-id="${entry.id}">Delete</button>
             </div>
@@ -830,6 +847,15 @@ function renderMemoryEntry(entry) {
         const now = !entry.important;
         updateEntry(entry.id, { important: now });
         toastr?.success?.(now ? `"${entry.title}" marked as core.` : `"${entry.title}" no longer core.`);
+        renderLibraryTab($("#ml-p-library"));
+    });
+
+    // Quick Exclude-from-consolidation toggle
+    $entry.find(".ml-exclude-entry-btn").on("click", (e) => {
+        e.stopPropagation();
+        const now = !entry.excludeFromConsolidation;
+        updateEntry(entry.id, { excludeFromConsolidation: now });
+        toastr?.success?.(now ? `"${entry.title}" excluded from consolidation.` : `"${entry.title}" can be consolidated again.`);
         renderLibraryTab($("#ml-p-library"));
     });
 
@@ -935,6 +961,10 @@ function toggleEntryEdit(entryId) {
             <input type="checkbox" id="ml-edit-important-${entryId}" ${entry.important ? "checked" : ""}>
             <span style="font-size:12px;color:#ddd">Mark as core/important memory <span style="color:#888;font-size:11px">(exempt from priority decay &amp; consolidation suppression)</span></span>
         </label>
+        <label class="ml-important-row" style="display:flex;align-items:center;gap:8px;margin-top:6px;cursor:pointer">
+            <input type="checkbox" id="ml-edit-exclude-${entryId}" ${entry.excludeFromConsolidation ? "checked" : ""}>
+            <span style="font-size:12px;color:#ddd">Exclude from consolidation <span style="color:#888;font-size:11px">(never used as a consolidation source)</span></span>
+        </label>
         <div class="ml-btn-row" style="margin-top:10px">
             <button class="ml-btn-confirm ml-save-edit-btn" data-entry-id="${entryId}">Save</button>
             <button class="ml-btn-danger ml-cancel-edit-btn" data-entry-id="${entryId}">Cancel</button>
@@ -954,9 +984,10 @@ function toggleEntryEdit(entryId) {
         const primaries = ($(`#ml-edit-primary-${entryId}`).val() || "").split(",").map(s => s.trim()).filter(Boolean);
         const keyChars  = ($(`#ml-edit-key-${entryId}`).val() || "").split(",").map(s => s.trim()).filter(Boolean);
         const important = $(`#ml-edit-important-${entryId}`).prop("checked");
+        const excludeFromConsolidation = $(`#ml-edit-exclude-${entryId}`).prop("checked");
 
         const update = {
-            title, datetime, content, delta, important,
+            title, datetime, content, delta, important, excludeFromConsolidation,
             keyCharacters: keyChars,
             primaryCharacters: primaries,
             primaryCharacter: primaries.length === 1 ? primaries[0] : "",
@@ -1025,12 +1056,90 @@ function renderScenesView($pane) {
         return;
     }
 
-    scenes.forEach((scene, idx) => {
-        const $sceneEl = renderSceneEntry(scene, idx);
-        $container.append($sceneEl);
+    // Split: live (not consolidated) scenes vs consolidated ones.
+    const liveScenes = scenes.filter(s => !s.consolidatedInto);
+    const consolidatedScenes = scenes.filter(s => s.consolidatedInto);
+
+    liveScenes.forEach((scene, idx) => {
+        $container.append(renderSceneEntry(scene, idx));
     });
 
+    // ── Consolidated scenes: grouped into per-consolidation folders ──
+    if (consolidatedScenes.length > 0) {
+        // group by the consolidation they were folded into
+        const groups = new Map();
+        for (const s of consolidatedScenes) {
+            if (!groups.has(s.consolidatedInto)) groups.set(s.consolidatedInto, []);
+            groups.get(s.consolidatedInto).push(s);
+        }
+        $container.append(`<div class="ml-scene-archive-hdr">Consolidated scene archive</div>`);
+        for (const [consId, members] of groups) {
+            $container.append(renderConsolidatedSceneFolder(consId, members));
+        }
+    }
+
     $pane.append($container);
+}
+
+/**
+ * Render a folder grouping all scenes that were folded into one consolidation.
+ * Title + summary come from the consolidation record and are BOTH editable
+ * (the LLM mislabels sometimes). Inside, each member scene is shown read-only-ish
+ * (still editable via its own card) so the user can verify what was grouped.
+ */
+function renderConsolidatedSceneFolder(consolidationId, scenes) {
+    const cons = getConsolidation(consolidationId);
+    const folderTitle = (cons && cons.title) ? cons.title : "Consolidated scenes";
+    const folderSummary = (cons && (cons.summary || cons.preferred_injection)) || "";
+    const fid = `consfold-${consolidationId}`;
+
+    const $folder = $(`
+        <div class="ml-scene-archive-folder" id="ml-${fid}">
+            <div class="ml-scene-archive-folder-hdr">
+                ${iconSvg("ico-chevron-right", 12, 12, "#888")}
+                <span class="ml-scene-archive-folder-name">${escapeHtml(folderTitle)}</span>
+                <span class="ml-scene-archive-folder-count">${scenes.length} ${scenes.length === 1 ? "scene" : "scenes"}</span>
+            </div>
+            <div class="ml-scene-archive-folder-body">
+                <div class="ml-field-hdr"><span class="ml-lbl" style="margin-bottom:0">Folder title · editable</span></div>
+                <input class="ml-form-input" id="ml-${fid}-title" value="${escapeHtml(folderTitle)}" style="margin-bottom:8px">
+                <div class="ml-field-hdr"><span class="ml-lbl" style="margin-bottom:0">Folder summary · editable</span></div>
+                <textarea class="ml-form-textarea" id="ml-${fid}-summary" rows="4" style="margin-bottom:8px">${escapeHtml(folderSummary)}</textarea>
+                <div class="ml-btn-row" style="margin-bottom:10px">
+                    <button class="ml-btn ml-${fid}-save">Save folder</button>
+                </div>
+                <div class="ml-scene-archive-members"></div>
+            </div>
+        </div>
+    `);
+
+    // restore open state
+    if (openFolders.has(fid)) $folder.addClass("open");
+    $folder.find(".ml-scene-archive-folder-hdr").on("click", function () {
+        const isOpen = $folder.toggleClass("open").hasClass("open");
+        if (isOpen) openFolders.add(fid); else openFolders.delete(fid);
+    });
+
+    // save edited title/summary back onto the consolidation record
+    $folder.find(`.ml-${fid}-save`).on("click", function (e) {
+        e.stopPropagation();
+        const newTitle = $(`#ml-${fid}-title`).val().trim();
+        const newSummary = $(`#ml-${fid}-summary`).val().trim();
+        if (consolidationId && getConsolidation(consolidationId)) {
+            updateConsolidation(consolidationId, { title: newTitle, summary: newSummary });
+            toastr?.success?.("Consolidated scene folder updated.");
+        } else {
+            toastr?.warning?.("Consolidation record not found — changes not saved.");
+        }
+    });
+
+    // member scenes (each rendered as its normal card, still individually editable)
+    const $members = $folder.find(".ml-scene-archive-members");
+    scenes.forEach((scene, idx) => {
+        $members.append(renderSceneEntry(scene, idx));
+    });
+
+    return $folder;
 }
 
 /**
@@ -1122,17 +1231,22 @@ function openConsolidateModal($pane) {
     consolidateSelEntries.clear();
     consolidateSelScenes.clear();
 
-    // Only ACTIVE memories are sensible sources (already-consolidated sources
-    // are demoted; re-consolidating them compounds). Newest first.
+    // Eligible memory sources: ACTIVE (never consolidated) OR "consolidation"
+    // (the products of a PRIOR consolidation — those can be folded into a later,
+    // higher-level arc until they too are consolidated). EXCLUDES "consolidated"
+    // (already-demoted sources — re-consolidating them would compound). Newest first.
     const entries = getAllEntries()
-        .filter(e => e.status === "active")
+        .filter(e => (e.status === "active" || e.status === "consolidation") && !e.excludeFromConsolidation)
         .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-    const scenes = getAllScenes();
+    // Eligible scenes: closed and NOT already consolidated (consolidatedInto unset).
+    const scenes = getAllScenes().filter(s => s.status === "closed" && !s.consolidatedInto);
 
     const entryRows = entries.map(e => {
-        const who = (e.primaryCharacters && e.primaryCharacters.length)
-            ? e.primaryCharacters.join(", ")
-            : (e.primaryCharacter || "—");
+        const who = (e.category === "world")
+            ? "\ud83c\udf10 World"
+            : (e.primaryCharacters && e.primaryCharacters.length)
+                ? e.primaryCharacters.join(", ")
+                : (e.primaryCharacter || "—");
         return `
             <label class="ml-consld-row">
                 <input type="checkbox" class="ml-consld-entry" data-id="${e.id}">
@@ -1812,9 +1926,9 @@ function getStatusBadge(status) {
         case "pinned":
             return '<span class="ml-status-badge ml-status-pinned">pinned</span>';
         case "consolidation":
-            return '<span class="ml-status-badge ml-status-consolidated">consolidated</span>';
+            return '<span class="ml-status-badge ml-status-synthesis">synthesis</span>';
         case "consolidated":
-            return '<span class="ml-status-badge ml-status-consolidated">source · consolidated</span>';
+            return '<span class="ml-status-badge ml-status-consolidated">consolidated</span>';
         case "archived":
             return '<span class="ml-status-badge ml-status-archived">archived</span>';
         case "superseded":

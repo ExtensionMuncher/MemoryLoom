@@ -14,7 +14,7 @@
  */
 
 
-import { getScenes, saveScenes, getOpenSceneId, saveOpenSceneId } from "./storage.js";
+import { getScenes, saveScenes, getOpenSceneId, saveOpenSceneId, getConsolidations as getConsolidationsForScenes } from "./storage.js";
 
 // ─── ID Generation ────────────────────────────────────────
 
