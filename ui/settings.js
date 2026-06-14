@@ -293,6 +293,21 @@ function renderConnections($pane) {
     $body.append(settingRow("Consolidation LLM", "Generates arc and sub-arc consolidation summaries", selectFor("consolidationLLM")));
     $body.append(settingRow("Keyword sidecar LLM", "Extracts themes from context every N messages", selectFor("sidecarLLM")));
 
+    // No-think helpers/labels (defined before the dropdown loop so its change
+    // handler can reference them).
+    const roleLabels = {
+        memoryWriterLLM: "Memory writer",
+        sceneSummaryLLM: "Scene summary",
+        consolidationLLM: "Consolidation",
+        sidecarLLM: "Keyword sidecar",
+    };
+    function readMap(mapKey) { const m = getSetting(`connections.${mapKey}`, null); return (m && typeof m === "object") ? m : {}; }
+    function writeMap(mapKey, profileId, val) {
+        const m = readMap(mapKey);
+        if (val) m[profileId] = true; else delete m[profileId];
+        setSetting(`connections.${mapKey}`, m);
+    }
+
     // Set current values and wire change handlers.
     // Use $body.find() — $section is not in the document yet so document-level
     // selectors ($(...)) would find nothing. $body.find() works on detached elements.
@@ -301,8 +316,49 @@ function renderConnections($pane) {
         const $select = $body.find(`#ml-setting-${key}`);
         $select.val(current);
         $select.on("change", function () {
-            setSetting(`connections.${key}`, $(this).val());
+            const newId = $(this).val();
+            setSetting(`connections.${key}`, newId);
+            // Rebind this role's no-think row to the newly selected profile, and
+            // reflect that profile's existing no-think state — no full re-render.
+            const $r = $body.find(`.ml-nothink-row[data-role="${key}"]`);
+            if ($r.length) {
+                const softMap = readMap("noThinkProfiles");
+                const hardMap = readMap("noThinkHardProfiles");
+                $r.find(".ml-nt-soft").attr("data-pid", newId).prop("checked", !!softMap[newId]).prop("disabled", !newId);
+                $r.find(".ml-nt-hard").attr("data-pid", newId).prop("checked", !!hardMap[newId]).prop("disabled", !newId);
+                $r.find(".ml-nothink-rolelabel").html(roleLabels[key] + (newId ? "" : ` <span style="color:#a66">(no profile selected)</span>`));
+            }
         });
+    });
+
+    // ── No-think (per connection profile) ────────────────
+    // Each role's selected profile gets its own soft/hard no-think setting,
+    // keyed by profile ID. So a local Qwen sidecar can run thinking-off while a
+    // cloud writer keeps reasoning. The map is keyed by profile ID, so a profile
+    // used in two roles behaves consistently.
+    $body.append(`<div class="ml-subhdr" style="margin-top:14px;font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:#888">No-think (per profile)</div>`);
+    $body.append(`<div style="font-size:11px;color:#888;margin:4px 0 8px;line-height:1.4">Soft appends <code>/no_think</code> (safe, ignored if unsupported). Hard also sends API params (<code>think</code>/<code>enable_thinking=false</code>) — turn off if your backend errors.</div>`);
+
+    Object.keys(roleLabels).forEach(roleKey => {
+        const profileId = getSetting(`connections.${roleKey}`, "");
+        const softMap = readMap("noThinkProfiles");
+        const hardMap = readMap("noThinkHardProfiles");
+        const disabled = profileId ? "" : "disabled";
+        const hint = profileId ? "" : ` <span style="color:#a66">(no profile selected)</span>`;
+        const $row = $(`
+            <div class="ml-nothink-row" data-role="${roleKey}" style="display:flex;align-items:center;gap:14px;padding:5px 0;border-bottom:0.5px solid #2a2a2a">
+                <span class="ml-nothink-rolelabel" style="flex:1;font-size:12px;color:#ccc">${roleLabels[roleKey]}${hint}</span>
+                <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:#aaa;cursor:pointer"><input type="checkbox" class="ml-nt-soft" data-pid="${profileId}" ${softMap[profileId] ? "checked" : ""} ${disabled}> soft</label>
+                <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:#aaa;cursor:pointer"><input type="checkbox" class="ml-nt-hard" data-pid="${profileId}" ${hardMap[profileId] ? "checked" : ""} ${disabled}> hard</label>
+            </div>
+        `);
+        $row.find(".ml-nt-soft").on("change", function () {
+            const pid = $(this).data("pid"); if (pid) writeMap("noThinkProfiles", pid, this.checked);
+        });
+        $row.find(".ml-nt-hard").on("change", function () {
+            const pid = $(this).data("pid"); if (pid) writeMap("noThinkHardProfiles", pid, this.checked);
+        });
+        $body.append($row);
     });
 
     $pane.append($section);

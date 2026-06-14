@@ -9,6 +9,7 @@
 
 import { getContext } from "../../../../extensions.js";
 import { ConnectionManagerRequestService } from "../../../../extensions/shared.js";
+import { getSetting } from "../settings.js";
 
 // ─── Rate Limiter ─────────────────────────────────────────
 
@@ -150,13 +151,49 @@ export async function makeRequest(profileKey, systemPrompt, userPrompt, maxToken
 
     setMLInternalGen(true);
     try {
+        // Per-profile no-think resolution. The setting is keyed by profile ID so
+        // each connection profile can independently enable reasoning suppression
+        // (e.g. local Qwen sidecar off-thinking while a cloud writer keeps it).
+        // Backward-compat: the old blanket booleans (connections.noThink /
+        // .noThinkHard), if still true, apply to ALL profiles until the user sets
+        // any per-profile value — so existing setups keep working unchanged.
+        const noThinkMap = getSetting("connections.noThinkProfiles", null);
+        const noThinkHardMap = getSetting("connections.noThinkHardProfiles", null);
+        const legacySoft = getSetting("connections.noThink", false);
+        const legacyHard = getSetting("connections.noThinkHard", false);
+        const softOn = (noThinkMap && typeof noThinkMap === "object")
+            ? !!noThinkMap[profile.id]
+            : legacySoft;
+        const hardOn = (noThinkHardMap && typeof noThinkHardMap === "object")
+            ? !!noThinkHardMap[profile.id]
+            : legacyHard;
+
         const response = await rateLimiter.executeWithRetry(profile.id, async () => {
             const messages = [];
             if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
-            if (userPrompt)   messages.push({ role: 'user',   content: userPrompt });
+            // No-think soft switch: append "/no_think" to the END of the USER
+            // message (reliable in the user turn; latest instruction wins).
+            // Harmless to models that don't recognize it.
+            let finalUser = userPrompt || "";
+            if (softOn) {
+                finalUser = (finalUser ? finalUser + "\n\n" : "") + "/no_think";
+            }
+            if (finalUser) messages.push({ role: 'user', content: finalUser });
 
             const overridePayload = { max_tokens: maxTokens };
             if (temperature !== null) overridePayload.temperature = temperature;
+
+            // No-think HARD switch (per-profile, opt-in). Some backends ERROR on
+            // unknown body keys, so this is only sent when explicitly enabled for
+            // this profile. Sends the common forms; tolerant backends ignore keys
+            // they don't recognize (think=Ollama, chat_template_kwargs=vLLM, etc).
+            if (hardOn) {
+                overridePayload.think = false;
+                overridePayload.enable_thinking = false;
+                overridePayload.chat_template_kwargs = Object.assign(
+                    {}, overridePayload.chat_template_kwargs, { enable_thinking: false }
+                );
+            }
 
             // Pass profile.id (UUID) — this is what ST's sendRequest requires
             return await ConnectionManagerRequestService.sendRequest(

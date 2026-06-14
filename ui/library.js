@@ -35,6 +35,10 @@ let currentView = "memories";
 // Entry ids the user has check-marked for a bulk move. Survives re-renders
 // (checkboxes restore from this set) and clears after a bulk action.
 const bulkSelected = new Set();
+
+// Scene ids check-marked for bulk delete on the Scenes tab. Survives re-renders
+// (checkboxes restore from this set) and clears after a bulk action.
+const sceneBulkSelected = new Set();
 // Which folders/subfolders/entry-cards are expanded — persisted across re-renders
 // so editing/moving a memory doesn't collapse the whole library and force the
 // user to re-open three levels of folders every single time.
@@ -1204,9 +1208,71 @@ function renderScenesView($pane) {
     const liveScenes = scenes.filter(s => !s.consolidatedInto);
     const consolidatedScenes = scenes.filter(s => s.consolidatedInto);
 
+    // ── Bulk selection toolbar (live scenes only) ──
+    if (liveScenes.length > 0) {
+        const $sceneBar = $(`
+            <div class="ml-scene-bulk-bar">
+                <label class="ml-scene-bulk-all">
+                    <input type="checkbox" id="ml-scene-select-all"> Select all
+                </label>
+                <button class="ml-btn-danger" id="ml-scene-delete-selected" disabled style="opacity:0.5;pointer-events:none">Delete selected (0)</button>
+            </div>
+        `);
+        $container.append($sceneBar);
+
+        function refreshSceneBulkBar() {
+            const n = sceneBulkSelected.size;
+            const $del = $sceneBar.find("#ml-scene-delete-selected");
+            $del.text(`Delete selected (${n})`);
+            if (n > 0) $del.prop("disabled", false).css({ opacity: "", pointerEvents: "" });
+            else $del.prop("disabled", true).css({ opacity: "0.5", pointerEvents: "none" });
+            const total = $container.find(".ml-scene-select").length;
+            const checked = $container.find(".ml-scene-select:checked").length;
+            $sceneBar.find("#ml-scene-select-all").prop("checked", total > 0 && checked === total);
+        }
+
+        $sceneBar.find("#ml-scene-select-all").on("change", function () {
+            const on = this.checked;
+            $container.find(".ml-scene-select").each(function () {
+                this.checked = on;
+                const id = $(this).data("scene-id");
+                if (on) sceneBulkSelected.add(id); else sceneBulkSelected.delete(id);
+            });
+            refreshSceneBulkBar();
+        });
+
+        $sceneBar.find("#ml-scene-delete-selected").on("click", async function () {
+            const n = sceneBulkSelected.size;
+            if (n === 0) return;
+            let ok = false;
+            const ctx = window.SillyTavern?.getContext?.();
+            if (ctx?.callGenericPopup) {
+                const r = await ctx.callGenericPopup(`Delete <b>${n}</b> selected scene${n > 1 ? "s" : ""}? This cannot be undone.`, ctx.POPUP_TYPE?.CONFIRM || "confirm", "");
+                ok = r === true || r === 1;
+            } else ok = confirm(`Delete ${n} scenes?`);
+            if (!ok) return;
+            for (const id of sceneBulkSelected) { try { deleteScene(id); } catch (e) { console.error("[ML] scene delete failed:", e); } }
+            sceneBulkSelected.clear();
+            $pane.empty();
+            renderScenesView($pane);
+        });
+
+        // expose for the per-entry checkbox handler
+        $container.data("refreshSceneBulkBar", refreshSceneBulkBar);
+    }
+
     liveScenes.forEach((scene, idx) => {
         $container.append(renderSceneEntry(scene, idx));
     });
+    // restore checkbox state + bar after entries render
+    $container.find(".ml-scene-select").each(function () {
+        const id = $(this).data("scene-id");
+        if (sceneBulkSelected.has(id)) this.checked = true;
+    });
+    {
+        const fn = $container.data("refreshSceneBulkBar");
+        if (typeof fn === "function") fn();
+    }
 
     // ── Consolidated scenes: grouped into per-consolidation folders ──
     if (consolidatedScenes.length > 0) {
@@ -1301,6 +1367,7 @@ function renderSceneEntry(scene, sceneIndex) {
     const $scene = $(`
         <div class="ml-scene-entry" id="ml-scene-${scene.id}">
             <div class="ml-scene-hdr">
+                <input type="checkbox" class="ml-scene-select" data-scene-id="${scene.id}" title="Select for bulk delete" onclick="event.stopPropagation()" style="margin:0 4px 0 0;cursor:pointer">
                 <span class="ml-scene-num">Scene ${typeof sceneIndex === "number" ? sceneIndex + 1 : scene.id.replace("ml_scene_", "")}</span>
                 <input class="ml-scene-title-input" id="ml-scene-title-${scene.id}" value="${escapeHtml(titleText)}" title="Click to edit scene title" onclick="event.stopPropagation()">
                 <span class="ml-scene-badge">${mesRange}</span>
@@ -1323,6 +1390,17 @@ function renderSceneEntry(scene, sceneIndex) {
     // Toggle expand/collapse
     $scene.find(".ml-scene-hdr").on("click", function () {
         $scene.toggleClass("open");
+    });
+
+    // Bulk-select checkbox
+    $scene.find(".ml-scene-select").on("change", function () {
+        const id = $(this).data("scene-id");
+        if (this.checked) sceneBulkSelected.add(id); else sceneBulkSelected.delete(id);
+        // walk up to the scenes container that holds the refresh fn
+        let $c = $scene.parent();
+        while ($c.length && !$c.data("refreshSceneBulkBar")) $c = $c.parent();
+        const fn = $c.data("refreshSceneBulkBar");
+        if (typeof fn === "function") fn();
     });
 
 

@@ -2006,3 +2006,16 @@ body.ml-disabled .ml-scene-btn {
     margin-bottom: 8px;
     border-radius: 0 4px 4px 0;
 }
+
+/* ─── Scenes tab bulk selection ─── */
+.ml-scene-bulk-bar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 8px; margin-bottom: 8px;
+    border: 0.5px solid #333; border-radius: 6px;
+    background: rgba(255,255,255,0.02);
+}
+.ml-scene-bulk-all {
+    display: flex; align-items: center; gap: 5px;
+    font-size: 12px; cursor: pointer; color: #ccc;
+}
+.ml-scene-bulk-all input { margin: 0; cursor: pointer; }
