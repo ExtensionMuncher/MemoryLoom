@@ -15,6 +15,7 @@
  */
 
 import { getSetting, setSetting } from "../settings.js";
+import { persistSettings } from "../data/storage.js";
 import { resolveMemoryEntryPrompt, resolveSceneSummaryPrompt } from "../llm/writer.js";
 import { getAllEntries } from "../data/entries.js";
 import { reEmbedEntry } from "../embed/embedder.js";
@@ -130,61 +131,71 @@ function renderDebug($pane) {
         }
     });
 
-    // ── World memory generation toggle ───────────────────
-    const worldOn = getSetting("worldMemory.enabled", true);
-    $body.append(`
-        <div class="ml-setting-row">
-            <div style="flex:1;min-width:0">
-                <div class="ml-setting-label">World memory generation</div>
-                <div class="ml-setting-sub">On scene close, run a strict separate pass for new/changed world facts (organizations, locations, structures, world-altering events)</div>
-            </div>
-            <label class="ml-toggle"><input type="checkbox" id="ml-setting-worldEnabled" ${worldOn ? "checked" : ""}><span class="ml-slider"></span></label>
-        </div>
-    `);
-    $body.find("#ml-setting-worldEnabled").on("change", function () {
-        setSetting("worldMemory.enabled", this.checked);
-    });
 
     // ── Scan for world memories (debug) ──────────────────
     $body.append(`
         <div class="ml-setting-row">
             <div style="flex:1;min-width:0">
                 <div class="ml-setting-label">Scan chat for world memories</div>
-                <div class="ml-setting-sub">Run the strict world-memory pass over every closed scene · produces pending world entries on the Home tab</div>
+                <div class="ml-setting-sub">Full world-only batch scan over the raw chat · choose full chat or a message range · ignores hidden-message markers · always runs even when auto world-generation is off (toggle in Scanning)</div>
             </div>
             <button class="ml-btn" id="ml-world-scan-btn">Scan world</button>
         </div>
     `);
     $body.find("#ml-world-scan-btn").on("click", async function () {
         const $btn = $(this);
-        $btn.prop("disabled", true).text("Scanning…");
-        const { showPanelLoading, hidePanelLoading, setProcessingStatus } = await import("./panel.js");
+        const { chat } = await import("../../../../../script.js");
+        const total = chat?.length || 0;
+        if (!total) { toastr?.warning?.("No messages to scan.", "Memory Loom"); return; }
+
+        // Range popout — full chat or a message range, just like batch / selective scan.
+        const html = `
+            <div style="text-align:left">
+                <h3 style="margin-top:0">Scan for world memories</h3>
+                <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#888;margin:6px 0 12px;line-height:1.6">Reads the raw chat (${total} messages, numbered #0–#${total - 1} to match ST), creates scene chunks, and runs the strict world-memory pass. Hidden-message markers are ignored — everything in range is read.</div>
+                <label class="checkbox_label" style="display:flex;gap:8px;align-items:center;margin:6px 0">
+                    <input type="radio" name="ml-world-range" value="all" checked> Scan everything
+                </label>
+                <label class="checkbox_label" style="display:flex;gap:8px;align-items:center;margin:6px 0">
+                    <input type="radio" name="ml-world-range" value="range"> Message range:
+                    <input type="number" id="ml-world-from" placeholder="from" min="0" max="${total - 1}" class="text_pole" style="width:70px" disabled>
+                    <span style="color:#888">–</span>
+                    <input type="number" id="ml-world-to" placeholder="to" min="0" max="${total - 1}" class="text_pole" style="width:70px" disabled>
+                </label>
+            </div>`;
+
+        let mode = "all", from = null, to = null;
+        $(document).off("change.mlworld").on("change.mlworld", "input[name='ml-world-range']", function () {
+            mode = $(this).val();
+            const dis = mode !== "range";
+            $("#ml-world-from,#ml-world-to").prop("disabled", dis);
+        }).on("change.mlworld", "#ml-world-from", function () { from = parseInt($(this).val(), 10); })
+          .on("change.mlworld", "#ml-world-to", function () { to = parseInt($(this).val(), 10); });
+
+        let proceed = false;
         try {
-            const { getAllScenes } = await import("../data/scenes.js");
-            const { generateWorldMemories } = await import("../llm/worldWriter.js");
-            const scenes = getAllScenes().filter(s => s.status === "closed");
-            if (!scenes.length) { toastr?.warning?.("No closed scenes to scan.", "Memory Loom"); return; }
-            let total = 0;
-            for (let i = 0; i < scenes.length; i++) {
-                const msg = `Scanning scene ${i + 1}/${scenes.length} for world facts…`;
-                $btn.text(`${i + 1}/${scenes.length}`);
-                showPanelLoading(msg); setProcessingStatus(msg);
-                try {
-                    const w = await generateWorldMemories(scenes[i].id);
-                    if (w && w.length) total += w.length;
-                } catch (e) { console.error("[ML] World scan chunk failed:", e); }
-                await new Promise(r => setTimeout(r, 2500)); // rate-limit spacing
-            }
-            toastr?.success?.(`World scan complete — ${total} world ${total === 1 ? "memory" : "memories"} pending review.`, "Memory Loom", { timeOut: 6000 });
-            const { renderHomeTab } = await import("./home.js");
-            const $home = $("#ml-p-home"); if ($home.length) renderHomeTab($home);
-        } catch (err) {
-            console.error("[ML] World scan failed:", err);
-            toastr?.error?.("World scan failed. Check console.", "Memory Loom");
+            const ctx = window.SillyTavern?.getContext();
+            if (ctx?.callGenericPopup) {
+                const r = await ctx.callGenericPopup(html, ctx.POPUP_TYPE?.CONFIRM || "confirm", "");
+                proceed = r === true || r === 1;
+            } else proceed = confirm("Scan for world memories?");
         } finally {
-            hidePanelLoading(); setProcessingStatus(null);
-            $btn.prop("disabled", false).text("Scan world");
+            $(document).off("change.mlworld");
         }
+        if (!proceed) return;
+
+        let rangeStart = null, rangeEnd = null;
+        if (mode === "range") {
+            if (isNaN(from) || isNaN(to)) { toastr?.warning?.("Enter both a start and end message number.", "Memory Loom"); return; }
+            if (from < 0) from = 0;              // ST's first message is #0
+            if (to > total - 1) to = total - 1;  // last valid 0-based index
+            if (from > to) { toastr?.warning?.("Start must be before end.", "Memory Loom"); return; }
+            // ST message numbers are already 0-based — use directly, no offset.
+            rangeStart = from;
+            rangeEnd = to;
+        }
+        // world-only batch scan (5th arg true)
+        runBatchScan($btn, rangeStart, rangeEnd, "Scan world", true);
     });
 
     // ── Set to default ───────────────────────────────────
@@ -511,6 +522,27 @@ function renderInjection($pane) {
         setSetting("injection.maxToolCallMemories", parseInt($(this).val()) || 5);
     });
 
+    // ── Default stickiness ───────────────────────────────
+    // (storage key kept as vectorization.* so previously-saved values survive)
+    const stickiness = getSetting("vectorization.defaultStickiness", 0);
+    $body.append(settingRow("Default stickiness", "Messages an injected memory stays active after firing (0 = off)",
+        `<input type="number" id="ml-setting-stickiness" value="${Number(stickiness) || 0}" min="0" max="50">`
+    ));
+    $body.find("#ml-setting-stickiness").on("change", function () {
+        setSetting("vectorization.defaultStickiness", parseInt($(this).val()) || 0);
+        persistSettings();  // flush immediately — debounced save could be lost on quick navigation
+    });
+
+    // ── Default cooldown ─────────────────────────────────
+    const cooldown = getSetting("vectorization.defaultCooldown", 0);
+    $body.append(settingRow("Default cooldown", "Messages before an injected memory can re-fire (0 = off)",
+        `<input type="number" id="ml-setting-cooldown" value="${Number(cooldown) || 0}" min="0" max="50">`
+    ));
+    $body.find("#ml-setting-cooldown").on("change", function () {
+        setSetting("vectorization.defaultCooldown", parseInt($(this).val()) || 0);
+        persistSettings();
+    });
+
     $pane.append($section);
 }
 
@@ -728,24 +760,6 @@ function renderVectorization($pane) {
 
     $body.append($rawAdvanced);
 
-    // ── Stickiness ──────────────────────────────────────
-    const stickiness = getSetting("vectorization.defaultStickiness", 0);
-    $body.append(settingRow("Default stickiness", "Messages to stay after firing (0 = off)",
-        `<input type="number" id="ml-setting-stickiness" value="${stickiness}" min="0" max="50">`
-    ));
-    $body.find("#ml-setting-stickiness").on("change", function () {
-        setSetting("vectorization.defaultStickiness", parseInt($(this).val()) || 0);
-    });
-
-    // ── Cooldown ────────────────────────────────────────
-    const cooldown = getSetting("vectorization.defaultCooldown", 0);
-    $body.append(settingRow("Default cooldown", "Messages before re-fire (0 = off)",
-        `<input type="number" id="ml-setting-cooldown" value="${cooldown}" min="0" max="50">`
-    ));
-    $body.find("#ml-setting-cooldown").on("change", function () {
-        setSetting("vectorization.defaultCooldown", parseInt($(this).val()) || 0);
-    });
-
     $pane.append($section);
 
     // Export toggle function
@@ -846,9 +860,9 @@ function renderData($pane) {
     // is settled and leave the live scene alone.
     $body.append(settingRow("Selective batch scan", "Scan only a message range · leaves the rest available for manual scenes",
         `<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end">
-            <input type="number" class="ml-setting-select" id="ml-sel-scan-from" placeholder="from" min="1" style="width:64px;text-align:center" title="First message # (1-based)">
+            <input type="number" class="ml-setting-select" id="ml-sel-scan-from" placeholder="from" min="0" style="width:64px;text-align:center" title="First message # (matches ST's #, starts at 0)">
             <span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#666">–</span>
-            <input type="number" class="ml-setting-select" id="ml-sel-scan-to" placeholder="to" min="1" style="width:64px;text-align:center" title="Last message # (1-based)">
+            <input type="number" class="ml-setting-select" id="ml-sel-scan-to" placeholder="to" min="0" style="width:64px;text-align:center" title="Last message # (matches ST's #)">
             <button class="ml-btn" id="ml-sel-scan-btn">Run selective scan</button>
         </div>`
     ));
@@ -858,11 +872,25 @@ function renderData($pane) {
         let from = parseInt($body.find("#ml-sel-scan-from").val(), 10);
         let to   = parseInt($body.find("#ml-sel-scan-to").val(), 10);
         if (isNaN(from) || isNaN(to)) { toastr?.warning?.("Enter both a start and end message number.", "Memory Loom"); return; }
-        if (from < 1) from = 1;
-        if (to > total) to = total;
+        if (from < 0) from = 0;                  // ST's first message is #0
+        if (to > total - 1) to = total - 1;      // last valid 0-based index
         if (from > to) { toastr?.warning?.("Start message must be before end message.", "Memory Loom"); return; }
-        // user types 1-based message numbers; chat indices are 0-based
-        runBatchScan($body.find("#ml-sel-scan-btn"), from - 1, to - 1, "Run selective scan");
+        // Inputs are ST message numbers (ST labels the first message #0), used
+        // DIRECTLY as 0-based indices — no offset, so what you type matches what
+        // you see in ST exactly.
+        runBatchScan($body.find("#ml-sel-scan-btn"), from, to, "Run selective scan");
+    });
+
+    // ── World memory generation toggle ───────────────────
+    // Governs the AUTOMATIC world pass on scene close AND during batch/selective
+    // scans. When off, those scans skip world entirely. The explicit "Scan world"
+    // button in Debug always runs regardless of this toggle.
+    const worldOn = getSetting("worldMemory.enabled", true);
+    $body.append(settingRow("World memory generation", "Include the strict world-memory pass automatically on scene close and during batch/selective scans · the Debug 'Scan world' button always runs regardless",
+        `<label class="ml-toggle"><input type="checkbox" id="ml-setting-worldEnabled" ${worldOn ? "checked" : ""}><span class="ml-slider"></span></label>`
+    ));
+    $body.find("#ml-setting-worldEnabled").on("change", function () {
+        setSetting("worldMemory.enabled", this.checked);
     });
 
     // ── Lorebook memory import (EXPERIMENTAL) ───────────
@@ -1085,7 +1113,7 @@ async function mlPopupConfirm(html) {
  * overlay, and the Home-tab processing banner. Home and Library (Scenes view)
  * re-render after every chunk so new material appears as it's created.
  */
-async function runBatchScan($btn, rangeStart, rangeEnd, idleLabel) {
+async function runBatchScan($btn, rangeStart, rangeEnd, idleLabel, worldOnly = false) {
     $btn.prop("disabled", true).text("Scanning...");
     const { showPanelLoading, hidePanelLoading, setProcessingStatus } = await import("./panel.js");
     try {
@@ -1106,15 +1134,17 @@ async function runBatchScan($btn, rangeStart, rangeEnd, idleLabel) {
             return;
         }
 
-        const { createScene, closeScene, recordLastClosedScene } = await import("../data/scenes.js");
+        const { createScene, closeScene, recordLastClosedScene, getAllScenes } = await import("../data/scenes.js");
         const { generateSceneSummary, generateMemoryEntries } = await import("../llm/writer.js");
+        const { generateWorldMemories } = await import("../llm/worldWriter.js");
         const { renderHomeTab } = await import("./home.js");
         const { renderLibraryTab } = await import("./library.js");
 
         const isSelective = rangeStart !== null || rangeEnd !== null;
+        const scanLabel = worldOnly ? "World scan" : (isSelective ? "Selective scan" : "Batch scan");
         toastr?.info?.(isSelective
-            ? `Selective scan started — messages ${rangeStart + 1}–${rangeEnd + 1}...`
-            : "Batch scan started — analyzing chat history...", "Memory Loom");
+            ? `${scanLabel} started — messages #${rangeStart}–#${rangeEnd}...`
+            : `${scanLabel} started — analyzing chat history...`, "Memory Loom");
 
         // Capture the chat we're scanning. ST mutates `chat` and swaps chat_metadata
         // in place on chat switch — if the user changes chats mid-scan, we MUST abort
@@ -1145,23 +1175,68 @@ async function runBatchScan($btn, rangeStart, rangeEnd, idleLabel) {
                 break;
             }
             const chunk = chunks[i];
-            const progressMsg = `Scanning messages ${chunk.start + 1}–${chunk.end + 1} (${i + 1}/${chunks.length})...`;
+            const progressMsg = `Scanning messages #${chunk.start}–#${chunk.end} (${i + 1}/${chunks.length})...`;
             showPanelLoading(progressMsg);
             setProcessingStatus(progressMsg);
             toastr?.info?.(progressMsg, "Memory Loom", { timeOut: 3000 });
             try {
-                const scene = createScene(chunk.start);
-                if (!scene) continue;
-                const closed = closeScene(scene.id, chunk.end);
-                if (!closed) continue;
-                recordLastClosedScene(closed.id);
-                await generateSceneSummary(closed.id);
-                const entries = await generateMemoryEntries(closed.id);
+                let closed = null;
+                if (worldOnly) {
+                    // Reuse an existing CLOSED scene overlapping this chunk if one
+                    // exists (e.g. a prior batch scan already created it) — creating
+                    // a new scene over already-scanned messages returns null and
+                    // would skip the chunk. Only create one where none exists.
+                    const existing = getAllScenes().find(s =>
+                        s.status === "closed" &&
+                        chunk.start >= s.messageStart &&
+                        (s.messageEnd === null || chunk.start <= s.messageEnd)
+                    );
+                    if (existing) {
+                        closed = existing;
+                        // ensure it has a summary for reconciliation
+                        if (!existing.llmSummary) await generateSceneSummary(existing.id);
+                    } else {
+                        const scene = createScene(chunk.start);
+                        if (!scene) continue;
+                        closed = closeScene(scene.id, chunk.end);
+                        if (!closed) continue;
+                        recordLastClosedScene(closed.id);
+                        await generateSceneSummary(closed.id);
+                    }
+                } else {
+                    const scene = createScene(chunk.start);
+                    if (!scene) continue;
+                    closed = closeScene(scene.id, chunk.end);
+                    if (!closed) continue;
+                    recordLastClosedScene(closed.id);
+                    // Always generate a scene summary — world reconciliation needs it,
+                    // and it's cheap context for everything downstream.
+                    await generateSceneSummary(closed.id);
+                }
+
+                let chunkCount = 0;
+                if (!worldOnly) {
+                    const entries = await generateMemoryEntries(closed.id);
+                    if (entries?.length) chunkCount += entries.length;
+                    // pause between the two LLM calls within a chunk
+                    await new Promise(r => setTimeout(r, 2000));
+                }
+                // World pass:
+                //   - world-only scan (explicit button): ALWAYS runs, force=true
+                //   - full batch scan: runs ONLY if World Memory Generation is on
+                // Reads raw chunk messages (via the scene) + reconciles against
+                // prior scene summaries and known world facts.
+                const doWorld = worldOnly || getSetting("worldMemory.enabled", true);
+                if (doWorld) {
+                    const world = await generateWorldMemories(closed.id, worldOnly /* force */);
+                    if (world?.length) chunkCount += world.length;
+                }
+
                 processed++;
-                if (entries?.length) {
-                    totalEntries += entries.length;
+                totalEntries += chunkCount;
+                if (chunkCount > 0) {
                     toastr?.success?.(
-                        `Chunk ${i + 1}: ${entries.length} ${entries.length === 1 ? "entry" : "entries"} queued`,
+                        `Chunk ${i + 1}: ${chunkCount} ${chunkCount === 1 ? "entry" : "entries"} queued`,
                         "Memory Loom", { timeOut: 2500 }
                     );
                 }
@@ -1170,13 +1245,13 @@ async function runBatchScan($btn, rangeStart, rangeEnd, idleLabel) {
             } catch (chunkErr) {
                 console.error(`[ML] Scan chunk ${chunk.start}–${chunk.end} failed:`, chunkErr);
             }
-            // Pause between chunks — each chunk fires 2 LLM calls with large payloads,
-            // and providers like GLM Cloud rate-limit aggressively on burst traffic.
+            // Pause between chunks — each chunk fires multiple LLM calls with large
+            // payloads, and providers like GLM Cloud rate-limit aggressively on bursts.
             await new Promise(r => setTimeout(r, 3000));
         }
 
         toastr?.success?.(
-            `Scan complete — ${processed}/${chunks.length} chunks, ${totalEntries} entries pending review.`,
+            `${worldOnly ? "World scan" : "Scan"} complete — ${processed}/${chunks.length} chunks, ${totalEntries} ${worldOnly ? "world " : ""}${totalEntries === 1 ? "entry" : "entries"} pending review.`,
             "Memory Loom", { timeOut: 6000 }
         );
         setProcessingStatus(null);

@@ -341,6 +341,7 @@ let _batchScanPerformed = false;
  */
 export function recordLastClosedScene(sceneId) {
     _lastClosedSceneId = sceneId;
+    setSetting("scan.lastClosedSceneId", sceneId);  // persist so undo survives reload
 }
 
 /**
@@ -356,6 +357,11 @@ export function markBatchScanPerformed() {
  * @returns {{available: boolean, reason: string, sceneId: string|null}}
  */
 export function getUndoStatus() {
+    // Restore persisted marker if the in-memory one was cleared by a page reload
+    if (!_lastClosedSceneId) {
+        const persisted = getSetting("scan.lastClosedSceneId", null);
+        if (persisted) _lastClosedSceneId = persisted;
+    }
     if (_batchScanPerformed) {
         return { available: false, reason: "Cannot undo a batch scan", sceneId: null };
     }
@@ -366,18 +372,37 @@ export function getUndoStatus() {
 }
 
 /**
- * Undo the last scan by removing the last closed scene and its entries.
+ * Undo the last scan: removes the last closed scene AND every memory entry
+ * (committed or pending) that scan generated. Previously this only deleted the
+ * scene record and left all the generated memories behind — a broken "undo".
+ * The marker is persisted in storage so it survives a page reload.
  * @returns {boolean} True if undone
  */
 export function undoLastScan() {
     const status = getUndoStatus();
     if (!status.available) return false;
+    const sceneId = status.sceneId;
 
-    // Delete the scene
-    const deleted = deleteScene(status.sceneId);
-    if (deleted) {
-        _lastClosedSceneId = null;
-        console.log(`[ML] Undid last scan: scene ${status.sceneId}`);
-    }
-    return deleted;
+    // Remove committed entries created by this scene
+    let removed = 0;
+    try {
+        const all = getAllEntries();
+        for (const e of all) {
+            if (e.sceneId === sceneId) { deleteEntry(e.id); removed++; }
+        }
+    } catch (err) { console.error("[ML] Undo: entry cleanup failed:", err); }
+
+    // Remove pending entries created by this scene (not yet committed)
+    try {
+        const pending = getPendingEntries() || [];
+        const keep = pending.filter(p => p.sceneId !== sceneId);
+        if (keep.length !== pending.length) savePendingEntries(keep);
+    } catch (err) { console.error("[ML] Undo: pending cleanup failed:", err); }
+
+    // Finally delete the scene itself
+    const deleted = deleteScene(sceneId);
+    _lastClosedSceneId = null;
+    setSetting("scan.lastClosedSceneId", null);
+    console.log(`[ML] Undid last scan: scene ${sceneId}, removed ${removed} committed + cleared pending`);
+    return deleted || removed > 0;
 }

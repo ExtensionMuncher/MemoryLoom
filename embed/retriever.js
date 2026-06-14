@@ -198,7 +198,10 @@ function applyFilters(candidates) {
 
 function applyDecay(entry, score, settings) {
     const ageMs = Date.now() - entry.createdAt;
-    const ageScenes = Math.floor(ageMs / (1000 * 60 * 60));
+    // Age proxy in DAYS (was mislabeled "scenes" but computed hours). Scene
+    // count isn't tracked per-entry, so age-since-creation in days is the stable
+    // proxy: decayStart and decay windows are interpreted in days.
+    const ageScenes = Math.floor(ageMs / (1000 * 60 * 60 * 24));
     const decayStart = settings.decayStart || 5;
     if (ageScenes < decayStart) return score;
     const minPriority = settings.minimumPriority || 0.3;

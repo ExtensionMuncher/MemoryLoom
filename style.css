@@ -1985,3 +1985,24 @@ body.ml-disabled .ml-scene-btn {
     border: 1px solid #333;
     border-radius: 3px;
 }
+
+/* ─── World update pending markers ─── */
+.ml-update-badge {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    color: #c9a227;
+    border: 1px solid #c9a227;
+    border-radius: 3px;
+    padding: 1px 6px;
+    white-space: nowrap;
+}
+.ml-update-note {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #c9a227;
+    background: rgba(201, 162, 39, 0.08);
+    border-left: 2px solid #c9a227;
+    padding: 5px 9px;
+    margin-bottom: 8px;
+    border-radius: 0 4px 4px 0;
+}

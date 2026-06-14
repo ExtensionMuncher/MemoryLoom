@@ -354,10 +354,12 @@ function normalizePrimaries(raw) {
  * @param {object} scene
  * @returns {string}
  */
-export function getSceneMessages(scene) {
+export function getSceneMessages(scene, includeHidden = false) {
     if (!chat || !Array.isArray(chat)) return "";
-    const msgs = chat.slice(scene.messageStart, (scene.messageEnd || chat.length) + 1)
-        .filter(msg => !(msg.is_system && msg.extra?.hidden));
+    let msgs = chat.slice(scene.messageStart, (scene.messageEnd || chat.length) + 1);
+    // Scans that explicitly want EVERYTHING in range (world scan) pass
+    // includeHidden=true so hidden-message markers are ignored, as intended.
+    if (!includeHidden) msgs = msgs.filter(msg => !(msg.is_system && msg.extra?.hidden));
 
     // Total budget so one request can never explode past provider token limits.
     // Normal scenes (under ~12k chars total) pass through with full prose.

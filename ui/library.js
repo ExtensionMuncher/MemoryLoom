@@ -129,7 +129,15 @@ function renderLibraryHeader($pane) {
 
     // Wire action buttons
     $header.find("#ml-new-entry-btn").on("click", () => openModal("ml-new-entry-modal"));
-    $header.find("#ml-new-folder-btn").on("click", () => openModal("ml-new-folder-modal"));
+    $header.find("#ml-new-folder-btn").on("click", () => {
+        // reset to a clean Primary state each open, and refresh parent options
+        // so any folders created this session are available as parents
+        $("#ml-nf-name").val("");
+        $("#ml-nf-pill-primary").addClass("on");
+        $("#ml-nf-pill-sub").removeClass("on");
+        $("#ml-nf-parent-group").hide();
+        openModal("ml-new-folder-modal");
+    });
     $header.find("#ml-consolidate-btn").on("click", () => openConsolidateModal($pane));
 
     $pane.append($header);
@@ -150,10 +158,10 @@ function renderMemoriesView($pane) {
         <div class="ml-filter-bar">
             <input class="ml-filter-input" type="text" id="ml-mem-search" placeholder="Search memories…">
             <select class="ml-filter-select" id="ml-mem-sort">
-                <option>Newest first</option>
-                <option>Oldest first</option>
-                <option>A–Z</option>
-                <option>Z–A</option>
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="az">A–Z</option>
+                <option value="za">Z–A</option>
             </select>
             <select class="ml-filter-select" id="ml-mem-folder-filter">
                 <option>All folders</option>
@@ -309,27 +317,34 @@ function renderMemoriesView($pane) {
 
     // Sort: re-order entry cards inside every folder/subfolder body
     $filterBar.find("#ml-mem-sort").on("change", function () {
-        const mode = $(this).val();
-        $container.find(".ml-folder-body, .ml-char-subfolder-body").each(function () {
-            const $body = $(this);
-            const $items = $body.children(".ml-mem-entry-wrap").get();
-            if ($items.length < 2) return;
-            $items.sort((a, b) => {
-                const ca = Number(a.dataset.created || 0), cb = Number(b.dataset.created || 0);
-                const ta = (a.dataset.title || "").toLowerCase(), tb = (b.dataset.title || "").toLowerCase();
-                if (mode === "Oldest first") return ca - cb;
-                if (mode === "A\u2013Z") return ta.localeCompare(tb);
-                if (mode === "Z\u2013A") return tb.localeCompare(ta);
-                return cb - ca; // Newest first (default)
-            });
-            $items.forEach(el => $body.append(el));
-        });
+        applySortMode($container, $(this).val());
     });
 
     $pane.append($container);
 }
 
-// ─── Folder Rendering ─────────────────────────────────────
+/**
+ * Re-order memory cards inside every folder body by the chosen mode.
+ * Operates on whatever body containers hold .ml-mem-entry-wrap cards, so it
+ * works for character subfolders, World, Plot, and custom folders alike.
+ */
+function applySortMode($container, mode) {
+    $container.find(".ml-folder-body, .ml-char-subfolder-body, .ml-scene-archive-members").each(function () {
+        const $body = $(this);
+        // direct entry cards only (don't yank cards out of nested subfolders)
+        const items = $body.children(".ml-mem-entry-wrap").get();
+        if (items.length < 2) return;
+        items.sort((a, b) => {
+            const ca = Number(a.dataset.created || 0), cb = Number(b.dataset.created || 0);
+            const ta = (a.dataset.title || "").toLowerCase(), tb = (b.dataset.title || "").toLowerCase();
+            if (mode === "oldest") return ca - cb;
+            if (mode === "az") return ta.localeCompare(tb);
+            if (mode === "za") return tb.localeCompare(ta);
+            return cb - ca; // newest (default)
+        });
+        items.forEach(el => $body.append(el));
+    });
+}
 
 
 
@@ -544,13 +559,16 @@ function renderFolder(folder) {
                         ? `${subfolders.length} ${subfolders.length === 1 ? "subfolder" : "subfolders"}, ${entries.length} ${entries.length === 1 ? "entry" : "entries"}`
                         : `${entries.length} ${entries.length === 1 ? "entry" : "entries"}`
                 }</span>
-                ${["ml_folder_world", "ml_folder_characters", "ml_folder_plot"].includes(folder.id) ? "" : `
+                ${(folder.parentId && !["ml_folder_world","ml_folder_characters","ml_folder_plot"].includes(folder.id)) ? `
+                <button class="ml-icon-btn ml-subfolder-img-btn" title="Upload folder image" data-folder-id="${folder.id}" style="width:22px;height:22px">
+                    ${iconSvg("ico-image", 12, 12, "#888")}
+                </button>
                 <button class="ml-icon-btn ml-rename-folder-btn" title="Rename this folder" data-folder-id="${folder.id}" style="width:22px;height:22px">
                     ${iconSvg("ico-edit", 12, 12, "#888")}
                 </button>
                 <button class="ml-icon-btn ml-del-folder-btn" title="Delete this folder" data-folder-id="${folder.id}" style="color:#b05b5b;width:22px;height:22px">
                     ${iconSvg("ico-trash", 12, 12, "#b05b5b")}
-                </button>`}
+                </button>` : ""}
                 ${iconSvg("ico-chevron-down", 14, 14, "#666")}
             </div>
             <div class="ml-folder-body"></div>
@@ -569,6 +587,13 @@ function renderFolder(folder) {
         renameFolderFlow(folder);
     });
 
+    // Custom subfolder image upload (header button on subfolders)
+    $folder.find(".ml-subfolder-img-btn").on("click", function (e) {
+        e.stopPropagation();
+        $("#ml-img-upload").data("target-folder-id", folder.id);
+        $("#ml-img-upload").click();
+    });
+
     const $body = $folder.find(".ml-folder-body");
 
     // Toggle expand/collapse on header click (persist open state)
@@ -577,6 +602,74 @@ function renderFolder(folder) {
         const isOpen = $folder.toggleClass("open").hasClass("open");
         if (isOpen) openFolders.add(folder.id); else openFolders.delete(folder.id);
     });
+
+    // Custom subfolder banner (if image set) — mirrors character banner
+    if (folder.parentId && folder.hasImage && folder.imagePath) {
+        $body.append(`
+            <div class="ml-char-banner">
+                <img src="${folder.imagePath}" alt="${escapeHtml(folder.name)}">
+                <div class="ml-char-banner-gradient"></div>
+            </div>
+        `);
+    }
+
+    // In-body menu bar for top-level folders (World / Plot / custom) — mirrors
+    // the character-subfolder info row, tucked INTO the folder rather than
+    // crammed into the header line.
+    if (!folder.parentId && folder.id !== "ml_folder_characters") {
+        const cat = folder.id === "ml_folder_world" ? "world" : folder.id === "ml_folder_plot" ? "plot" : folder.id;
+        const isCustom = !["ml_folder_world", "ml_folder_plot"].includes(folder.id);
+        const $infoRow = $(`
+            <div class="ml-char-info-row">
+                <div style="flex:1;min-width:0">
+                    <div class="ml-char-name">${escapeHtml(folder.name)}</div>
+                    <div class="ml-char-stats-line">${entries.length} ${entries.length === 1 ? "entry" : "entries"} · updated ${relativeTime(folderLastUpdated(folder.id))}</div>
+                </div>
+                <div class="ml-btn-row">
+                    <button class="ml-icon-btn ml-folder-new-entry-btn" title="Add an entry to this folder" data-folder-cat="${cat}">
+                        ${iconSvg("ico-plus", 14, 14, "#888")}
+                    </button>
+                    <button class="ml-icon-btn ml-folder-consolidate-btn" title="Consolidate this folder's entries only">
+                        ${iconSvg("ico-book", 14, 14, "#888")}
+                    </button>
+                    ${isCustom ? `
+                    <button class="ml-icon-btn ml-folder-img-bar-btn" title="Upload folder image">
+                        ${iconSvg("ico-image", 14, 14, "#888")}
+                    </button>
+                    <button class="ml-icon-btn ml-folder-rename-bar-btn" title="Rename this folder">
+                        ${iconSvg("ico-edit", 14, 14, "#888")}
+                    </button>
+                    <button class="ml-icon-btn ml-folder-del-bar-btn" title="Delete this folder" style="color:#b05b5b">
+                        ${iconSvg("ico-trash", 14, 14, "#b05b5b")}
+                    </button>` : ""}
+                </div>
+            </div>
+        `);
+        $infoRow.find(".ml-folder-new-entry-btn").on("click", (e) => {
+            e.stopPropagation();
+            openModal("ml-new-entry-modal");
+            const $c = $("#ml-ne-category");
+            if ($c.length) { $c.val(cat).trigger("change"); }
+        });
+        $infoRow.find(".ml-folder-consolidate-btn").on("click", (e) => {
+            e.stopPropagation();
+            consolidateFolderFlow(folder);
+        });
+        $infoRow.find(".ml-folder-img-bar-btn").on("click", (e) => {
+            e.stopPropagation();
+            $("#ml-img-upload").data("target-folder-id", folder.id);
+            $("#ml-img-upload").click();
+        });
+        $infoRow.find(".ml-folder-rename-bar-btn").on("click", (e) => {
+            e.stopPropagation();
+            renameFolderFlow(folder);
+        });
+        $infoRow.find(".ml-folder-del-bar-btn").on("click", (e) => {
+            e.stopPropagation();
+            confirmDeleteSubfolder(folder);
+        });
+        $body.append($infoRow);
+    }
 
     // Render subfolders (character subfolders, group, etc.)
     if (folder.id === "ml_folder_characters") {
@@ -649,7 +742,7 @@ function renderCharacterSubfolder(folder) {
         <div class="ml-char-info-row">
             <div style="flex:1;min-width:0">
                 <div class="ml-char-name">${escapeHtml(folder.name)}</div>
-                <div class="ml-char-stats-line">${count} memories · last updated recently</div>
+                <div class="ml-char-stats-line">${count} ${count === 1 ? "memory" : "memories"} · updated ${relativeTime(folderLastUpdated(folder.id))}</div>
             </div>
             <div class="ml-btn-row">
                 ${buttons.showImageUpload ? `
@@ -736,6 +829,38 @@ function renderCharacterSubfolder(folder) {
 
 // ─── Memory Entry Rendering ───────────────────────────────
 
+/** Human-friendly relative time from a timestamp (ms). */
+function relativeTime(ts) {
+    if (!ts) return "never";
+    const diff = Date.now() - ts;
+    if (diff < 0) return "just now";
+    const s = Math.floor(diff / 1000);
+    if (s < 60) return "just now";
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m} ${m === 1 ? "minute" : "minutes"} ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h} ${h === 1 ? "hour" : "hours"} ago`;
+    const d = Math.floor(h / 24);
+    if (d < 7) return `${d} ${d === 1 ? "day" : "days"} ago`;
+    const w = Math.floor(d / 7);
+    if (w < 5) return `${w} ${w === 1 ? "week" : "weeks"} ago`;
+    const mo = Math.floor(d / 30);
+    if (mo < 12) return `${mo} ${mo === 1 ? "month" : "months"} ago`;
+    const y = Math.floor(d / 365);
+    return `${y} ${y === 1 ? "year" : "years"} ago`;
+}
+
+/** Most recent updatedAt/createdAt across a folder's direct entries (ms), or 0. */
+function folderLastUpdated(folderId) {
+    const entries = getEntriesByFolder(folderId);
+    let latest = 0;
+    for (const e of entries) {
+        const t = e.updatedAt || e.createdAt || 0;
+        if (t > latest) latest = t;
+    }
+    return latest;
+}
+
 /** Rough token estimate (~4 chars/token) for a memory entry's injected text. */
 function estimateTokens(entry) {
     const text = `${entry.title || ""}\n${entry.datetime || ""}\n${entry.content || ""}\n${(entry.primaryCharacters||[entry.primaryCharacter]).join(", ")}\n${(entry.keyCharacters||[]).join(", ")}`;
@@ -797,14 +922,15 @@ function renderMemoryEntry(entry) {
             <div class="ml-mem-full-date">${escapeHtml(entry.datetime)}</div>
             <div class="ml-mem-full-rule"></div>
             <div class="ml-mem-full-prose">${escapeHtml(entry.content)}</div>
+            ${entry.category === "character" ? `
             <div class="ml-mem-full-chars">
                 ${entry.primaryCharacter ? `<span>Primary</span> · ${escapeHtml(entry.primaryCharacter)}<br>` : ""}
                 ${entry.keyCharacters && entry.keyCharacters.length > 0 ? `<span>Key</span> · ${escapeHtml(entry.keyCharacters.join(", "))}` : ""}
             </div>
-            ${buildDeltaDisplay(entry)}
+            ${buildDeltaDisplay(entry)}` : ""}
             <div class="ml-btn-row">
                 <button class="ml-btn ml-edit-entry-btn" data-entry-id="${entry.id}">Edit</button>
-                ${hasDelta(entry) ? '<button class="ml-btn ml-impact-btn" data-entry-id="' + entry.id + '">Show Impact</button>' : ''}
+                ${entry.category === "character" && hasDelta(entry) ? '<button class="ml-btn ml-impact-btn" data-entry-id="' + entry.id + '">Show Impact</button>' : ''}
                 <button class="ml-btn ml-important-entry-btn" data-entry-id="${entry.id}">${entry.important ? "★ Core" : "☆ Mark core"}</button>
                 <button class="ml-btn ml-exclude-entry-btn" data-entry-id="${entry.id}">${entry.excludeFromConsolidation ? "⊘ Excluded" : "Exclude from consld."}</button>
                 <button class="ml-btn ml-move-entry-btn" data-entry-id="${entry.id}">Move</button>
@@ -946,6 +1072,7 @@ function toggleEntryEdit(entryId) {
         <div class="ml-mem-full-prose-edit">
             <div class="ml-field-hdr" style="display:flex;align-items:center"><span style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#666">Memory context</span><i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="ml-edit-content-${entryId}" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer"></i></div>
             <textarea class="ml-form-textarea" id="ml-edit-content-${entryId}" rows="6">${escapeHtml(entry.content)}</textarea>
+            ${entry.category === "character" ? `
             <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#666;margin-top:6px">Before</div>
             <textarea class="ml-form-textarea" id="ml-edit-before-${entryId}" rows="2">${escapeHtml(entry.delta?.before_state || "")}</textarea>
             <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#666;margin-top:6px">After</div>
@@ -955,7 +1082,7 @@ function toggleEntryEdit(entryId) {
             <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#666;margin-top:6px">Primary character(s) · comma-separate · 2+ routes to Group</div>
             <input class="ml-form-input" id="ml-edit-primary-${entryId}" value="${escapeHtml((entry.primaryCharacters && entry.primaryCharacters.length ? entry.primaryCharacters : (entry.primaryCharacter ? [entry.primaryCharacter] : [])).join(", "))}" placeholder="Who this memory belongs to">
             <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#666;margin-top:6px">Key characters · comma-separate · optional</div>
-            <input class="ml-form-input" id="ml-edit-key-${entryId}" value="${escapeHtml((entry.keyCharacters || []).join(", "))}" placeholder="Supporting cast (optional)">
+            <input class="ml-form-input" id="ml-edit-key-${entryId}" value="${escapeHtml((entry.keyCharacters || []).join(", "))}" placeholder="Supporting cast (optional)">` : ""}
         </div>
         <label class="ml-important-row" style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer">
             <input type="checkbox" id="ml-edit-important-${entryId}" ${entry.important ? "checked" : ""}>
@@ -976,22 +1103,25 @@ function toggleEntryEdit(entryId) {
         const title = $(`#ml-edit-title-${entryId}`).val().trim();
         const datetime = $(`#ml-edit-datetime-${entryId}`).val().trim();
         const content = $(`#ml-edit-content-${entryId}`).val().trim();
-        const delta = Object.assign({}, entry.delta || {}, {
-            before_state: $(`#ml-edit-before-${entryId}`).val().trim(),
-            after_state:  $(`#ml-edit-after-${entryId}`).val().trim(),
-            delta:        $(`#ml-edit-delta-${entryId}`).val().trim(),
-        });
-        const primaries = ($(`#ml-edit-primary-${entryId}`).val() || "").split(",").map(s => s.trim()).filter(Boolean);
-        const keyChars  = ($(`#ml-edit-key-${entryId}`).val() || "").split(",").map(s => s.trim()).filter(Boolean);
+        const isChar = entry.category === "character";
+        const delta = isChar ? Object.assign({}, entry.delta || {}, {
+            before_state: ($(`#ml-edit-before-${entryId}`).val() || "").trim(),
+            after_state:  ($(`#ml-edit-after-${entryId}`).val() || "").trim(),
+            delta:        ($(`#ml-edit-delta-${entryId}`).val() || "").trim(),
+        }) : (entry.delta || {});
+        const primaries = isChar ? ($(`#ml-edit-primary-${entryId}`).val() || "").split(",").map(s => s.trim()).filter(Boolean) : [];
+        const keyChars  = isChar ? ($(`#ml-edit-key-${entryId}`).val() || "").split(",").map(s => s.trim()).filter(Boolean) : (entry.keyCharacters || []);
         const important = $(`#ml-edit-important-${entryId}`).prop("checked");
         const excludeFromConsolidation = $(`#ml-edit-exclude-${entryId}`).prop("checked");
 
         const update = {
             title, datetime, content, delta, important, excludeFromConsolidation,
             keyCharacters: keyChars,
-            primaryCharacters: primaries,
-            primaryCharacter: primaries.length === 1 ? primaries[0] : "",
         };
+        if (isChar) {
+            update.primaryCharacters = primaries;
+            update.primaryCharacter = primaries.length === 1 ? primaries[0] : "";
+        }
 
         // Re-routing rule: editing characters does NOT move the memory, with one
         // exception — going from single to multiple primaries routes to Group;
@@ -1101,9 +1231,9 @@ function renderConsolidatedSceneFolder(consolidationId, scenes) {
                 <span class="ml-scene-archive-folder-count">${scenes.length} ${scenes.length === 1 ? "scene" : "scenes"}</span>
             </div>
             <div class="ml-scene-archive-folder-body">
-                <div class="ml-field-hdr"><span class="ml-lbl" style="margin-bottom:0">Folder title · editable</span></div>
+                <div class="ml-field-hdr"><span class="ml-lbl" style="margin-bottom:0">Folder title · editable</span><i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="ml-${fid}-title" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer;transition:all var(--animation-duration-2x,0.3s) ease-in-out"></i></div>
                 <input class="ml-form-input" id="ml-${fid}-title" value="${escapeHtml(folderTitle)}" style="margin-bottom:8px">
-                <div class="ml-field-hdr"><span class="ml-lbl" style="margin-bottom:0">Folder summary · editable</span></div>
+                <div class="ml-field-hdr"><span class="ml-lbl" style="margin-bottom:0">Folder summary · editable</span><i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="ml-${fid}-summary" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer;transition:all var(--animation-duration-2x,0.3s) ease-in-out"></i></div>
                 <textarea class="ml-form-textarea" id="ml-${fid}-summary" rows="4" style="margin-bottom:8px">${escapeHtml(folderSummary)}</textarea>
                 <div class="ml-btn-row" style="margin-bottom:10px">
                     <button class="ml-btn ml-${fid}-save">Save folder</button>
@@ -1411,7 +1541,7 @@ function renderNewEntryModal($pane) {
                     </div>
                     <textarea class="ml-form-textarea" id="ml-ne-content" placeholder="Write the memory entry here. Use rich, specific, sensory and emotionally precise prose…"></textarea>
                 </div>
-                <div class="ml-form-group">
+                <div class="ml-form-group ml-charonly-field">
                     <div class="ml-field-hdr"><div class="ml-form-label" style="margin-bottom:0">Before</div></div>
                     <textarea class="ml-form-textarea" id="ml-ne-before" rows="2" placeholder="The character's stance before this moment (optional)"></textarea>
                     <div class="ml-field-hdr"><div class="ml-form-label" style="margin-bottom:0">After</div></div>
@@ -1426,6 +1556,7 @@ function renderNewEntryModal($pane) {
                             <option value="character">Character</option>
                             <option value="world">World</option>
                             <option value="plot">Plot</option>
+                            ${getAllFolders().filter(f => !f.parentId && !["ml_folder_characters","ml_folder_world","ml_folder_plot"].includes(f.id)).map(f => `<option value="${f.id}">${escapeHtml(f.name)}</option>`).join("")}
                         </select>
                     </div>
                     <div class="ml-form-group">
@@ -1434,14 +1565,14 @@ function renderNewEntryModal($pane) {
                         <div class="ml-form-hint">For Characters: pick a specific character, or pick "Characters" and a new subfolder is made from the primary character's name on save.</div>
                     </div>
                 </div>
-                <div class="ml-form-group">
+                <div class="ml-form-group ml-charonly-field">
                     <label class="ml-form-label">Primary character(s)</label>
                     <div class="ml-form-hint">Separate multiple names with a comma. 2+ primaries → auto-routes to Group subfolder.</div>
                     <div class="ml-char-tag-input" id="ml-ne-primary-wrap">
                         <input class="ml-char-tag-ghost" id="ml-ne-primary-input" placeholder="Type name(s), separate with comma…">
                     </div>
                 </div>
-                <div class="ml-form-group">
+                <div class="ml-form-group ml-charonly-field">
                     <label class="ml-form-label">Key characters</label>
                     <div class="ml-form-hint">Supporting cast — for reference only, no routing effect.</div>
                     <div class="ml-char-tag-input" id="ml-ne-key-wrap">
@@ -1465,29 +1596,72 @@ function renderNewEntryModal($pane) {
     });
 
     // Category → Destination: rebuild the Destination dropdown to match category.
-    // This is what was broken — the dropdown never reacted to the category switch.
+    // Scoped to $modal so it works even before the modal is appended to the DOM
+    // (the previous version queried the live document and ran before append,
+    // leaving the dropdown empty until you toggled categories).
     function populateDestination(cat) {
         const all = getAllFolders();
         let opts = [];
         if (cat === "world") {
-            opts = all.filter(f => f.id === "ml_folder_world");
+            // World folder + any custom subfolders under it
+            opts = all.filter(f => f.id === "ml_folder_world" || f.parentId === "ml_folder_world");
         } else if (cat === "plot") {
-            opts = all.filter(f => f.id === "ml_folder_plot");
-        } else {
-            // Characters: the top-level Characters folder + every character subfolder
+            opts = all.filter(f => f.id === "ml_folder_plot" || f.parentId === "ml_folder_plot");
+        } else if (cat === "character") {
             const top = all.filter(f => f.id === "ml_folder_characters");
             const subs = all.filter(f => f.parentId === "ml_folder_characters");
             opts = [...top, ...subs];
+        } else {
+            // Custom category → the matching custom top-level folder + its subfolders
+            const top = all.filter(f => f.id === cat);
+            const subs = all.filter(f => f.parentId === cat);
+            opts = [...top, ...subs];
         }
-        const $sel = $("#ml-ne-folder");
+        const $sel = $modal.find("#ml-ne-folder");
         $sel.empty();
         for (const f of opts) {
-            const indent = (f.parentId === "ml_folder_characters") ? "— " : "";
+            const indent = f.parentId ? "— " : "";
             $sel.append(`<option value="${f.id}">${indent}${escapeHtml(f.name)}</option>`);
         }
     }
-    $modal.find("#ml-ne-category").on("change", function () { populateDestination($(this).val()); });
-    populateDestination("character"); // initial fill (Character is the default category)
+    function updateRoutePreview() {
+        const cat = $modal.find("#ml-ne-category").val();
+        const $prev = $modal.find("#ml-ne-route-preview");
+        if (cat === "character") {
+            const primaryRaw = ($modal.find("#ml-ne-primary-input").val() || "").trim();
+            const primaries = primaryRaw ? primaryRaw.split(",").map(s => s.trim()).filter(Boolean) : [];
+            const destId = ($modal.find("#ml-ne-folder").val() || "").trim();
+            if (primaries.length >= 2) {
+                $prev.html(`<span>Destination:</span> Group subfolder (${escapeHtml(primaries.join(" & "))})`);
+            } else if (destId === "ml_folder_characters" || !destId) {
+                if (primaries.length === 1) {
+                    $prev.html(`<span>Destination:</span> Characters › ${escapeHtml(primaries[0])} (new subfolder if needed)`);
+                } else {
+                    $prev.html(`<span>Destination:</span> enter a primary character to route`);
+                }
+            } else {
+                const f = getAllFolders().find(x => x.id === destId);
+                $prev.html(`<span>Destination:</span> ${escapeHtml(f ? f.name : "selected folder")}`);
+            }
+        } else {
+            const destId = ($modal.find("#ml-ne-folder").val() || "").trim();
+            const f = getAllFolders().find(x => x.id === destId);
+            $prev.html(`<span>Destination:</span> ${escapeHtml(f ? f.name : (cat === "world" ? "World" : cat === "plot" ? "Plot" : "selected folder"))}`);
+        }
+    }
+
+    function applyCategoryUI(cat) {
+        populateDestination(cat);
+        // Character-only fields (before/after/delta, primary, key) are hidden for
+        // world/plot/custom categories — those don't have characters or deltas.
+        const showChar = (cat === "character");
+        $modal.find(".ml-charonly-field").toggle(showChar);
+        updateRoutePreview();
+    }
+    $modal.find("#ml-ne-category").on("change", function () { applyCategoryUI($(this).val()); });
+    $modal.find("#ml-ne-folder").on("change", updateRoutePreview);
+    $modal.find("#ml-ne-primary-input").on("input", updateRoutePreview);
+    applyCategoryUI("character"); // initial fill (Character is the default category)
 
     // Wire cancel button
     $modal.find("#ml-cancel-entry-btn").on("click", () => closeModal("ml-new-entry-modal"));
@@ -1505,47 +1679,52 @@ function renderNewEntryModal($pane) {
             return;
         }
 
-        const primaryInput = $("#ml-ne-primary-input").val().trim();
+        const cat = category || "character";
+        const isChar = cat === "character";
+
+        const primaryInput = isChar ? $("#ml-ne-primary-input").val().trim() : "";
         const primaries = primaryInput ? primaryInput.split(",").map(s => s.trim()).filter(Boolean) : [];
 
-        // Key characters — these were being thrown away before (hardcoded []).
-        const keyInput = $("#ml-ne-key-input").val().trim();
+        const keyInput = isChar ? $("#ml-ne-key-input").val().trim() : "";
         const keyChars = keyInput ? keyInput.split(",").map(s => s.trim()).filter(Boolean) : [];
 
-        const cat = category || "character";
-        if (cat === "character" && primaries.length === 0) {
+        if (isChar && primaries.length === 0) {
             toastr?.warning?.("Character memories need at least one primary character.");
             return;
         }
 
-        // Destination is now a folder ID from the dropdown.
+        // Destination is a folder ID from the dropdown.
         let folderId = ($("#ml-ne-folder").val() || "").trim();
 
         // If the user left it on the top-level "Characters" folder, route by the
         // primary character instead — reusing the same get-or-create-subfolder
         // path the writer uses, so a brand-new character gets a fresh subfolder.
-        if (folderId === "ml_folder_characters" || (cat === "character" && !folderId)) {
+        if (folderId === "ml_folder_characters" || (isChar && !folderId)) {
             folderId = ""; // let createEntry's routeEntry assign the character subfolder
         }
 
-        const entry = createEntry({
+        const entryData = {
             title,
             datetime,
             content,
             category: cat,
-            primaryCharacter: primaries,
-            primaryCharacters: primaries,
-            keyCharacters: keyChars,
             source: "manual",
             folderId,
-            delta: {
+        };
+        // Character entries carry characters + delta; world/plot/custom do not.
+        if (isChar) {
+            entryData.primaryCharacter = primaries;
+            entryData.primaryCharacters = primaries;
+            entryData.keyCharacters = keyChars;
+            entryData.delta = {
                 before_state: ($("#ml-ne-before").val() || "").trim(),
                 after_state:  ($("#ml-ne-after").val() || "").trim(),
                 delta:        ($("#ml-ne-delta").val() || "").trim(),
                 delta_type: [],
                 low_delta_flag: false,
-            },
-        });
+            };
+        }
+        const entry = createEntry(entryData);
 
         embedEntry(entry).catch(err => console.warn("[ML] Embed failed:", err));
         toastr?.success?.(`Entry "${title || "Untitled"}" created.`);
@@ -1584,11 +1763,7 @@ function renderNewFolderModal($pane) {
                 </div>
                 <div class="ml-form-group" id="ml-nf-parent-group" style="display:none">
                     <label class="ml-form-label">Place inside</label>
-                    <select class="ml-form-select" id="ml-nf-parent">
-                        <option value="ml_folder_characters">Characters</option>
-                        <option value="ml_folder_world">World</option>
-                        <option value="ml_folder_plot">Plot</option>
-                    </select>
+                    <select class="ml-form-select" id="ml-nf-parent"></select>
                 </div>
                 <div class="ml-route-preview" id="ml-nf-preview">
                     <span>Primary folder</span> · sits at the top level alongside World / Character / Plot · gets a <span>+ New entry</span> button
@@ -1609,16 +1784,31 @@ function renderNewFolderModal($pane) {
     // Wire cancel
     $modal.find("#ml-cancel-folder-btn").on("click", () => closeModal("ml-new-folder-modal"));
 
+    // Populate the "Place inside" dropdown from ALL top-level folders, so custom
+    // folders are valid parents too — not just the three defaults. Rebuilt each
+    // time Subfolder is chosen, so folders created this session show up.
+    function refreshParentOptions() {
+        const $sel = $modal.find("#ml-nf-parent");
+        const prev = $sel.val();
+        $sel.empty();
+        const tops = getAllFolders().filter(f => !f.parentId);
+        for (const f of tops) {
+            $sel.append(`<option value="${f.id}">${escapeHtml(f.name)}</option>`);
+        }
+        if (prev && tops.some(f => f.id === prev)) $sel.val(prev);
+    }
+
     // Wire level pills
     $modal.find("#ml-nf-pill-primary").on("click", function () {
         $(this).addClass("on");
-        $("#ml-nf-pill-sub").removeClass("on");
-        $("#ml-nf-parent-group").hide();
+        $modal.find("#ml-nf-pill-sub").removeClass("on");
+        $modal.find("#ml-nf-parent-group").hide();
     });
     $modal.find("#ml-nf-pill-sub").on("click", function () {
         $(this).addClass("on");
-        $("#ml-nf-pill-primary").removeClass("on");
-        $("#ml-nf-parent-group").show();
+        $modal.find("#ml-nf-pill-primary").removeClass("on");
+        refreshParentOptions();
+        $modal.find("#ml-nf-parent-group").show();
     });
 
     // Wire create
@@ -1657,7 +1847,7 @@ function renderCropModal($pane) {
         <div class="ml-crop-overlay" id="ml-crop-modal">
             <div class="ml-crop-modal">
                 <div>
-                    <div class="ml-crop-title">Crop character image</div>
+                    <div class="ml-crop-title">Crop folder image</div>
                     <div class="ml-crop-sub">Drag to reposition · drag corners to resize · aspect ratio locked to banner</div>
                 </div>
                 <div class="ml-crop-wrap" id="ml-crop-wrap">
@@ -1667,6 +1857,10 @@ function renderCropModal($pane) {
                     <div class="ml-crop-handle ne" id="ml-ch-ne"></div>
                     <div class="ml-crop-handle sw" id="ml-ch-sw"></div>
                     <div class="ml-crop-handle se" id="ml-ch-se"></div>
+                </div>
+                <div class="ml-btn-row" style="margin-bottom:8px">
+                    <button class="ml-btn ml-crop-rotate-l" title="Rotate left 90°">⟲ Rotate left</button>
+                    <button class="ml-btn ml-crop-rotate-r" title="Rotate right 90°">⟳ Rotate right</button>
                 </div>
                 <div class="ml-btn-row">
                     <button class="ml-btn" id="ml-crop-skip">Skip crop</button>
@@ -1698,15 +1892,21 @@ function renderCropModal($pane) {
 
     // Wire close buttons — crop & save uses canvas to produce cropped data URL
     $modal.find("#ml-crop-cancel").on("click", () => closeModal("ml-crop-modal"));
+
+    // Rotate buttons — physically rotate the source image 90°, then re-init the
+    // crop box. Rotating the data (not just CSS) keeps the crop math simple,
+    // since by save time the image is already in its final orientation.
+    $modal.find(".ml-crop-rotate-l").on("click", () => rotateCropImage(-90));
+    $modal.find(".ml-crop-rotate-r").on("click", () => rotateCropImage(90));
     $modal.find("#ml-crop-skip").on("click", async () => {
         await applyBannerImage();
-        toastr?.success?.("Character image saved (uncropped).");
+        toastr?.success?.("Folder image saved (uncropped).");
         closeModal("ml-crop-modal");
         renderLibraryTab($("#ml-p-library"));
     });
     $modal.find("#ml-crop-apply").on("click", async () => {
         await applyCroppedImage();
-        toastr?.success?.("Character image cropped and saved.");
+        toastr?.success?.("Folder image cropped and saved.");
         closeModal("ml-crop-modal");
         renderLibraryTab($("#ml-p-library"));
     });
@@ -1715,6 +1915,32 @@ function renderCropModal($pane) {
 }
 
 // ─── Crop Engine ──────────────────────────────────────────
+
+/**
+ * Rotate the crop image by ±90°. Re-renders the image data to a rotated canvas,
+ * swaps it into the <img>, and re-initializes the crop box once the new image
+ * loads. Works for both character and custom-subfolder banners (shared modal).
+ */
+function rotateCropImage(deg) {
+    const img = document.getElementById("ml-crop-img");
+    if (!img || !img.src) return;
+    const tmp = new Image();
+    tmp.onload = () => {
+        const canvas = document.createElement("canvas");
+        const w = tmp.naturalWidth, h = tmp.naturalHeight;
+        // 90° rotations swap width/height
+        canvas.width = h;
+        canvas.height = w;
+        const ctx = canvas.getContext("2d");
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.rotate(deg * Math.PI / 180);
+        ctx.drawImage(tmp, -w / 2, -h / 2);
+        const rotated = canvas.toDataURL("image/jpeg", 0.95);
+        img.onload = () => initCrop();
+        img.src = rotated;
+    };
+    tmp.src = img.src;
+}
 
 // Banner aspect ratio: wide rectangle (4:1)
 const BANNER_W = 4, BANNER_H = 1;

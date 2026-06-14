@@ -410,6 +410,11 @@ export function getFolderButtons(folder) {
     if (folder.parentId === "ml_folder_characters" && !folder.characterName) {
         return { showImageUpload: true, showNewEntry: true };
     }
+    // Custom subfolders (under World, Plot, or any custom top-level folder) also
+    // get image upload + new entry — they're user-curated and may want a banner.
+    if (folder.parentId && folder.parentId !== "ml_folder_characters") {
+        return { showImageUpload: true, showNewEntry: true };
+    }
     // Everything else gets new entry only
     return { showImageUpload: false, showNewEntry: true };
 }

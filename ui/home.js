@@ -3,6 +3,25 @@ import { isEnabled, isSidecarPaused, setSidecarPaused, getSetting } from "../set
 import { renderHomeHeader, getProcessingStatus } from "./panel.js";
 import { getPendingEntries, savePendingEntries, getOpenSceneId, getScenes } from "../data/storage.js";
 import { getEntry, createEntry, deleteEntry, updateEntry } from "../data/entries.js";
+
+/**
+ * Commit one pending entry to the library. If it's a world UPDATE (carries
+ * updateTargetId), the existing target entry is deleted first so the revision
+ * replaces it cleanly. Returns the created entry.
+ */
+function commitPendingEntry(e) {
+    if (e && e.updateTargetId) {
+        try {
+            const target = getEntry(e.updateTargetId);
+            if (target) deleteEntry(e.updateTargetId);
+        } catch (err) { console.error("[ML] World update: target removal failed:", err); }
+        // strip the marker so it commits as a normal world entry
+        const clean = Object.assign({}, e);
+        delete clean.updateTargetId;
+        return createEntry(clean);
+    }
+    return createEntry(e);
+}
 import { embedEntry } from "../embed/embedder.js";
 import { regenerateEntry, generateMemoryEntries } from "../llm/writer.js";
 import { iconSvg } from "../lib/icons.js";
@@ -89,15 +108,15 @@ function renderPendingSection($pane) {
         worldItems.forEach(([e, i]) => $pane.append(renderCard(e, i, $pane)));
     }
     const $ga = $('<div class="ml-btn-row" style="margin-top:11px"><button class="ml-btn-confirm" id="ml-commit-all" style="font-size:12px;padding:7px 18px">Commit all</button><button class="ml-btn-danger" id="ml-discard-all">Discard all</button></div>');
-    $(document).on("click"+NS, "#ml-commit-all", async () => { const ok = await popup(`Commit all ${pl.length} entries?`); if(ok) { pl.forEach(e => { try{ const created = createEntry(e); embedEntry(created).catch(err => console.warn("[ML] Embed failed:", err)); }catch(err){console.error(err)} }); savePendingEntries(null); renderHomeTab($pane); }});
+    $(document).on("click"+NS, "#ml-commit-all", async () => { const ok = await popup(`Commit all ${pl.length} entries?`); if(ok) { pl.forEach(e => { try{ const created = commitPendingEntry(e); embedEntry(created).catch(err => console.warn("[ML] Embed failed:", err)); }catch(err){console.error(err)} }); savePendingEntries(null); renderHomeTab($pane); }});
     $(document).on("click"+NS, "#ml-discard-all", async () => { const ok = await popup("Discard all pending entries?"); if(ok) { savePendingEntries(null); renderHomeTab($pane); }});
     $pane.append($ga);
 }
 function renderCard(entry,i,$pane) {
     const lo = entry.delta?.low_delta_flag;
-    const $c = $(`<div class="ml-entry-card" id="ml-pc-${i}"><div class="ml-entry-card-hdr"><div style="flex:1;min-width:0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;flex-wrap:wrap"><div class="ml-entry-title" style="margin-bottom:0">${h(entry.title||"Untitled")}</div>${lo?'<span class="ml-delta-flag">low delta</span>':''}</div><div class="ml-entry-meta">${h(entry.primaryCharacter||(entry.primaryCharacters||[]).join(", ")||"Unknown")} · ${h(entry.category||"character")}${entry.sceneId?' · Scene '+getSceneDisplayNum(entry.sceneId):''}</div></div>${iconSvg("ico-chevron-down",16,16,"#666")}</div><div class="ml-entry-card-body"><div class="ml-entry-prose">${h(entry.content||"")}</div><div class="ml-entry-chars">${entry.primaryCharacter?`<span>Primary</span> · ${h(entry.primaryCharacter)}<br>`:''}${entry.keyCharacters?.length?`<span>Key</span> · ${h(entry.keyCharacters.join(", "))}`:''}</div>${db(entry)}<div class="ml-btn-row"><button class="ml-btn-confirm ml-co" data-idx="${i}">Commit</button><button class="ml-btn ml-rt" data-idx="${i}">Regen</button><button class="ml-btn ml-ee" data-idx="${i}">Edit</button><button class="ml-btn-danger ml-do" data-idx="${i}">Discard</button></div><div class="ml-regen-box" id="ml-rg-${i}"><div class="ml-field-hdr"><div class="ml-regen-hint" style="margin-bottom:0">Optional guidance</div><i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="ml-ri-${i}" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer;transition:all var(--animation-duration-2x,0.3s) ease-in-out"></i></div><textarea id="ml-ri-${i}" rows="2" style="margin-bottom:8px" placeholder="Guidance…"></textarea><div class="ml-btn-row"><button class="ml-btn ml-rg" data-idx="${i}">Regen with prompt</button><button class="ml-btn ml-rs" data-idx="${i}">Regen from scene</button></div></div></div></div>`);
+    const $c = $(`<div class="ml-entry-card" id="ml-pc-${i}"><div class="ml-entry-card-hdr"><div style="flex:1;min-width:0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;flex-wrap:wrap"><div class="ml-entry-title" style="margin-bottom:0">${h(entry.title||"Untitled")}</div>${entry.updateTargetId?'<span class="ml-update-badge">✎ updates existing</span>':''}${lo?'<span class="ml-delta-flag">low delta</span>':''}</div><div class="ml-entry-meta">${entry.category==="world" ? (entry.updateTargetId ? "\ud83c\udf10 World update" : "\ud83c\udf10 World fact") : (h(entry.primaryCharacter||(entry.primaryCharacters||[]).join(", ")||"Unknown")+" · "+h(entry.category||"character"))}${entry.sceneId?' · Scene '+getSceneDisplayNum(entry.sceneId):''}</div></div>${iconSvg("ico-chevron-down",16,16,"#666")}</div><div class="ml-entry-card-body">${entry.updateTargetId?`<div class="ml-update-note">Replaces existing entry: ${h((getEntry(entry.updateTargetId)||{}).title||entry.updateTargetId)}</div>`:''}<div class="ml-entry-prose">${h(entry.content||"")}</div><div class="ml-entry-chars">${entry.category!=="world" && entry.primaryCharacter?`<span>Primary</span> · ${h(entry.primaryCharacter)}<br>`:''}${entry.keyCharacters?.length?`<span>Key</span> · ${h(entry.keyCharacters.join(", "))}`:''}</div>${db(entry)}<div class="ml-btn-row"><button class="ml-btn-confirm ml-co" data-idx="${i}">Commit</button><button class="ml-btn ml-rt" data-idx="${i}">Regen</button><button class="ml-btn ml-ee" data-idx="${i}">Edit</button><button class="ml-btn-danger ml-do" data-idx="${i}">Discard</button></div><div class="ml-regen-box" id="ml-rg-${i}"><div class="ml-field-hdr"><div class="ml-regen-hint" style="margin-bottom:0">Optional guidance</div><i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="ml-ri-${i}" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer;transition:all var(--animation-duration-2x,0.3s) ease-in-out"></i></div><textarea id="ml-ri-${i}" rows="2" style="margin-bottom:8px" placeholder="Guidance…"></textarea><div class="ml-btn-row"><button class="ml-btn ml-rg" data-idx="${i}">Regen with prompt</button><button class="ml-btn ml-rs" data-idx="${i}">Regen from scene</button></div></div></div></div>`);
     $c.find(".ml-entry-card-hdr").on("click",function(){$c.toggleClass("open")});
-    $(document).on("click"+NS,`#ml-pc-${i} .ml-co`,()=>{const pl=getPendingEntries();const plist=pl?(Array.isArray(pl)?pl:Object.values(pl)):[];if(i<0||i>=plist.length)return;const created=createEntry(plist[i]);embedEntry(created).catch(err=>console.warn("[ML] Embed failed:",err));plist.splice(i,1);savePendingEntries(plist.length?plist:null);renderHomeTab($pane)});
+    $(document).on("click"+NS,`#ml-pc-${i} .ml-co`,()=>{const pl=getPendingEntries();const plist=pl?(Array.isArray(pl)?pl:Object.values(pl)):[];if(i<0||i>=plist.length)return;const created=commitPendingEntry(plist[i]);embedEntry(created).catch(err=>console.warn("[ML] Embed failed:",err));plist.splice(i,1);savePendingEntries(plist.length?plist:null);renderHomeTab($pane)});
     $(document).on("click"+NS,`#ml-pc-${i} .ml-do`,async()=>{const ok=await popup("Discard this entry?");if(!ok)return;const pl=getPendingEntries();const plist=pl?(Array.isArray(pl)?pl:Object.values(pl)):[];if(i<0||i>=plist.length)return;plist.splice(i,1);savePendingEntries(plist.length?plist:null);renderHomeTab($pane)});
     $(document).on("click"+NS,`#ml-pc-${i} .ml-rt`,()=>{$(`#ml-rg-${i}`).toggleClass("open")});
     // Edit entry — replace static prose with editable fields inline
@@ -112,8 +131,9 @@ function renderCard(entry,i,$pane) {
         const $editForm = $(`
             <div class="ml-edit-form" style="margin-top:10px;display:flex;flex-direction:column;gap:8px">
                 <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#888;text-transform:uppercase;letter-spacing:0.06em">Editing entry</div>
+                ${e.category==="world" ? "" : `
                 <div class="ml-field-row"><span class="ml-fh">Primary character</span><i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="ml-edit-primary-${i}" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer"></i></div>
-                <textarea class="ml-edit-primary ml-edit-mini" id="ml-edit-primary-${i}" rows="1" placeholder="Who this memory belongs to (comma-separate for a joint memory)">${h(e.primaryCharacter||(e.primaryCharacters||[]).join(', ')||'')}</textarea>
+                <textarea class="ml-edit-primary ml-edit-mini" id="ml-edit-primary-${i}" rows="1" placeholder="Who this memory belongs to (comma-separate for a joint memory)">${h(e.primaryCharacter||(e.primaryCharacters||[]).join(', ')||'')}</textarea>`}
                 <div class="ml-field-row"><span class="ml-fh">Title</span><i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="ml-edit-title-${i}" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer"></i></div>
                 <textarea class="ml-edit-title ml-edit-mini" id="ml-edit-title-${i}" rows="1">${h(e.title||'')}</textarea>
                 <div class="ml-field-row"><span class="ml-fh">Date / Time</span><i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="ml-edit-datetime-${i}" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer"></i></div>
@@ -149,7 +169,7 @@ function renderCard(entry,i,$pane) {
                 title:          $editForm.find(".ml-edit-title").val().trim(),
                 datetime:       $editForm.find(".ml-edit-datetime").val().trim(),
                 content:        $editForm.find(".ml-edit-narrative").val().trim(),
-                primaryCharacter: $editForm.find(".ml-edit-primary").val().trim(),
+                primaryCharacter: e.category==="world" ? "" : ($editForm.find(".ml-edit-primary").val()||"").trim(),
                 keyCharacters:  keyRaw.split(",").map(s => s.trim()).filter(Boolean),
                 delta: Object.assign({}, plist[i].delta || {}, {
                     before_state: $editForm.find(".ml-edit-before").val().trim(),
@@ -176,7 +196,7 @@ function renderCard(entry,i,$pane) {
         if(i<0||i>=plist.length)return;
         toastr?.info?.("Regenerating entry...");
         const newEntry = await regenerateEntry(plist[i], guidance);
-        if (newEntry) { plist[i] = newEntry; savePendingEntries(plist); renderHomeTab($pane); toastr?.success?.("Entry regenerated."); }
+        if (newEntry) { if (plist[i].updateTargetId) newEntry.updateTargetId = plist[i].updateTargetId; plist[i] = newEntry; savePendingEntries(plist); renderHomeTab($pane); toastr?.success?.("Entry regenerated."); }
         else { toastr?.error?.("Regeneration failed. Check LLM connection."); }
     });
     $(document).on("click"+NS,`#ml-pc-${i} .ml-rs`,async ()=>{
