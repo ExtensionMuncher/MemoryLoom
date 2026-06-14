@@ -1092,6 +1092,17 @@ function toggleEntryEdit(entryId) {
             <input type="checkbox" id="ml-edit-exclude-${entryId}" ${entry.excludeFromConsolidation ? "checked" : ""}>
             <span style="font-size:12px;color:#ddd">Exclude from consolidation <span style="color:#888;font-size:11px">(never used as a consolidation source)</span></span>
         </label>
+        <div style="display:flex;gap:14px;margin-top:10px;flex-wrap:wrap">
+            <div>
+                <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#666">Stickiness override</div>
+                <input type="number" id="ml-edit-stickiness-${entryId}" value="${Number(entry.stickiness) || 0}" min="0" max="50" style="width:80px">
+            </div>
+            <div>
+                <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#666">Cooldown override</div>
+                <input type="number" id="ml-edit-cooldown-${entryId}" value="${Number(entry.cooldown) || 0}" min="0" max="50" style="width:80px">
+            </div>
+            <div style="flex:1;min-width:140px;align-self:flex-end;font-size:11px;color:#888;line-height:1.4">0 = use the global default. Set a value to override this memory's persistence individually.</div>
+        </div>
         <div class="ml-btn-row" style="margin-top:10px">
             <button class="ml-btn-confirm ml-save-edit-btn" data-entry-id="${entryId}">Save</button>
             <button class="ml-btn-danger ml-cancel-edit-btn" data-entry-id="${entryId}">Cancel</button>
@@ -1113,9 +1124,12 @@ function toggleEntryEdit(entryId) {
         const keyChars  = isChar ? ($(`#ml-edit-key-${entryId}`).val() || "").split(",").map(s => s.trim()).filter(Boolean) : (entry.keyCharacters || []);
         const important = $(`#ml-edit-important-${entryId}`).prop("checked");
         const excludeFromConsolidation = $(`#ml-edit-exclude-${entryId}`).prop("checked");
+        const stickiness = Math.max(0, parseInt($(`#ml-edit-stickiness-${entryId}`).val(), 10) || 0);
+        const cooldown = Math.max(0, parseInt($(`#ml-edit-cooldown-${entryId}`).val(), 10) || 0);
 
         const update = {
             title, datetime, content, delta, important, excludeFromConsolidation,
+            stickiness, cooldown,
             keyCharacters: keyChars,
         };
         if (isChar) {

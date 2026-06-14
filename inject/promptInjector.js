@@ -13,6 +13,7 @@
 import { setExtensionPrompt } from "../../../../../script.js";
 import { getSetting } from "../settings.js";
 import { isMLInternalGen } from "../llm/connections.js";
+import { recordInjection } from "../embed/retriever.js";
 import { dlog } from "../lib/debug.js";
 
 // ─── Constants ────────────────────────────────────────────
@@ -21,17 +22,31 @@ import { dlog } from "../lib/debug.js";
 const PROMPT_ID = "ml-memory-injection";
 const ROLE_SYSTEM = 0;
 
-/**
- * Placement mapping to ST's injection position/depth.
- * Only ST-standard positions: top(0), above character card(1), below character card(2)
- * bottom maps to depth 4 (after character card).
- */
-const PLACEMENT_MAP = {
-    above_card: 1,
-    below_card: 2,
-    top: 0,
-    bottom: 4,
-};
+// ST extension_prompt_types: IN_PROMPT=0 (story string / before main),
+// IN_CHAT=1 (inserted into chat at a given depth), BEFORE_PROMPT=2.
+// extension_prompt_roles: SYSTEM=0, USER=1, ASSISTANT=2.
+// Placement → { position, depth, role }, mirroring the approach used in the
+// World State / Relationship trackers so behavior is consistent across them.
+function resolvePlacement(placement) {
+    switch (placement) {
+        case "before_main": return { position: 2, depth: 0, role: ROLE_SYSTEM }; // BEFORE_PROMPT
+        case "after_main":  return { position: 0, depth: 0, role: ROLE_SYSTEM }; // IN_PROMPT (story string)
+        case "top_an":      return { position: 1, depth: 0, role: ROLE_SYSTEM };   // author's-note top
+        case "bottom_an":   return { position: 1, depth: 999, role: ROLE_SYSTEM }; // author's-note bottom
+        case "at_depth": {
+            const depth = Number(getSetting("injection.depth", 4));
+            const roleSel = getSetting("injection.depthRole", "system");
+            const role = roleSel === "user" ? 1 : roleSel === "assistant" ? 2 : 0;
+            return { position: 1, depth: Number.isFinite(depth) ? depth : 4, role };
+        }
+        // legacy values kept working
+        case "above_card": return { position: 2, depth: 0, role: ROLE_SYSTEM };
+        case "below_card": return { position: 0, depth: 0, role: ROLE_SYSTEM };
+        case "top":        return { position: 2, depth: 0, role: ROLE_SYSTEM };
+        case "bottom":     return { position: 1, depth: 999, role: ROLE_SYSTEM };
+        default:           return { position: 2, depth: 0, role: ROLE_SYSTEM };
+    }
+}
 
 // ─── Main Injection Function ──────────────────────────────
 
@@ -60,10 +75,26 @@ export function updateInjection(candidates) {
         return;
     }
 
-    const position = PLACEMENT_MAP[settings.placement] || 2;
+    const place = resolvePlacement(settings.placement);
 
-    // Register the injection
-    setExtensionPrompt(PROMPT_ID, content, position, 0, false, ROLE_SYSTEM);
+    // Register the injection through ST's extension-prompt API. This is the same
+    // mechanism the built-in Vector Storage uses, so the block participates in
+    // prompt assembly and is visible/inspectable in ST's prompt itinerary.
+    setExtensionPrompt(PROMPT_ID, content, place.position, place.depth, false, place.role);
+
+    // Start stickiness for each injected entry so it stays active for a few
+    // messages after firing. Per-entry overrides take precedence over the
+    // global default. Without this, the sticky map was never populated and
+    // stickiness/cooldown did nothing.
+    try {
+        for (const c of candidates) {
+            const e = c.entry;
+            if (!e) continue;
+            const perEntry = Number(e.stickiness);
+            recordInjection(e.id, Number.isFinite(perEntry) && perEntry > 0 ? perEntry : 0);
+        }
+    } catch (err) { console.warn("[ML] recordInjection failed:", err); }
+
     console.log(`[ML] Injection updated: ${candidates.length} entries`);
     dlog("Injection block now in system prompt:", candidates.map(c => `"${c.entry.title}"`).join(", "));
 }

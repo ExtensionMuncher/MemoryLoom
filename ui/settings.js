@@ -483,18 +483,49 @@ function renderInjection($pane) {
     });
 
     // Placement
-    const placement = getSetting("injection.placement", "below_card");
-    const placements = ["above_card", "below_card", "top", "bottom"];
-    const placementLabels = ["Above character card", "Below character card", "Top of system prompt", "Bottom of system prompt"];
+    const placement = getSetting("injection.placement", "before_main");
+    const placements = ["before_main", "after_main", "top_an", "bottom_an", "at_depth"];
+    const placementLabels = [
+        "Before main prompt", "After main prompt",
+        "Top of author's note", "Bottom of author's note",
+        "At chat depth",
+    ];
     const placementOpts = placements.map((p, i) =>
         `<option value="${p}" ${placement === p ? "selected" : ""}>${placementLabels[i]}</option>`
     ).join("");
-    $body.append(settingRow("Injection placement", "Where in the system prompt entries are inserted",
+    $body.append(settingRow("Injection placement", "Where in the prompt the memory block is inserted",
         `<select class="ml-setting-select" id="ml-setting-placement">${placementOpts}</select>`
     ));
+
+    // At-depth controls (only meaningful when placement = at_depth)
+    const depth = getSetting("injection.depth", 4);
+    const depthRole = getSetting("injection.depthRole", "system");
+    const $depthRow = $(settingRow("Injection depth", "Messages from the end (only used with 'At chat depth')",
+        `<input type="number" id="ml-setting-injdepth" value="${Number(depth) || 4}" min="0" max="100" style="width:70px">`
+    ));
+    const $roleRow = $(settingRow("Injection role", "Whose turn the block is attributed to at depth",
+        `<select class="ml-setting-select" id="ml-setting-injrole">
+            <option value="system" ${depthRole === "system" ? "selected" : ""}>System</option>
+            <option value="user" ${depthRole === "user" ? "selected" : ""}>User</option>
+            <option value="assistant" ${depthRole === "assistant" ? "selected" : ""}>Assistant</option>
+        </select>`
+    ));
+    $body.append($depthRow, $roleRow);
+    function toggleDepthRows() {
+        const show = $("#ml-setting-placement").val() === "at_depth";
+        $depthRow.toggle(show); $roleRow.toggle(show);
+    }
     $body.find("#ml-setting-placement").on("change", function () {
         setSetting("injection.placement", $(this).val());
+        toggleDepthRows();
     });
+    $body.find("#ml-setting-injdepth").on("change", function () {
+        setSetting("injection.depth", Math.max(0, parseInt($(this).val(), 10) || 4));
+    });
+    $body.find("#ml-setting-injrole").on("change", function () {
+        setSetting("injection.depthRole", $(this).val());
+    });
+    toggleDepthRows();
 
     // Max entries
     const maxEntries = getSetting("injection.maxEntriesPerMessage", 3);

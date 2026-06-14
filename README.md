@@ -1,276 +1,157 @@
-/**
- * index.js — Memory Loom
- */
-import { chat, chat_metadata, name1, saveSettingsDebounced, saveChatDebounced } from "../../../../script.js";
-import { eventSource, event_types } from "../../../../scripts/events.js";
-import { extension_settings } from "../../../../scripts/extensions.js";
-import { initSettings, isEnabled, getSetting, isSidecarPaused } from "./settings.js";
+# Memory Loom
 
-// ── Debug log gate ────────────────────────────────────────
-// Quiet by default: [ML]-prefixed console.log lines only show when the Debug
-// toggle (Settings → Debug) is on. Warnings and errors ALWAYS show.
-const __mlOrigLog = console.log.bind(console);
-console.log = function (...args) {
-    if (typeof args[0] === "string" && args[0].startsWith("[ML]")) {
-        const on = (typeof window !== "undefined" && window.__ML_DEBUG !== undefined)
-            ? window.__ML_DEBUG
-            : (() => { try { return getSetting("debug.enabled", false); } catch (e) { return true; } })();
-        if (!on) return;
-    }
-    __mlOrigLog(...args);
-};
-import { getFolders, saveFolders, getEntries, getScenes, getPendingEntries, savePendingEntries, getOpenSceneId, saveOpenSceneId, getMessageCounter, incrementMessageCounter, getStickinessMap, saveStickinessMap, getCooldownsMap, saveCooldownsMap } from "./data/storage.js";
-import { createPanel, showPanelLoading, hidePanelLoading, setProcessingStatus } from "./ui/panel.js";
-import { injectSvgDefs } from "./lib/icons.js";
-import { renderHomeTab } from "./ui/home.js";
-import { renderLibraryTab } from "./ui/library.js";
-import { renderSettingsTab } from "./ui/settings.js";
-import { extractKeywords } from "./llm/sidecar.js";
-import { dlog } from "./lib/debug.js";
-import { isMLInternalGen } from "./llm/connections.js";
-import { registerMemoryRecallTool } from "./llm/recallTool.js";
-import { runWriterFlow } from "./llm/writer.js";
-import { maybeAutoConsolidate } from "./llm/consolidationOrchestrator.js";
-import { runRetrievalPipeline, tickCounters } from "./embed/retriever.js";
-import { updateInjection, removeInjection } from "./inject/promptInjector.js";
-import { createScene, closeScene, getOpenScene, isMessageInClosedScene, initSceneCounter, recordLastClosedScene } from "./data/scenes.js";
+A per-chat narrative memory manager for [SillyTavern](https://github.com/SillyTavern/SillyTavern). Memory Loom watches your roleplay, writes vivid memories of what mattered, and feeds the most relevant ones back into context — so long-running stories stay coherent without you hand-maintaining a lorebook.
 
-let _sidecarRunning = false;
-const _processedMesIds = new Set();
-let mlPopoutVisible = false, $mlPopout = null;
+It is built for long-form collaborative roleplay where continuity is the whole point: who remembers what, how relationships and the world evolve, and which past moments should resurface when they become relevant again.
 
-jQuery(async () => {
-    try {
-        await initSettings(); window.__ML_DEBUG = getSetting("debug.enabled", false);
-        injectSvgDefs();
-        createPanel();
-        renderHomeTab($("#ml-p-home"));
-        renderLibraryTab($("#ml-p-library"));
-        renderSettingsTab($("#ml-p-settings"));
-        initSceneCounter();
-        registerEventHandlers();
-        registerMagicWandMenuEntry();
-        eventSource.once(event_types.APP_READY, () => {
-            if (!isEnabled()) return;
-            $(".mes").each(function () {
-                const mesId = $(this).attr("mesid");
-                if (mesId !== undefined) addMessageButtons(parseInt(mesId, 10));
-            });
-        });
-        $(document).on("ml:tab-switched", (_e, tabId) => {
-            const $pane = $(`#ml-p-${tabId}`);
-            if (tabId === "home") renderHomeTab($pane);
-            else if (tabId === "library") renderLibraryTab($pane);
-            else if (tabId === "settings") renderSettingsTab($pane);
-        });
-        $(document).on("ml:toggle", (_e, enabled) => {
-            if (enabled) { $(".ml-scene-btn").show(); $("#ml_container").css({ opacity: "", pointerEvents: "" }); }
-            else { removeInjection(); $(".ml-scene-btn").hide(); $("#ml_container").css({ opacity: "0.45", pointerEvents: "none" }); }
-        });
-        if (!isEnabled()) removeInjection(); // clear stale injection if extension is disabled
-        registerMemoryRecallTool();
-    } catch (err) { console.error("[ML] Init failed:", err.message, err.stack); }
-});
+---
 
+## What it does
 
-/**
- * The sidecar → retriever → injector pipeline.
- * Every skip reason that used to be a silent early return now logs in debug
- * mode, so "why didn't the sidecar run" is answerable from the F12 console.
- */
-let _sidecarStartedAt = 0;
-const SIDECAR_TIMEOUT_MS = 45000; // hard cap per run — a hung LLM call must never wedge the pipeline
+- **Writes memories from your scenes.** Mark a scene's start and end (or run a batch scan over existing chat), and a writer LLM distills it into concise third-person memory entries — one per pivotal moment, with concrete sensory detail rather than dry summary.
+- **Retrieves the right memories at the right time.** Before each reply, a lightweight *sidecar* LLM reads the recent messages and figures out what's being discussed; an embedding model then surfaces the stored memories most relevant to that moment and injects them into context.
+- **Tracks the world, not just the cast.** A separate, stricter pass records *world memories* — the durable lore of your setting (factions, locations, rules, world-altering events) — kept apart from character memories and able to update itself as the world changes.
+- **Consolidates over time.** As memories pile up, you can fold groups of them into higher-level summaries, keeping the working set lean while preserving meaning.
+- **Keeps you in control.** Nothing is committed silently. Generated memories land in a *pending* review area where you approve, edit, regenerate, or discard them.
 
-async function runSidecarPipeline(trigger) {
-    const counter = incrementMessageCounter();
-    const freq = getSetting("scanFrequency", 1);
-    dlog(`Sidecar trigger: ${trigger} (turn ${counter}, runs every ${freq})`);
-    if (counter % freq !== 0) { dlog(`Sidecar skipped — counter ${counter % freq}/${freq} (next run in ${freq - (counter % freq)} turn(s))`); return; }
-    if (isSidecarPaused()) { dlog("Sidecar skipped — paused from Home tab"); return; }
-    if (_sidecarRunning) {
-        // Watchdog: a hung LLM call (cloud rate limit, dead connection) used to
-        // leave this flag stuck TRUE forever, silently vetoing every future run
-        // — "the sidecar ran once and never again". Stale runs now get evicted.
-        if (Date.now() - _sidecarStartedAt > SIDECAR_TIMEOUT_MS) {
-            console.warn("[ML] Sidecar: previous run exceeded timeout — force-resetting stuck flag");
-            _sidecarRunning = false;
-        } else {
-            dlog("Sidecar skipped — previous run still in progress");
-            return;
-        }
-    }
-    _sidecarRunning = true;
-    _sidecarStartedAt = Date.now();
-    try {
-        dlog("Sidecar: calling keyword LLM…");
-        const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("sidecar timed out")), SIDECAR_TIMEOUT_MS));
-        const keywords = await Promise.race([extractKeywords(), timeout]);
-        dlog("Sidecar keywords:", JSON.stringify(keywords));
-        const candidates = await Promise.race([runRetrievalPipeline(keywords), timeout]);
-        dlog(`Retriever returned ${candidates.length} candidate(s):`, candidates.map(c => `"${c.entry.title}" (${(c.score ?? 0).toFixed(3)})`).join(", ") || "(none)");
-        updateInjection(candidates);
-        tickCounters();
-    } catch (err) { console.error("[ML] Sidecar error:", err); }
-    finally { _sidecarRunning = false; }
-}
+Everything is stored **per chat**, inside that chat's metadata — memories from one chat never leak into another.
 
-/**
- * Generate interceptor — ST AWAITS this before assembling the prompt for
- * every generation (same mechanism the built-in Vector Storage uses). This
- * is what makes per-turn injection actually work: the sidecar runs and the
- * refreshed injection is in place BEFORE the prompt is built, with the
- * user's newest message included in what the keyword LLM sees. The old
- * event-based triggers either landed one turn late (MESSAGE_SENT — prompt
- * already building) or lagged one message behind (MESSAGE_RECEIVED).
- */
-globalThis.memoryLoomGenerateInterceptor = async function (chat, contextSize, abort, type) {
-    try {
-        if (!isEnabled()) return;
-        if (isMLInternalGen()) { dlog("Interceptor: skipped (Memory Loom internal generation)"); return; }
-        if (type === "quiet") { dlog("Interceptor: skipped (quiet generation)"); return; }
-        dlog(`Interceptor: generation starting (type: ${type || "normal"})`);
-        await runSidecarPipeline(`generation (${type || "normal"})`);
-    } catch (err) {
-        console.error("[ML] Generate interceptor error:", err);
-    }
-};
+---
 
-function registerEventHandlers() {
-    eventSource.on(event_types.MESSAGE_RECEIVED, async (mesId) => {
-        if (!isEnabled()) return;
-        if (mesId !== undefined && _processedMesIds.has(mesId)) return;
-        if (mesId !== undefined) _processedMesIds.add(mesId);
-        addMessageButtons(mesId);
-    });
-    $(document).on("ml:scene-state-changed", () => { refreshSceneButtons(); });
+## Requirements
 
-    eventSource.on(event_types.MESSAGE_SENT, (mesId) => {
-        if (!isEnabled()) return;
-        if (mesId !== undefined && _processedMesIds.has(mesId)) return;
-        if (mesId !== undefined) _processedMesIds.add(mesId);
-        addMessageButtons(mesId);
-    });
-    eventSource.on(event_types.CHAT_CHANGED, () => {
-        _processedMesIds.clear();
-        initDefaultFolders();
-        initSceneCounter();
-        renderHomeTab($("#ml-p-home"));
-        renderLibraryTab($("#ml-p-library"));
-        renderSettingsTab($("#ml-p-settings"));
-        if (!isEnabled()) removeInjection(); // clear stale injection on chat change if disabled
-        $(".mes").each(function () {
-            const mesId = $(this).attr("mesid");
-            if (mesId !== undefined) addMessageButtons(parseInt(mesId, 10));
-        });
-    });
-}
+- A recent SillyTavern install (server-side extensions enabled).
+- **An embedding backend.** Memory Loom has its own embedding configuration (in the Vectorization settings) and supports Local/Transformers, Ollama, vLLM, OpenAI, Cohere, Google AI Studio, OpenRouter, and MistralAI. It uses ST's vector API endpoints under the hood but with its own settings — you do not configure this through ST's Vector Storage. Ollama with an embedding model (e.g. `qwen3-embedding`) works well.
+- **Connection profiles** for the LLM roles below. These can all be the same profile, or different ones tuned for cost/speed.
 
-function addMessageButtons(mesId) {
-    if (!isEnabled()) return;
-    const $bar = $(`.mes[mesid="${mesId}"] .extraMesButtons`);
-    if (!$bar.length) return;
-    $bar.find(".ml-scene-btn").remove();
-    const openScene = getOpenScene();
-    let icon, title, css, handler;
-    if (openScene && mesId >= openScene.messageStart && (openScene.messageEnd === null || mesId <= openScene.messageEnd)) {
-        icon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><use href="#ico-feather"/></svg>';
-        title = "Close scene"; css = "ml-scene-btn ml-scene-active";
-        handler = async () => {
-            const closed = closeScene(openScene.id, mesId);
-            if (!closed) return;
-            recordLastClosedScene(closed.id);
-            refreshSceneButtons();
-            toastr?.info?.("Scene closed — generating entries...");
-            // Persistent indicators: panel overlay + Home-tab processing banner.
-            // Toasts vanish; these stay up until the writer flow finishes.
-            showPanelLoading("Scene closed — generating memory entries...");
-            setProcessingStatus("Generating memory entries for closed scene...");
-            renderHomeTab($("#ml-p-home"));
-            try {
-                const result = await runWriterFlow(closed.id);
-                if (result && result.length > 0) toastr?.success?.(result.length + " entr" + (result.length === 1 ? "y" : "ies") + " ready for review.");
-                else toastr?.warning?.("Scene closed. Check LLM connection.");
-            } catch (e) { console.error(e); toastr?.error?.("Entry generation failed."); }
-            hidePanelLoading();
-            setProcessingStatus(null);
-            // Refresh Home (pending entries) AND Library (Scenes view) so the new
-            // material shows without flipping between tabs
-            renderHomeTab($("#ml-p-home"));
-            const $lib = $("#ml-p-library");
-            if ($lib.length) renderLibraryTab($lib);
-            // Automatic consolidation check — only fires if enabled and a folder
-            // crossed its threshold. Runs after entries are committed, not pending.
-            maybeAutoConsolidate().then(() => {
-                const $l = $("#ml-p-library"); if ($l.length) renderLibraryTab($l);
-            }).catch(err => console.error("[ML] Auto-consolidate error:", err));
-        };
-    } else if (isMessageInClosedScene(mesId)) {
-        icon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><use href="#ico-book"/></svg>';
-        title = "Already scanned"; css = "ml-scene-btn"; handler = null;
-    } else {
-        icon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><use href="#ico-book-open"/></svg>';
-        title = "Open scene"; css = "ml-scene-btn";
-        handler = () => {
-            if (getOpenScene()) { toastr?.warning?.("Scene already open."); return; }
-            createScene(mesId); refreshSceneButtons(); toastr?.success?.("Scene opened.");
-        };
-    }
-    const $btn = $(`<div class="${css}" title="${title}">${icon}</div>`);
-    if (handler) $btn.on("click", handler);
-    $bar.prepend($btn);
-}
-function refreshSceneButtons() {
-    $(".mes[mesid]").each(function() {
-        const id = parseInt($(this).attr("mesid"), 10);
-        if (!isNaN(id)) addMessageButtons(id);
-    });
-}
+---
 
+## Installation
 
-function initDefaultFolders() {
-    const folders = getFolders();
-    const defaults = [
-        { id: "ml_folder_world", name: "World", type: "world", parentId: null },
-        { id: "ml_folder_characters", name: "Characters", type: "characters", parentId: null },
-        { id: "ml_folder_plot", name: "Plot", type: "plot", parentId: null },
-    ];
-    let changed = false;
-    for (const df of defaults) {
-        if (!folders.find(f => f.id === df.id)) {
-            folders.push({ ...df, characterName: null, hasImage: false, imagePath: null, entryCount: 0, createdAt: Date.now() });
-            changed = true;
-        }
-    }
-    if (changed) saveFolders(folders);
-}
+1. Place the `MemoryLoom` folder in your ST extensions directory:
+   `SillyTavern/public/scripts/extensions/third-party/MemoryLoom`
+2. Reload SillyTavern (a hard refresh, so the browser picks up the files).
+3. Open the Memory Loom panel from the extensions menu.
 
-function registerMagicWandMenuEntry() {
-    const menu = document.getElementById('extensionsMenu');
-    if (!menu || document.getElementById('ml-wand-entry')) return;
-    const entry = document.createElement('div');
-    entry.id = 'ml-wand-entry';
-    entry.className = 'list-group-item flex-container flexGap5 interactable';
-    entry.title = 'Open Memory Loom'; entry.tabIndex = 0;
-    entry.innerHTML = '<i class="fa-solid fa-book-open-reader"></i><span>Memory Loom</span>';
-    entry.addEventListener('click', () => { mlPopoutVisible ? closeMlPopout() : openMlPopout(); });
-    menu.appendChild(entry);
-}
-function openMlPopout() {
-    if (mlPopoutVisible) return;
-    const $c = $('#ml_container .inline-drawer-content'); if (!$c.length) return;
-    $mlPopout = $(`<div id="ml-popout" class="draggable"><div id="ml-popout-header" class="ml-popout-header"><div class="ml-popout-title"><i class="fa-solid fa-book-open-reader"></i><span>Memory Loom</span></div><div class="ml-popout-close" title="Close"><i class="fa-solid fa-xmark"></i></div></div><div id="ml-popout-content"></div></div>`);
-    $('body').append($mlPopout); $mlPopout.find('#ml-popout-content')[0].appendChild($c[0]);
-    $mlPopout.find('.ml-popout-close').on('click', closeMlPopout);
-    $(document).on('keydown.ml_popout', e => { if (e.key === 'Escape') closeMlPopout(); });
-    if (typeof window.dragElement === 'function') window.dragElement($mlPopout);
-    $mlPopout.fadeIn(200); mlPopoutVisible = true;
-}
-function closeMlPopout() {
-    if (!mlPopoutVisible || !$mlPopout) return;
-    const dc = document.getElementById('ml-popout-content')?.firstElementChild;
-    $mlPopout.fadeOut(200, () => {
-        if (dc) { const p = $('#ml_container .inline-drawer'); (p.length ? p : $('#ml_container')).append(dc); }
-        $mlPopout.remove(); $mlPopout = null;
-    });
-    mlPopoutVisible = false; $(document).off('keydown.ml_popout');
-}
+To update, replace the whole folder and hard-refresh.
+
+---
+
+## First-time setup
+
+1. **Connections** (Settings tab) — pick a profile for each of the four roles. See **Choosing models** below for what each one needs; they can all be the same profile or different ones tuned for cost and speed.
+2. **Embedding** (Vectorization settings) — choose your embedding source and model directly in Memory Loom. Pick the provider, fill in the model field, and make sure that backend is reachable.
+3. **Similarity threshold** (Injection settings) — the default is conservative. If relevant memories aren't surfacing, lower it; if irrelevant ones are, raise it. Turn on Debug logging to watch the actual match scores and tune from real numbers.
+
+---
+
+## Choosing models
+
+Memory Loom uses four LLM roles, and they have very different demands. Matching model strength to the job keeps quality high without melting your machine or your API budget.
+
+### Memory Writer LLM — *your strongest model*
+This is where memory quality comes from. It reads a whole scene and distills it into vivid, accurate entries, and it also drives the world-memory pass and its update logic. Give it the best model you have access to — ideally a strong cloud API, or a local model with genuinely good reasoning, summarization, and a large context window. If you only upgrade one role, upgrade this one.
+
+### Consolidation LLM — *also your strongest model*
+Consolidation folds many memories and scene summaries into coherent higher-level arcs. That demands the same strengths as the writer — strong reasoning, summarization, and a large context limit, since it ingests a lot at once. Treat it the same as the Memory Writer: best model available, cloud API or a strong large local model.
+
+### Scene Summary LLM — *a decent mid-size model*
+This writes the internal scene reference notes that maintain continuity between sessions. It's a lighter job than full memory writing, so a competent mid-size model is plenty. A model in the ~12B range works well here. *(If you leave it unset, it falls back to the Memory Writer.)*
+
+### Keyword Sidecar LLM — *a small, fast, lightweight model*
+The sidecar's only job is to read the current context and output good keywords for the embedding model. It does not need to be smart or large — it needs to understand what's happening in the messages and produce clean, relevant keywords quickly. A small fast model in the ~9B range is ideal.
+
+> **This connection runs on every message (or every N messages, per your Scan frequency setting).** Because it fires so often, its speed directly adds to your reply latency, and a heavy model here will make every turn sluggish (and, if local, work your hardware constantly). Pick something light. A small local model is perfect — it keeps the cost at zero and the latency low.
+
+### Embedding model — *whatever you like*
+The embedding model is configured in Memory Loom's own Vectorization settings — source plus model — use whatever you prefer. Remember to tune the similarity threshold to match it (the built-in default leans strict for some embedding models).
+
+---
+
+## How to use it
+
+### Capturing memories
+
+- **Manual scenes:** use the Scene Start / Scene End controls to mark a stretch of roleplay. On close, the writer generates memory entries (and, if enabled, a world pass).
+- **Batch scan** (Scanning settings): process an existing or long chat in scene-sized chunks. Good for retrofitting Memory Loom onto a story already in progress.
+- **Selective scan:** scan only a message range. Message numbers match ST's own numbering (the first message is `#0`).
+
+All generated entries appear as **pending** on the Home tab — grouped by character, with world memories in their own clearly-divided section. Review them there.
+
+### The library
+
+The Library tab is your memory store, organized into folders:
+
+- **Characters** — per-character subfolders, each with its own memories, optional banner image, and update history.
+- **World** — setting lore (see below).
+- **Plot** — arc-level summaries, including the products of consolidation.
+- **Custom folders** — make your own top-level folders and subfolders, with images and their own menu bars.
+
+Each memory card shows an estimated token cost and when its folder was last updated. You can search, sort, bulk-select, move, edit, star (mark as core/important), or exclude entries from consolidation.
+
+### World memories
+
+World memories are deliberately **stricter** than character memories. They capture facts about the *setting itself* — what an organization is, how the world's rules work, a significant location, or a world-altering event — and explicitly reject character-level detail, plot beats, and passing scene texture. Most scenes produce none, and that's expected; a lore-dense world yields more than a grounded one.
+
+When a later scene changes something already recorded, the world pass can issue an **update** to the existing entry instead of duplicating it — these show up as pending entries marked "updates existing," and on approval the revised version replaces the old one.
+
+You can also run a dedicated **world scan** from the Debug settings, and add or edit world entries by hand via the World folder's menu bar.
+
+### Consolidation
+
+When memories accumulate, open the Consolidate popout, select the memories and/or scenes to fold together, and confirm. Memory Loom writes one consolidated memory per character over the selection plus a single arc summary in the Plot folder, then demotes the source memories (non-destructively — they stay retrievable at lower priority). World memories can be included in consolidation too.
+
+### Recall tool
+
+If your chat backend supports tool calling, Memory Loom registers a `search_core_memories` function the model can call mid-reply to pull specific memories on demand, beyond what's auto-injected.
+
+---
+
+## How retrieval works (the short version)
+
+1. You send a message.
+2. The **sidecar** LLM reads recent context and extracts the characters, themes, and events in play.
+3. Those become a query against this chat's **vector collection**; the embedding model returns the closest-matching stored memories.
+4. Scoring applies your settings — similarity threshold, stickiness (a memory stays active for a few messages after firing), cooldown (a memory won't re-fire immediately), and optional decay (older memories gradually lose priority). Starred/important memories bypass decay and suppression.
+5. The surviving memories are injected into the prompt, in the format and placement you chose.
+
+A 45-second watchdog guards the whole pass, so a hung LLM call can never freeze your chat.
+
+---
+
+## Settings reference
+
+- **Connections** — Memory Writer, Scene Summary, Consolidation, and Keyword Sidecar profiles (see *Choosing models*).
+- **Scanning** — batch scan, selective scan, world-memory generation toggle.
+- **Injection** — what gets injected and where; max entries per message; stickiness; cooldown; max recall-tool memories.
+- **Vectorization** — embedding source mirror, similarity threshold, top-K, consolidated-priority multiplier, distance metric.
+- **Consolidation** — token cap, auto-consolidation threshold, important-priority multiplier.
+- **Debug** — verbose console logging (highly recommended while tuning), world scan, delta backfill, re-embed, undo last scan, memory decay, reset to defaults.
+- **Data** — import / export everything.
+
+---
+
+## Back up your memories
+
+Memories live in the chat's metadata. **Export regularly** — there's an Export All in the Data settings. A quick export after a good session is the difference between a non-event and a bad day if a chat gets wiped or corrupted. Imports support merge or replace, so you can recover or combine snapshots.
+
+---
+
+## Troubleshooting
+
+- **No memories retrieved / nothing injects:** check that your embedding backend is reachable and the similarity threshold isn't too high. Turn on Debug logging and watch the retriever's score lines.
+- **World scan returns "[NO WORLD MEMORY]" everywhere:** this is often correct — either the scenes contain no new setting lore, or the facts are already on record (re-scanning the same scenes dedupes). Confirm with Debug logging, which prints the raw model response for each scene.
+- **A feature button seems to do nothing:** open the browser console (F12). Memory Loom logs its actions; errors there point to the cause (often an embedding backend not configured).
+- **Memories from another chat showing up:** they shouldn't — storage is per-chat. If something looks crossed, check that you didn't import another chat's export into this one.
+
+---
+
+## Notes
+
+- Storage is per-chat and lives in chat metadata; deleting a chat removes its memories.
+- The sidecar runs before every reply — if latency matters, use a small fast model for that role.
+- Stricter is safer for world memories: a missed fact can be added later, but a flood of trivial ones is just noise.
+
+---
+
+*Memory Loom is a community SillyTavern extension. It orchestrates your own configured models through ST's vector API; it ships no models of its own.*
