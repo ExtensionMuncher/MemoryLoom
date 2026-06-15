@@ -34,6 +34,7 @@ import { maybeAutoConsolidate } from "./llm/consolidationOrchestrator.js";
 import { runRetrievalPipeline, tickCounters } from "./embed/retriever.js";
 import { updateInjection, removeInjection } from "./inject/promptInjector.js";
 import { createScene, closeScene, getOpenScene, isMessageInClosedScene, initSceneCounter, recordLastClosedScene } from "./data/scenes.js";
+import { getAllEntries } from "./data/entries.js";
 
 let _sidecarRunning = false;
 const _processedMesIds = new Set();
@@ -87,6 +88,12 @@ async function runSidecarPipeline(trigger) {
     dlog(`Sidecar trigger: ${trigger} (turn ${counter}, runs every ${freq})`);
     if (counter % freq !== 0) { dlog(`Sidecar skipped — counter ${counter % freq}/${freq} (next run in ${freq - (counter % freq)} turn(s))`); return; }
     if (isSidecarPaused()) { dlog("Sidecar skipped — paused from Home tab"); return; }
+    // Empty-library guard: the sidecar exists to find stored memories that match
+    // the current conversation. With zero entries in the library there is nothing
+    // to match against, so every LLM call would be wasted. Skip until the library
+    // actually has content (e.g. after the first scene is closed and entries are
+    // committed). This is the common "fresh chat, nothing saved yet" case.
+    if (getAllEntries().length === 0) { dlog("Sidecar skipped — library is empty (no entries to match)"); return; }
     if (_sidecarRunning) {
         // Watchdog: a hung LLM call (cloud rate limit, dead connection) used to
         // leave this flag stuck TRUE forever, silently vetoing every future run
