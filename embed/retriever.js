@@ -11,11 +11,11 @@
  * Pattern: follows VectFox's queryCollection() in core-vector-api.js.
  */
 
-import { getRequestHeaders } from "../../../../../script.js";
+import { getRequestHeaders, chat, name1 } from "../../../../../script.js";
 import { textgen_types, textgenerationwebui_settings } from "../../../../textgen-settings.js";
 import { getSetting } from "../settings.js";
 import { getEntry } from "../data/entries.js";
-import { getEntries, getStickinessMap, saveStickinessMap, getCooldownsMap, saveCooldownsMap } from "../data/storage.js";
+import { getEntries, getStickinessMap, saveStickinessMap, getCooldownsMap, saveCooldownsMap, getFolders } from "../data/storage.js";
 import { getCollectionId } from "./embedder.js";
 import { dlog } from "../lib/debug.js";
 
@@ -43,7 +43,7 @@ export async function runRetrievalPipeline(sidecarResult) {
     if (!collectionId) return [];
 
     const queryText = buildQueryText(sidecarResult);
-    if (!queryText) return [];
+    if (!queryText) { dlog("Retriever skipped — empty query text"); return []; }
 
     const mlSettings = buildVectorSettings();
 
@@ -53,12 +53,45 @@ export async function runRetrievalPipeline(sidecarResult) {
 
     dlog(`Retriever query: "${queryText}" (collection ${collectionId}, topK ${topK}, threshold ${threshold})`);
     const rawResults = await queryCollection(collectionId, queryText, topK, threshold, mlSettings);
-    if (!rawResults || !rawResults.hashes || rawResults.hashes.length === 0) { dlog("Retriever: no vector hits above threshold"); return []; }
-    dlog(`Retriever: ${rawResults.hashes.length} raw vector hit(s)`);
 
-    const candidates = mapHashesToEntries(rawResults);
+    // IMPORTANT: Passive recall must not die just because vector search returns
+    // no hits above threshold. Direct event/title references like "Yūji's first
+    // kill" should still be able to surface "The First Kill" through lexical
+    // fallback. The previous version returned here, so the fallback was never
+    // reached — exactly the failure seen in F12 logs.
+    let candidates = [];
+    if (!rawResults || !rawResults.hashes || rawResults.hashes.length === 0) {
+        dlog("Retriever: no vector hits above threshold; trying lexical fallback");
+    } else {
+        dlog(`Retriever: ${rawResults.hashes.length} raw vector hit(s)`);
+        candidates = mapHashesToEntries(rawResults);
+    }
+
+    candidates = addLexicalFallbacks(candidates, sidecarResult, queryText);
+    if (!candidates.length) {
+        dlog("Retriever: no vector or lexical candidates");
+        return [];
+    }
+
     const filtered = applyFilters(candidates);
-    const final = filtered.slice(0, maxEntries);
+    if (!filtered.length) {
+        dlog(`Retriever: ${candidates.length} candidate(s) found but all were filtered by threshold/cooldown/status`);
+        return [];
+    }
+
+    // Per-category caps: limit how many of each category inject, then apply the
+    // global cap as an overall ceiling. Filtered is already score-sorted, so we
+    // keep the highest-scoring entries within each category's allowance.
+    const perCat = getSetting("injection.maxPerCategory", {}) || {};
+    const catCounts = {};
+    const catLimited = [];
+    for (const c of filtered) {
+        const cat = categoryOfEntry(c.entry);
+        const limit = Number.isFinite(perCat[cat]) ? perCat[cat] : Infinity;
+        const used = catCounts[cat] || 0;
+        if (used < limit) { catLimited.push(c); catCounts[cat] = used + 1; }
+    }
+    const final = catLimited.slice(0, maxEntries);
 
     if (final.length > 0) {
         console.log(`[ML] Retriever: ${final.length} entries selected for injection`);
@@ -133,12 +166,119 @@ export async function queryCollection(collectionId, searchText, topK, threshold,
 }
 
 function buildQueryText(sidecarResult) {
+    const querySource = getSetting("vectorization.querySource", "keywords");
+    if (querySource === "raw") {
+        return getRawRecentMessagesQuery();
+    }
+
     // keywords already contains themes + events (sidecar folds them together);
     // appending themes again double-weighted them in the similarity query
     const parts = [];
     if (sidecarResult.keywords?.length) parts.push(sidecarResult.keywords.join(" "));
     if (sidecarResult.characters?.length) parts.push(sidecarResult.characters.join(" "));
     return parts.join(" ").trim();
+}
+
+function getRawRecentMessagesQuery() {
+    if (!chat || !Array.isArray(chat)) return "";
+    const depth = Math.max(1, Number(getSetting("vectorization.raw.scanDepth", 10)) || 10);
+    const recent = chat.slice(-depth);
+    return recent.map(msg => {
+        const speaker = msg.is_user ? (name1 || "User") : (msg.name || "Character");
+        const text = String(msg.mes || "").replace(/<[^>]+>/g, " ").slice(0, 1200);
+        return `${speaker}: ${text}`;
+    }).join("\n").trim();
+}
+
+function normalizeText(value) {
+    return String(value || "")
+        .normalize("NFKD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLowerCase()
+        .replace(/[’']/g, "")
+        .replace(/[^a-z0-9\s-]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function buildLexicalTerms(sidecarResult, queryText) {
+    const raw = [queryText, ...(sidecarResult.keywords || []), ...(sidecarResult.characters || []), ...(sidecarResult.themes || [])];
+    const terms = new Set();
+    for (const item of raw) {
+        const base = normalizeText(item);
+        if (!base || base.length < 3) continue;
+        terms.add(base);
+        terms.add(base.replace(/^memory of /, "").trim());
+        terms.add(base.replace(/^memory about /, "").trim());
+        const words = base.split(" ").filter(w => w.length > 2);
+        // Preserve useful title-like tails, e.g. "memory of yujis first kill" → "first kill".
+        for (let n = 2; n <= Math.min(4, words.length); n++) {
+            terms.add(words.slice(-n).join(" "));
+        }
+    }
+    return [...terms].filter(t => t && t.length >= 3);
+}
+
+function entrySearchText(entry) {
+    const delta = entry.delta || {};
+    return normalizeText([
+        entry.title, entry.datetime, entry.content, entry.primaryCharacter,
+        ...(entry.primaryCharacters || []), ...(entry.keyCharacters || []), ...(entry.tags || []),
+        delta.before_state, delta.after_state, delta.delta,
+    ].filter(Boolean).join("\n"));
+}
+
+function addLexicalFallbacks(candidates, sidecarResult, queryText) {
+    const entries = Object.values(getEntries() || {});
+    if (!entries.length) return candidates;
+    const terms = buildLexicalTerms(sidecarResult || {}, queryText);
+    if (!terms.length) return candidates;
+
+    const byId = new Map(candidates.map(c => [c.entry.id, c]));
+    let added = 0;
+    for (const entry of entries) {
+        if (!entry || entry.status === "archived" || entry.status === "superseded") continue;
+        const hay = entrySearchText(entry);
+        const title = normalizeText(entry.title);
+        let lexicalScore = 0;
+        for (const term of terms) {
+            if (!term || term.length < 3) continue;
+            if (title && (title === term || title.includes(term) || term.includes(title))) lexicalScore = Math.max(lexicalScore, 0.95);
+            else if (hay.includes(term)) lexicalScore = Math.max(lexicalScore, term.includes(" ") ? 0.82 : 0.62);
+        }
+        if (lexicalScore <= 0) continue;
+        const existing = byId.get(entry.id);
+        if (existing) existing.score = Math.max(existing.score || 0, lexicalScore);
+        else { byId.set(entry.id, { entry, score: lexicalScore }); added++; }
+    }
+    if (added > 0) dlog(`Retriever: added ${added} lexical fallback hit(s)`);
+    return [...byId.values()];
+}
+
+/**
+ * Classify an entry into one of the injection-cap categories:
+ * "character" | "world" | "plot" | "custom". Folder-driven (matches the
+ * consolidation menu logic): resolve the entry's owning folder, walk to its
+ * root, and bucket by the root folder's TYPE. Anything not a default root is
+ * "custom". Falls back to the entry.category field when there's no folder.
+ */
+function categoryOfEntry(e) {
+    try {
+        const folders = getFolders() || [];
+        const f = folders.find(ff => ff.id === e.folderId);
+        if (f) {
+            let root = f, guard = 0;
+            while (root && root.parentId && guard++ < 10) root = folders.find(ff => ff.id === root.parentId) || root;
+            const t = root.type;
+            if (t === "world") return "world";
+            if (t === "plot") return "plot";
+            if (t === "characters") return "character";
+            return "custom";
+        }
+    } catch (err) { /* fall through to category field */ }
+    if (e.category === "world") return "world";
+    if (e.category === "plot") return "plot";
+    return "character";
 }
 
 function mapHashesToEntries(results) {

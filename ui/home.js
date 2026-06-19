@@ -10,19 +10,30 @@ import { getEntry, createEntry, deleteEntry, updateEntry } from "../data/entries
  * replaces it cleanly. Returns the created entry.
  */
 function commitPendingEntry(e) {
+    // Committing means the entry becomes live, so force status to "active".
+    // World pending entries carry status:"pending" from the writer; createEntry
+    // uses (data.status || "active"), so without this override they'd commit
+    // still "pending" — which excluded them from the consolidation modal and
+    // anywhere else that filters on active status.
     if (e && e.updateTargetId) {
         try {
             const target = getEntry(e.updateTargetId);
-            if (target) deleteEntry(e.updateTargetId);
+            if (target) {
+                // Remove the old version's VECTOR too, not just the entry —
+                // otherwise the superseded memory's embedding lingers in the
+                // collection and can still be retrieved (silent stale-recall bug).
+                deleteEntryVector(target).catch(err => console.warn("[ML] World update: old vector delete failed:", err));
+                deleteEntry(e.updateTargetId);
+            }
         } catch (err) { console.error("[ML] World update: target removal failed:", err); }
         // strip the marker so it commits as a normal world entry
-        const clean = Object.assign({}, e);
+        const clean = Object.assign({}, e, { status: "active" });
         delete clean.updateTargetId;
         return createEntry(clean);
     }
-    return createEntry(e);
+    return createEntry(Object.assign({}, e, { status: "active" }));
 }
-import { embedEntry } from "../embed/embedder.js";
+import { embedEntry, deleteEntryVector } from "../embed/embedder.js";
 import { regenerateEntry, generateMemoryEntries } from "../llm/writer.js";
 import { iconSvg } from "../lib/icons.js";
 const NS = ".ml-home";
@@ -114,7 +125,7 @@ function renderPendingSection($pane) {
 }
 function renderCard(entry,i,$pane) {
     const lo = entry.delta?.low_delta_flag;
-    const $c = $(`<div class="ml-entry-card" id="ml-pc-${i}"><div class="ml-entry-card-hdr"><div style="flex:1;min-width:0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;flex-wrap:wrap"><div class="ml-entry-title" style="margin-bottom:0">${h(entry.title||"Untitled")}</div>${entry.updateTargetId?'<span class="ml-update-badge">✎ updates existing</span>':''}${lo?'<span class="ml-delta-flag">low delta</span>':''}</div><div class="ml-entry-meta">${entry.category==="world" ? (entry.updateTargetId ? "\ud83c\udf10 World update" : "\ud83c\udf10 World fact") : (h(entry.primaryCharacter||(entry.primaryCharacters||[]).join(", ")||"Unknown")+" · "+h(entry.category||"character"))}${entry.sceneId?' · Scene '+getSceneDisplayNum(entry.sceneId):''}</div></div>${iconSvg("ico-chevron-down",16,16,"#666")}</div><div class="ml-entry-card-body">${entry.updateTargetId?`<div class="ml-update-note">Replaces existing entry: ${h((getEntry(entry.updateTargetId)||{}).title||entry.updateTargetId)}</div>`:''}<div class="ml-entry-prose">${h(entry.content||"")}</div><div class="ml-entry-chars">${entry.category!=="world" && entry.primaryCharacter?`<span>Primary</span> · ${h(entry.primaryCharacter)}<br>`:''}${entry.keyCharacters?.length?`<span>Key</span> · ${h(entry.keyCharacters.join(", "))}`:''}</div>${db(entry)}<div class="ml-btn-row"><button class="ml-btn-confirm ml-co" data-idx="${i}">Commit</button><button class="ml-btn ml-rt" data-idx="${i}">Regen</button><button class="ml-btn ml-ee" data-idx="${i}">Edit</button><button class="ml-btn-danger ml-do" data-idx="${i}">Discard</button></div><div class="ml-regen-box" id="ml-rg-${i}"><div class="ml-field-hdr"><div class="ml-regen-hint" style="margin-bottom:0">Optional guidance</div><i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="ml-ri-${i}" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer;transition:all var(--animation-duration-2x,0.3s) ease-in-out"></i></div><textarea id="ml-ri-${i}" rows="2" style="margin-bottom:8px" placeholder="Guidance…"></textarea><div class="ml-btn-row"><button class="ml-btn ml-rg" data-idx="${i}">Regen with prompt</button><button class="ml-btn ml-rs" data-idx="${i}">Regen from scene</button></div></div></div></div>`);
+    const $c = $(`<div class="ml-entry-card" id="ml-pc-${i}"><div class="ml-entry-card-hdr"><div style="flex:1;min-width:0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;flex-wrap:wrap"><div class="ml-entry-title" style="margin-bottom:0">${h(entry.title||"Untitled")}</div>${entry.updateTargetId?'<span class="ml-update-badge">✎ updates existing</span>':''}${lo?'<span class="ml-delta-flag">low delta</span>':''}</div><div class="ml-entry-meta">${entry.category==="world" ? (entry.updateTargetId ? "\ud83c\udf10 World update" : (entry.worldEvent ? "\ud83c\udf10 World event" : "\ud83c\udf10 World fact")) : (h(entry.primaryCharacter||(entry.primaryCharacters||[]).join(", ")||"Unknown")+" · "+h(entry.category||"character"))}${entry.sceneId?' · Scene '+getSceneDisplayNum(entry.sceneId):''}</div></div>${iconSvg("ico-chevron-down",16,16,"#666")}</div><div class="ml-entry-card-body">${entry.updateTargetId?`<div class="ml-update-note">Replaces existing entry: ${h((getEntry(entry.updateTargetId)||{}).title||entry.updateTargetId)}</div>`:''}<div class="ml-entry-prose">${h(entry.content||"")}</div><div class="ml-entry-chars">${entry.category!=="world" && entry.primaryCharacter?`<span>Primary</span> · ${h(entry.primaryCharacter)}<br>`:''}${entry.keyCharacters?.length?`<span>Key</span> · ${h(entry.keyCharacters.join(", "))}`:''}</div>${db(entry)}<div class="ml-btn-row"><button class="ml-btn-confirm ml-co" data-idx="${i}">Commit</button><button class="ml-btn ml-rt" data-idx="${i}">Regen</button><button class="ml-btn ml-ee" data-idx="${i}">Edit</button><button class="ml-btn-danger ml-do" data-idx="${i}">Discard</button></div><div class="ml-regen-box" id="ml-rg-${i}"><div class="ml-field-hdr"><div class="ml-regen-hint" style="margin-bottom:0">Optional guidance</div><i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="ml-ri-${i}" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer;transition:all var(--animation-duration-2x,0.3s) ease-in-out"></i></div><textarea id="ml-ri-${i}" rows="2" style="margin-bottom:8px" placeholder="Guidance…"></textarea><div class="ml-btn-row"><button class="ml-btn ml-rg" data-idx="${i}">Regen with prompt</button><button class="ml-btn ml-rs" data-idx="${i}">Regen from scene</button></div></div></div></div>`);
     $c.find(".ml-entry-card-hdr").on("click",function(){$c.toggleClass("open")});
     $(document).on("click"+NS,`#ml-pc-${i} .ml-co`,()=>{const pl=getPendingEntries();const plist=pl?(Array.isArray(pl)?pl:Object.values(pl)):[];if(i<0||i>=plist.length)return;const created=commitPendingEntry(plist[i]);embedEntry(created).catch(err=>console.warn("[ML] Embed failed:",err));plist.splice(i,1);savePendingEntries(plist.length?plist:null);renderHomeTab($pane)});
     $(document).on("click"+NS,`#ml-pc-${i} .ml-do`,async()=>{const ok=await popup("Discard this entry?");if(!ok)return;const pl=getPendingEntries();const plist=pl?(Array.isArray(pl)?pl:Object.values(pl)):[];if(i<0||i>=plist.length)return;plist.splice(i,1);savePendingEntries(plist.length?plist:null);renderHomeTab($pane)});

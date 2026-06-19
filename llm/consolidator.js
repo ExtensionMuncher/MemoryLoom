@@ -113,7 +113,8 @@ Output ONLY a JSON object, no markdown fences:
 {
   "title": "An evocative 3-6 word title specific to ${charName}'s arc — NOT a generic arc name",
   "content": "The consolidated memory, narrated in THIRD PERSON about ${charName}.",
-  "datetime": "The time period this covers."
+  "datetime": "The time period this covers.",
+  "tags": ["3-6 lowercase_snake_case tags SPECIFIC to ${charName}'s experience in this arc — what THEY went through, felt, or became. Do NOT use generic arc-wide tags that don't apply to ${charName} personally."]
 }`;
 
     let user = `CHARACTER: ${charName}\n\nTHIS CHARACTER'S MEMORIES FROM THE ARC:\n\n`;
@@ -144,6 +145,9 @@ Output ONLY a JSON object, no markdown fences:
             title: String(parsed.title || "").trim() || `${charName}'s arc`,
             content: contentText,
             datetime: String(parsed.datetime || "").trim() || (draft?.timeRange || ""),
+            tags: Array.isArray(parsed.tags)
+                ? parsed.tags.map(t => String(t).trim().toLowerCase().replace(/\s+/g, "_")).filter(Boolean).slice(0, 6)
+                : [],
         };
     } catch (err) {
         console.warn(`[ML] Per-character consolidation parse failed for ${charName}:`, err.message);

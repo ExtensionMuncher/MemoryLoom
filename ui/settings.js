@@ -592,6 +592,31 @@ function renderInjection($pane) {
         setSetting("injection.maxEntriesPerMessage", parseInt($(this).val()) || 3);
     });
 
+    // ── Per-category caps ────────────────────────────────
+    // Each limits how many of that category inject per message; the global cap
+    // above is the overall ceiling across all categories combined.
+    $body.append(`<div style="font-size:11px;color:#888;margin:10px 0 2px;line-height:1.4">Per-category caps — how many of each kind can inject at once (the global cap above is the overall ceiling).</div>`);
+    const perCat = getSetting("injection.maxPerCategory", {}) || {};
+    const catRows = [
+        ["character", "Character", 3],
+        ["world", "World", 2],
+        ["plot", "Plot", 1],
+        ["custom", "Custom folders", 2],
+    ];
+    catRows.forEach(([key, label, def]) => {
+        const val = Number.isFinite(perCat[key]) ? perCat[key] : def;
+        $body.append(settingRow(`Max ${label.toLowerCase()} entries`, `Cap on ${label} memories per message`,
+            `<input type="number" class="ml-setting-maxcat" data-cat="${key}" value="${val}" min="0" max="10">`
+        ));
+    });
+    $body.find(".ml-setting-maxcat").on("change", function () {
+        const cat = $(this).data("cat");
+        const v = Math.max(0, parseInt($(this).val(), 10));
+        const map = getSetting("injection.maxPerCategory", {}) || {};
+        map[cat] = Number.isFinite(v) ? v : 0;
+        setSetting("injection.maxPerCategory", map);
+    });
+
     // ── Memory recall tool ───────────────────────────────
     const recallOn = getSetting("injection.recallToolEnabled", true);
     $body.append(settingRow("Memory recall tool", "Lets the main LLM actively search the archive mid-reply (function calling) · requires a tool-capable Chat Completion backend",
@@ -780,6 +805,17 @@ function renderVectorization($pane) {
         setSetting('vectorization.similarityThreshold', parseFloat($(this).val()) || 0.75);
     });
 
+    // ── Top-k ───────────────────────────────────────────
+    const topKSetting = getSetting('vectorization.raw.topK', 10);
+    $body.append(settingRow('Top-k results', 'Max candidates returned before Memory Loom filters them',
+        `<input type="number" id="ml-setting-topK-global" value="${topKSetting}" min="1" max="50" step="1">`
+    ));
+    $body.find('#ml-setting-topK-global').on('change', function(){
+        const raw = getSetting('vectorization.raw', {});
+        raw.topK = Math.max(1, parseInt($(this).val()) || 10);
+        setSetting('vectorization.raw', raw);
+    });
+
     // ── Query source ────────────────────────────────────
     const querySource = getSetting('vectorization.querySource', 'keywords');
     $body.append(settingRow('Query source', 'What the embedding model queries against',
@@ -808,7 +844,6 @@ function renderVectorization($pane) {
     addRawRow('Scan depth',     'Recent messages to include',       'ml-setting-scanDepth',     rawSettings.scanDepth     || 10);
     addRawRow('Chunk size',     'Token size per text chunk',        'ml-setting-chunkSize',     rawSettings.chunkSize     || 256);
     addRawRow('Overlap tokens', 'Token overlap between chunks',     'ml-setting-overlapTokens', rawSettings.overlapTokens || 32);
-    addRawRow('Top-k results',  'Max candidates before threshold',  'ml-setting-topK',          rawSettings.topK          || 10);
 
     const metric = rawSettings.distanceMetric || "cosine";
     $rawAdvanced.append(`
@@ -835,7 +870,6 @@ function renderVectorization($pane) {
     $rawAdvanced.find("#ml-setting-scanDepth").on("change", function () { saveRaw("scanDepth", parseInt($(this).val())); });
     $rawAdvanced.find("#ml-setting-chunkSize").on("change", function () { saveRaw("chunkSize", parseInt($(this).val())); });
     $rawAdvanced.find("#ml-setting-overlapTokens").on("change", function () { saveRaw("overlapTokens", parseInt($(this).val())); });
-    $rawAdvanced.find("#ml-setting-topK").on("change", function () { saveRaw("topK", parseInt($(this).val())); });
     $rawAdvanced.find("#ml-setting-distanceMetric").on("change", function () { saveRaw("distanceMetric", $(this).val()); });
     $rawAdvanced.find("#ml-setting-rerank").on("change", function () { saveRaw("rerank", $(this).prop("checked")); });
 
@@ -978,6 +1012,35 @@ function renderData($pane) {
     ));
     $body.find("#ml-setting-worldEnabled").on("change", function () {
         setSetting("worldMemory.enabled", this.checked);
+    });
+
+    // ── World scale (per-chat) ───────────────────────────
+    // Anchors how the world writer judges what counts as a world EVENT. Stored
+    // per-chat, like NWST's setting context, so each roleplay scales correctly —
+    // a town-scale slice-of-life vs a multi-realm epic. Read by worldWriter.js.
+    const $scaleWrap = $(`
+        <div class="ml-setting-row" style="flex-direction:column;align-items:stretch;gap:6px">
+            <div>
+                <div class="ml-setting-label">World scale <span style="color:#888;font-weight:400">· per chat</span></div>
+                <div class="ml-setting-sub">Describe how big this world is so world-EVENT detection scales correctly. A town/school setting lets town-level events count; a multi-realm epic restricts events to realm-level. Mention any latent genre shifts (e.g. dormant supernatural elements) so an activation is caught as a top-tier event.</div>
+            </div>
+            <textarea id="ml-setting-worldscale" rows="3" placeholder="e.g. Small-scale: a single town (Miyashita) and its high school, slice-of-life. A dormant cursed-energy contamination leaks in certain spots and could activate, flipping the genre to urban fantasy. OR: Large: multiple dimensions (Soul Society, Hueco Mundo, the living world) with great-power factions."></textarea>
+            <div><button class="ml-btn" id="ml-setting-worldscale-save">Save world scale</button></div>
+        </div>
+    `);
+    $body.append($scaleWrap);
+    (async () => {
+        try {
+            const { getWorldScale } = await import("../data/storage.js");
+            $scaleWrap.find("#ml-setting-worldscale").val(getWorldScale());
+        } catch (e) { console.warn("[ML] load world scale failed:", e); }
+    })();
+    $scaleWrap.find("#ml-setting-worldscale-save").on("click", async function () {
+        try {
+            const { saveWorldScale } = await import("../data/storage.js");
+            saveWorldScale($scaleWrap.find("#ml-setting-worldscale").val());
+            toastr?.success?.("World scale saved for this chat.");
+        } catch (e) { console.error("[ML] save world scale failed:", e); toastr?.error?.("Failed to save world scale."); }
     });
 
     // ── Lorebook memory import (EXPERIMENTAL) ───────────

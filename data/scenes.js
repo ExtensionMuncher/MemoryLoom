@@ -14,7 +14,9 @@
  */
 
 
-import { getScenes, saveScenes, getOpenSceneId, saveOpenSceneId, getConsolidations as getConsolidationsForScenes } from "./storage.js";
+import { getScenes, saveScenes, getOpenSceneId, saveOpenSceneId, getConsolidations as getConsolidationsForScenes, getPendingEntries, savePendingEntries } from "./storage.js";
+import { getAllEntries, deleteEntry } from "./entries.js";
+import { deleteEntryVector } from "../embed/embedder.js";
 
 // ─── ID Generation ────────────────────────────────────────
 
@@ -388,7 +390,13 @@ export function undoLastScan() {
     try {
         const all = getAllEntries();
         for (const e of all) {
-            if (e.sceneId === sceneId) { deleteEntry(e.id); removed++; }
+            if (e.sceneId === sceneId) {
+                // Remove the vector too, or undo leaves orphaned embeddings that
+                // can still be retrieved after the entry is gone.
+                deleteEntryVector(e).catch(err => console.warn("[ML] Undo: vector delete failed:", err));
+                deleteEntry(e.id);
+                removed++;
+            }
         }
     } catch (err) { console.error("[ML] Undo: entry cleanup failed:", err); }
 

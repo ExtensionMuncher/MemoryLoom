@@ -170,6 +170,14 @@ function renderMemoriesView($pane) {
             <select class="ml-filter-select" id="ml-mem-folder-filter">
                 <option>All folders</option>
             </select>
+            <select class="ml-filter-select" id="ml-mem-source-filter" title="Filter by how the memory was created">
+                <option value="all">All sources</option>
+                <option value="synthesis">Synthesis only</option>
+                <option value="consolidated">Consolidated only</option>
+                <option value="lorebook">Lorebook import only</option>
+                <option value="core">Core (starred) only</option>
+                <option value="excluded">Excluded only</option>
+            </select>
             <button class="ml-btn" id="ml-select-all-btn" title="Select all currently visible memories">Select all</button>
         </div>
     `);
@@ -324,6 +332,11 @@ function renderMemoriesView($pane) {
         applySortMode($container, $(this).val());
     });
 
+    // Source filter: show only entries of the chosen creation-source class.
+    $filterBar.find("#ml-mem-source-filter").on("change", function () {
+        filterMemoryBySource($container, $(this).val());
+    });
+
     $pane.append($container);
 }
 
@@ -356,27 +369,15 @@ function applySortMode($container, mode) {
 
 // ─── Folder consolidation ─────────────────────────────────
 
-/** Manually consolidate all ACTIVE memories in a character folder. */
+/** Open the consolidation modal scoped to a single folder, so the user can pick
+ *  which of that folder's memories to consolidate (rather than auto-selecting all). */
 async function consolidateFolderFlow(folder) {
-    const active = getEntriesByFolder(folder.id).filter(e => e.status === "active");
-    if (active.length < 2) {
-        toastr?.warning?.(`${folder.name} has fewer than 2 active memories — nothing to consolidate.`);
+    const eligible = getEntriesByFolder(folder.id).filter(e => (e.status === "active" || e.status === "consolidation") && !e.excludeFromConsolidation && (e.category !== "world" || e.worldEvent === true));
+    if (eligible.length < 2) {
+        toastr?.warning?.(`${folder.name || folder.characterName || "This folder"} has fewer than 2 eligible memories — nothing to consolidate.`);
         return;
     }
-    let ok = false;
-    try {
-        const ctx = window.SillyTavern?.getContext();
-        if (ctx?.callGenericPopup) {
-            const r = await ctx.callGenericPopup(`Consolidate all <b>${active.length}</b> active memories for <b>${escapeHtml(folder.name)}</b>?<br><br>Creates an updated memory + an arc summary. Originals are kept at reduced priority.`, ctx.POPUP_TYPE?.CONFIRM || "confirm", "");
-            ok = r === true || r === 1;
-        } else {
-            ok = confirm(`Consolidate ${active.length} memories for ${folder.name}?`);
-        }
-    } catch (e) {}
-    if (!ok) return;
-    const { runConsolidation } = await import("../llm/consolidationOrchestrator.js");
-    await runConsolidation({ entryIds: active.map(e => e.id), mode: "folder" });
-    renderLibraryTab($("#ml-p-library"));
+    openConsolidateModal($("#ml-p-library"), folder.id);
 }
 
 // ─── Folder rename ────────────────────────────────────────
@@ -392,6 +393,14 @@ async function consolidateFolderFlow(folder) {
  *      keeps using the old name, those memories still route here
  */
 async function renameFolderFlow(folder) {
+    // Custom folders get a combined name + icon picker. A folder is "custom" if
+    // it isn't a character folder (no characterName) and isn't one of the three
+    // default roots (world/characters/plot). Custom folders are type "primary"
+    // (or a non-character "subfolder").
+    const isCustom = !folder.characterName
+        && !["world", "characters", "plot"].includes(folder.type);
+    if (isCustom) { return editCustomFolderFlow(folder); }
+
     let newName = "";
     try {
         const ctx = window.SillyTavern?.getContext();
@@ -435,6 +444,62 @@ async function renameFolderFlow(folder) {
     updateFolder(folder.id, updates);
     toastr?.success?.(`Folder renamed to "${newName}".${folder.characterName ? ` "${oldName}" kept as an alias.` : ""}`);
     renderLibraryTab($("#ml-p-library"));
+}
+
+// Curated icon set for custom folders.
+const ML_FOLDER_ICONS = ["\ud83d\udcc1","\ud83d\udcd6","\u2694\ufe0f","\ud83d\udd2e","\ud83c\udff0","\ud83d\udddd\ufe0f","\ud83c\udf0d","\u2728","\ud83d\udd25","\u2744\ufe0f","\ud83c\udf19","\u2600\ufe0f","\ud83c\udf3f","\ud83d\udc80","\ud83e\udde0","\u2764\ufe0f","\ud83d\udca5","\u26a1","\ud83d\udd17","\ud83d\udd11","\ud83c\udfad","\ud83c\udfb5","\ud83d\udcdc","\ud83e\ude99","\ud83c\udf52","\ud83d\udc31","\ud83d\udc09","\ud83d\udc7b","\ud83c\udf08","\u26d3\ufe0f","\ud83e\ude78","\ud83d\udee1\ufe0f"];
+
+async function editCustomFolderFlow(folder) {
+    const $host = $("#ml-popout").length ? $("#ml-popout") : $("body");
+    const current = folder.customIcon || "";
+    const iconGrid = ML_FOLDER_ICONS.map(ic =>
+        `<button type="button" class="ml-icon-pick ${ic === current ? "sel" : ""}" data-icon="${ic}">${ic}</button>`
+    ).join("");
+
+    const $modal = $(`
+        <div class="ml-modal-overlay open" id="ml-folder-edit-modal">
+            <div class="ml-modal" style="max-width:420px">
+                <div class="ml-modal-title">Edit folder</div>
+                <div>
+                    <div class="ml-field-label" style="font-size:11px;color:#999;margin-bottom:4px">Name</div>
+                    <input type="text" id="ml-folder-edit-name" class="ml-folder-edit-input" value="${escapeHtml(folder.name)}" style="width:100%">
+                </div>
+                <div>
+                    <div class="ml-field-label" style="font-size:11px;color:#999;margin:8px 0 4px">Icon</div>
+                    <div class="ml-icon-grid">
+                        <button type="button" class="ml-icon-pick ${!current ? "sel" : ""}" data-icon="">Default</button>
+                        ${iconGrid}
+                    </div>
+                </div>
+                <div class="ml-btn-row">
+                    <button class="ml-btn-confirm" id="ml-folder-edit-save">Save</button>
+                    <button class="ml-btn-danger" id="ml-folder-edit-cancel">Cancel</button>
+                </div>
+            </div>
+        </div>
+    `);
+
+    let pickedIcon = current;
+    $modal.on("click", ".ml-icon-pick", function () {
+        pickedIcon = $(this).data("icon");
+        $modal.find(".ml-icon-pick").removeClass("sel");
+        $(this).addClass("sel");
+    });
+    const close = () => { $modal.removeClass("open"); setTimeout(() => $modal.remove(), 150); };
+    $modal.find("#ml-folder-edit-cancel").on("click", close);
+    $modal.on("click", function (e) { if (e.target === this) close(); });
+    $modal.find("#ml-folder-edit-save").on("click", async () => {
+        const newName = ($modal.find("#ml-folder-edit-name").val() || "").trim();
+        const updates = {};
+        if (newName && newName !== folder.name) updates.name = newName;
+        updates.customIcon = pickedIcon || null;   // null clears back to default
+        const { updateFolder } = await import("../data/folders.js");
+        updateFolder(folder.id, updates);
+        close();
+        renderLibraryTab($("#ml-p-library"));
+    });
+
+    $host.append($modal);
 }
 
 // ─── Subfolder deletion ───────────────────────────────────
@@ -546,6 +611,10 @@ function populateBulkMoveSelect($sel) {
  */
 function renderFolder(folder) {
     const icon = getFolderIcon(folder.type);
+    // Custom folders can have a user-picked emoji icon (folder.customIcon).
+    const iconHtml = folder.customIcon
+        ? `<span class="ml-folder-emoji" style="font-size:15px;line-height:1;width:15px;display:inline-flex;justify-content:center">${folder.customIcon}</span>`
+        : iconSvg(icon, 15, 15, "#888");
     const subfolders = getSubfolders(folder.id);
     const entries = getEntriesByFolder(folder.id);
     // Count = direct entries in this folder + number of subfolders
@@ -555,7 +624,7 @@ function renderFolder(folder) {
     const $folder = $(`
         <div class="ml-folder" id="ml-folder-${folder.id}">
             <div class="ml-folder-hdr">
-                ${iconSvg(icon, 15, 15, "#888")}
+                ${iconHtml}
                 <span class="ml-folder-name">${escapeHtml(folder.name)}</span>
                 <span class="ml-folder-count">${subfolders.length > 0 && entries.length === 0
                     ? `${subfolders.length} ${subfolders.length === 1 ? "subfolder" : "subfolders"}`
@@ -907,7 +976,22 @@ function renderMemoryEntry(entry) {
         `<span class="ml-tag">${escapeHtml(t)}</span>`
     ).join("");
 
-    const $entry = $('<div class="ml-mem-entry-wrap"></div>').attr('data-created', entry.createdAt || 0).attr('data-title', entry.title || '');
+    // Classify the entry's source for the library source-filter:
+    //   synthesis    → per-character consolidated memory (has consolidationId, character)
+    //   consolidated → arc summary / any consolidation-status entry
+    //   lorebook     → imported from a lorebook
+    //   normal       → everything else
+    let srcClass = "normal";
+    if (entry.source === "lorebook_import" || (entry.tags || []).includes("lorebook-import")) srcClass = "lorebook";
+    else if (entry.consolidationId && entry.category === "character") srcClass = "synthesis";
+    else if (entry.consolidationId || entry.status === "consolidation" || entry.source === "consolidation") srcClass = "consolidated";
+
+    const $entry = $('<div class="ml-mem-entry-wrap"></div>')
+        .attr('data-created', entry.createdAt || 0)
+        .attr('data-title', entry.title || '')
+        .attr('data-srcclass', srcClass)
+        .attr('data-core', entry.important ? "1" : "0")
+        .attr('data-excluded', entry.excludeFromConsolidation ? "1" : "0");
     $entry.html(`
         <div class="ml-mem-entry" id="ml-mem-${entry.id}">
             <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px">
@@ -1449,21 +1533,80 @@ const consolidateSelScenes = new Set();
  *
  * @param {jQuery} $pane - the library pane (for re-render after consolidation)
  */
-function openConsolidateModal($pane) {
+function openConsolidateModal($pane, scopeFolderId = null) {
     consolidateSelEntries.clear();
     consolidateSelScenes.clear();
 
     // Eligible memory sources: ACTIVE (never consolidated) OR "consolidation"
-    // (the products of a PRIOR consolidation — those can be folded into a later,
-    // higher-level arc until they too are consolidated). EXCLUDES "consolidated"
-    // (already-demoted sources — re-consolidating them would compound). Newest first.
-    const entries = getAllEntries()
+    // (products of a PRIOR consolidation — foldable into a higher-level arc).
+    // EXCLUDES "consolidated" (already-demoted). Newest first.
+    let entries = getAllEntries()
         .filter(e => (e.status === "active" || e.status === "consolidation") && !e.excludeFromConsolidation)
+        // Exclude entries already used as a consolidation source. Starred sources
+        // keep "active" status (never demoted) so they'd otherwise reappear here
+        // every time — this marker keeps them out once consolidated.
+        .filter(e => !e.consolidatedSourceOf)
+        // World memories: only EVENTS (setting-altering, narrative) are worth
+        // consolidating. Static world FACTS are reference material with no arc to
+        // synthesize, so they're excluded from consolidation entirely.
+        .filter(e => e.category !== "world" || e.worldEvent === true)
         .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-    // Eligible scenes: closed and NOT already consolidated (consolidatedInto unset).
-    const scenes = getAllScenes().filter(s => s.status === "closed" && !s.consolidatedInto);
 
-    const entryRows = entries.map(e => {
+    // Folder-scoped consolidation: restrict to memories in this folder (or, for a
+    // parent folder, its subfolders too).
+    let scopeName = "";
+    if (scopeFolderId) {
+        const folder = getAllFolders().find(f => f.id === scopeFolderId);
+        scopeName = folder ? (folder.name || folder.characterName || "") : "";
+        const childIds = getAllFolders().filter(f => f.parentId === scopeFolderId).map(f => f.id);
+        const allowed = new Set([scopeFolderId, ...childIds]);
+        entries = entries.filter(e => allowed.has(e.folderId));
+    }
+
+    // Scenes are only relevant for global consolidation, not folder-scoped.
+    const scenes = scopeFolderId ? [] : getAllScenes().filter(s => s.status === "closed" && !s.consolidatedInto);
+
+    // ── Group memory rows by category: Plot, Character, World, Custom ──
+    const DEFAULT_FOLDER_IDS = new Set(["characters", "world", "plot"]);
+    function getRootFolder(folder) {
+        let cur = folder, guard = 0;
+        while (cur && cur.parentId && guard++ < 10) cur = getAllFolders().find(ff => ff.id === cur.parentId);
+        return cur || folder;
+    }
+    // Returns a group KEY for an entry. Default categories use fixed keys
+    // (World/Plot/Character); custom-folder memories use the root custom folder's
+    // own name so each custom folder becomes its own named section.
+    function categoryOf(e) {
+        const f = getAllFolders().find(ff => ff.id === e.folderId);
+        if (f) {
+            const root = getRootFolder(f);
+            const t = root.type;
+            if (t === "world") return "World";
+            if (t === "plot") return "Plot";
+            if (t === "characters") return "Character";
+            // custom folder → its own section, keyed by the custom folder's name
+            return "custom:" + root.id;
+        }
+        if (e.category === "world") return "World";
+        if (e.category === "plot") return "Plot";
+        if (e.category === "character") return "Character";
+        return "Character";
+    }
+
+    // Build groups. Default categories are fixed; custom folders are added
+    // dynamically, each keyed by its root folder id, labelled with its name.
+    const groups = {};                 // key -> array of entries
+    const customMeta = {};             // "custom:<id>" -> { name, icon }
+    for (const e of entries) {
+        const key = categoryOf(e);
+        (groups[key] = groups[key] || []).push(e);
+        if (key.startsWith("custom:") && !customMeta[key]) {
+            const root = getRootFolder(getAllFolders().find(ff => ff.id === e.folderId) || {});
+            customMeta[key] = { name: root.name || "Custom", icon: root.customIcon || "\ud83d\udcc1" };
+        }
+    }
+
+    function rowHtml(e) {
         const who = (e.category === "world")
             ? "\ud83c\udf10 World"
             : (e.primaryCharacters && e.primaryCharacters.length)
@@ -1475,7 +1618,32 @@ function openConsolidateModal($pane) {
                 <span class="ml-consld-row-title">${escapeHtml(e.title || "Untitled")}</span>
                 <span class="ml-consld-row-meta">${escapeHtml(who)}${e.datetime ? " · " + escapeHtml(e.datetime) : ""}</span>
             </label>`;
-    }).join("");
+    }
+
+    // Build grouped sections. Fixed default categories first (in order), then
+    // each custom folder as its own named section.
+    const CATEGORY_EMOJI = { Plot: "\ud83d\udcd6", Character: "\ud83d\udc64", World: "\ud83c\udf10" };
+    const fixedOrder = ["Plot", "Character", "World"];
+    const customKeys = Object.keys(groups).filter(k => k.startsWith("custom:"))
+        .sort((a, b) => (customMeta[a]?.name || "").localeCompare(customMeta[b]?.name || ""));
+
+    const renderGroup = (key, label, emoji) => {
+        if (!groups[key] || !groups[key].length) return "";
+        const safe = key.replace(/[^a-zA-Z0-9_-]/g, "_");  // CSS-safe selector token
+        return `
+        <div class="ml-consld-group" data-group="${safe}">
+            <div class="ml-consld-group-hdr">
+                <span>${emoji ? emoji + " " : ""}${escapeHtml(label)} <span class="ml-consld-group-count">(${groups[key].length})</span></span>
+                <button class="ml-btn ml-consld-group-all" data-group="${safe}" type="button">Select all</button>
+            </div>
+            ${groups[key].map(rowHtml).join("")}
+        </div>`;
+    };
+
+    const entryRows = [
+        ...fixedOrder.map(g => renderGroup(g, g, CATEGORY_EMOJI[g])),
+        ...customKeys.map(k => renderGroup(k, customMeta[k].name, customMeta[k].icon)),
+    ].join("");
 
     const sceneRows = scenes.map((s, i) => {
         const range = s.messageEnd ? `msgs ${s.messageStart}–${s.messageEnd}` : `msg ${s.messageStart}+`;
@@ -1488,12 +1656,28 @@ function openConsolidateModal($pane) {
             </label>`;
     }).join("");
 
+    const titleText = scopeFolderId ? `Consolidate: ${escapeHtml(scopeName || "folder")}` : "Consolidate an arc";
+    const subText = scopeFolderId
+        ? "Select which memories in this folder to fuse into one arc. Originals are kept at reduced priority, not deleted."
+        : "Select any mix of memories and scenes. They're fused into ONE arc: updated character memories + a single arc summary in Plot. Originals are kept at reduced priority, not deleted.";
+
+    const scenesCol = scopeFolderId ? "" : `
+                    <div class="ml-consld-col">
+                        <div class="ml-consld-col-hdr">
+                            <span>Scenes</span>
+                            <button class="ml-btn ml-consld-all" data-target="scene" type="button">Select all</button>
+                        </div>
+                        <div class="ml-consld-list" id="ml-consld-scenes">
+                            ${sceneRows || '<div class="ml-consld-empty">No scenes.</div>'}
+                        </div>
+                    </div>`;
+
     const $modal = $(`
         <div class="ml-modal-overlay" id="ml-consolidate-modal">
-            <div class="ml-modal" style="max-width:640px">
+            <div class="ml-modal ml-modal-consolidate">
                 <div>
-                    <div class="ml-modal-title">Consolidate an arc</div>
-                    <div class="ml-modal-sub">Select any mix of memories and scenes. They're fused into ONE arc: updated character memories + a single arc summary in Plot. Originals are kept at reduced priority, not deleted.</div>
+                    <div class="ml-modal-title">${titleText}</div>
+                    <div class="ml-modal-sub">${subText}</div>
                 </div>
 
                 <div class="ml-consld-cols">
@@ -1503,18 +1687,10 @@ function openConsolidateModal($pane) {
                             <button class="ml-btn ml-consld-all" data-target="entry" type="button">Select all</button>
                         </div>
                         <div class="ml-consld-list" id="ml-consld-entries">
-                            ${entryRows || '<div class="ml-consld-empty">No active memories.</div>'}
+                            ${entryRows || '<div class="ml-consld-empty">No eligible memories.</div>'}
                         </div>
                     </div>
-                    <div class="ml-consld-col">
-                        <div class="ml-consld-col-hdr">
-                            <span>Scenes</span>
-                            <button class="ml-btn ml-consld-all" data-target="scene" type="button">Select all</button>
-                        </div>
-                        <div class="ml-consld-list" id="ml-consld-scenes">
-                            ${sceneRows || '<div class="ml-consld-empty">No scenes.</div>'}
-                        </div>
-                    </div>
+                    ${scenesCol}
                 </div>
 
                 <div class="ml-consld-count" id="ml-consld-count">Nothing selected</div>
@@ -1533,7 +1709,6 @@ function openConsolidateModal($pane) {
         $c.text(n === 0
             ? "Nothing selected"
             : `${consolidateSelEntries.size} ${consolidateSelEntries.size === 1 ? "memory" : "memories"} · ${consolidateSelScenes.size} ${consolidateSelScenes.size === 1 ? "scene" : "scenes"} selected`);
-        // need at least 2 total sources to consolidate meaningfully
         $modal.find("#ml-consld-confirm").prop("disabled", n < 2);
     }
 
@@ -1548,6 +1723,22 @@ function openConsolidateModal($pane) {
         refreshCount();
     });
 
+    // Per-category "Select all"
+    $modal.on("click", ".ml-consld-group-all", function (e) {
+        e.preventDefault();
+        const g = $(this).data("group");
+        const $checks = $modal.find(`.ml-consld-group[data-group="${g}"] .ml-consld-entry`);
+        const allChecked = $checks.length > 0 && $checks.toArray().every(c => c.checked);
+        $checks.each(function () {
+            const id = $(this).data("id");
+            this.checked = !allChecked;
+            if (!allChecked) consolidateSelEntries.add(id); else consolidateSelEntries.delete(id);
+        });
+        $(this).text(allChecked ? "Select all" : "Select none");
+        refreshCount();
+    });
+
+    // Column-level "Select all" (Memories = all groups, or Scenes)
     $modal.find(".ml-consld-all").on("click", function () {
         const target = $(this).data("target");
         const sel = target === "entry" ? "#ml-consld-entries .ml-consld-entry" : "#ml-consld-scenes .ml-consld-scene";
@@ -1587,7 +1778,12 @@ function openConsolidateModal($pane) {
         renderLibraryTab($pane);
     });
 
-    $("body").append($modal);
+    // Append the modal INSIDE the Memory Loom popout if it's open, so it renders
+    // within the extension rather than as a detached body-level overlay (which on
+    // mobile showed through to the chat behind the popout). Fall back to body
+    // when running in the docked extensions drawer.
+    const $host = $("#ml-popout").length ? $("#ml-popout") : $("body");
+    $host.append($modal);
     requestAnimationFrame(() => $modal.addClass("open"));
 }
 
@@ -2294,6 +2490,22 @@ async function popup(msg) {
  * @param {jQuery} $container
  * @param {string} query - Lowercase search query
  */
+function filterMemoryBySource($container, srcFilter) {
+    const showAll = !srcFilter || srcFilter === "all";
+    $container.find(".ml-mem-entry-wrap").each(function () {
+        const $wrap = $(this);
+        let match = showAll;
+        if (!showAll) {
+            if (srcFilter === "core") match = $wrap.attr("data-core") === "1";
+            else if (srcFilter === "excluded") match = $wrap.attr("data-excluded") === "1";
+            else match = ($wrap.attr("data-srcclass") || "normal") === srcFilter;
+        }
+        $wrap.attr("data-fmatch", match ? "1" : "0");
+        $wrap.toggle(match);
+    });
+    syncContainersToVisibleEntries($container, !showAll);
+}
+
 function filterMemoryEntries($container, query) {
     $container.find(".ml-mem-entry").each(function () {
         const $entry = $(this);
@@ -2302,19 +2514,63 @@ function filterMemoryEntries($container, query) {
         const tags = ($entry.find(".ml-tag").map(function () { return $(this).text().toLowerCase(); }).get().join(" "));
 
         const matches = !query || title.includes(query) || preview.includes(query) || tags.includes(query);
+        const $wrap = $entry.closest(".ml-mem-entry-wrap");
+        // Flag match state explicitly. We must NOT rely on :visible to count
+        // matches per folder, because an entry inside a collapsed folder is not
+        // :visible even when it matches — that was hiding every folder.
+        $wrap.attr("data-fmatch", matches ? "1" : "0");
+        $wrap.toggle(matches);
         $entry.toggle(matches);
-
-        // Also hide the expanded section if the entry is hidden
         const fullId = $entry.next(".ml-mem-full");
-        if (fullId.length) {
-            fullId.toggle(matches);
-        }
+        if (fullId.length) fullId.toggle(matches);
     });
 
-    // Also filter character subfolders
+    syncContainersToVisibleEntries($container, !!query);
+}
+
+/**
+ * Reveal/auto-open containers that hold matches so results show even when every
+ * folder was collapsed. Counts matches via the data-fmatch flag (not :visible,
+ * which is false inside collapsed folders). When forceOpen is false (filter
+ * cleared) folders are shown and collapsed back to their remembered state.
+ */
+function syncContainersToVisibleEntries($container, forceOpen) {
+    const matchCount = ($scope) => {
+        if (!forceOpen) return 1; // not filtering — treat as "has content"
+        // explicit matches, OR (for the source filter which sets display only)
+        // wraps still shown and not flagged as a non-match
+        let n = $scope.find('.ml-mem-entry-wrap[data-fmatch="1"]').length;
+        if (n === 0) {
+            n = $scope.find(".ml-mem-entry-wrap").filter(function () {
+                return this.style.display !== "none" && this.getAttribute("data-fmatch") !== "0";
+            }).length;
+        }
+        return n;
+    };
+
     $container.find(".ml-char-subfolder").each(function () {
         const $sub = $(this);
-        const visibleEntries = $sub.find(".ml-mem-entry:visible").length;
-        $sub.toggle(visibleEntries > 0 || !query);
+        const n = matchCount($sub);
+        if (forceOpen) {
+            $sub.toggle(n > 0);
+            if (n > 0) $sub.addClass("open");
+        } else {
+            $sub.show();
+            const fid = ($sub.attr("id") || "").replace("ml-char-", "");
+            if (fid && !openFolders.has(fid)) $sub.removeClass("open");
+        }
+    });
+    $container.find(".ml-folder").each(function () {
+        const $f = $(this);
+        const n = matchCount($f);   // includes nested subfolder wraps
+        if (forceOpen) {
+            $f.toggle(n > 0);
+            if (n > 0) $f.addClass("open");
+        } else {
+            $f.show();
+            const fid = ($f.attr("id") || "").replace("ml-folder-", "");
+            if (fid && !openFolders.has(fid)) $f.removeClass("open");
+        }
     });
 }
+
