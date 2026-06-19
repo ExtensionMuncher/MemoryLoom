@@ -13,7 +13,7 @@
  */
 
 
-import { getEntries, saveEntries, getFolders, saveFolders } from "./storage.js";
+import { getEntries, saveEntries, getFolders, saveFolders, getConsolidations } from "./storage.js";
 import { resolveCanonicalCharacter, incrementEntryCount, decrementEntryCount } from "./folders.js";
 
 // ─── Constants ────────────────────────────────────────────
@@ -115,6 +115,7 @@ export function createEntry(data) {
         primaryCharacters: primaryCharArray,
         keyCharacters: data.keyCharacters || [],
         category: data.category || "character",
+        worldEvent: data.worldEvent || false,  // true = setting-altering world event (consolidation-eligible); false = static fact
         folderId: data.folderId || "",
         tags: data.tags || [],
         status: data.status || "active",
@@ -164,8 +165,76 @@ export function getEntry(id) {
  * @returns {object[]}
  */
 export function getAllEntries() {
+    repairStuckPendingStatus();
+    backfillConsolidatedSources();
     const entries = getEntries();
     return Object.values(entries);
+}
+
+/**
+ * One-time repair: any entry living in the committed store but still flagged
+ * status "pending" was committed with the wrong status (an old world-memory
+ * commit bug). Being in this store means it IS committed, so flip it to active.
+ * Idempotent and cheap; runs once per load via a guard flag.
+ */
+let _pendingStatusRepaired = false;
+let _consolidatedSourcesBackfilled = false;
+
+/**
+ * Reset the one-time migration guards. Called on chat change so per-chat
+ * migrations (pending-status repair, consolidatedSource backfill) run for the
+ * newly-loaded chat too — otherwise they'd only ever run for the first chat
+ * loaded after a page refresh, silently skipping every chat switched to after.
+ */
+export function resetEntryMigrationGuards() {
+    _pendingStatusRepaired = false;
+    _consolidatedSourcesBackfilled = false;
+}
+
+function repairStuckPendingStatus() {
+    if (_pendingStatusRepaired) return;
+    _pendingStatusRepaired = true;
+    try {
+        const entries = getEntries();
+        let changed = false;
+        for (const id of Object.keys(entries)) {
+            if (entries[id] && entries[id].status === "pending") {
+                entries[id].status = "active";
+                changed = true;
+            }
+        }
+        if (changed) { saveEntries(entries); console.log("[ML] Repaired entries stuck at 'pending' → 'active'."); }
+    } catch (e) { console.warn("[ML] pending-status repair skipped:", e); }
+}
+
+/**
+ * One-time backfill: mark every entry that was a source in any past
+ * consolidation with consolidatedSourceOf, so it stops reappearing in the
+ * consolidate modal. Needed because starred sources keep "active" status and
+ * older consolidations (pre-marker) never stamped them. Reconstructs from each
+ * consolidation's stored source_memories list.
+ */
+function backfillConsolidatedSources() {
+    if (_consolidatedSourcesBackfilled) return;
+    _consolidatedSourcesBackfilled = true;
+    try {
+        const cons = getConsolidations();
+        if (!cons) return;
+        const list = Array.isArray(cons) ? cons : Object.values(cons);
+        if (!list.length) return;
+        const entries = getEntries();
+        let changed = false;
+        for (const c of list) {
+            const srcIds = c && Array.isArray(c.source_memories) ? c.source_memories : [];
+            for (const sid of srcIds) {
+                if (entries[sid] && !entries[sid].consolidatedSourceOf) {
+                    entries[sid].consolidatedSourceOf = c.id || true;
+                    changed = true;
+                }
+            }
+        }
+        if (changed) { saveEntries(entries); console.log("[ML] Backfilled consolidatedSourceOf markers on past consolidation sources."); }
+    } catch (e) { console.warn("[ML] consolidated-source backfill skipped:", e); }
 }
 
 /**

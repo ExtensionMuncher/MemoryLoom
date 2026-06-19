@@ -1367,7 +1367,10 @@
     position: fixed;
     inset: 0;
     background: rgba(0,0,0,0.72);
-    z-index: 999;
+    /* Must sit ABOVE the ML popout (z-index 10000), or consolidating from inside
+       the chatbar popup renders the modal behind it — the chat/popout content
+       bleeds through on mobile. */
+    z-index: 10050;
     align-items: flex-start;
     justify-content: center;
     padding: 40px 20px;
@@ -1376,6 +1379,30 @@
 
 .ml-modal-overlay.open {
     display: flex;
+}
+
+/* When the modal is nested inside the ML popout, fill the popout (absolute)
+   instead of the whole viewport (fixed) so it stays within the extension. */
+#ml-popout .ml-modal-overlay {
+    position: absolute;
+    z-index: 50;
+    padding: 12px;
+}
+
+/* Inside the popout, the modal must fit the popout's width, not the viewport —
+   the popout is a narrow side panel, so 520px/640px/95vw would overflow it. */
+#ml-popout .ml-modal {
+    width: 100%;
+    max-width: 100%;
+    max-height: 100%;
+    overflow-y: auto;
+    padding: 14px;
+}
+#ml-popout .ml-modal .ml-consld-cols {
+    flex-direction: column;
+}
+#ml-popout .ml-modal .ml-consld-list {
+    max-height: 30vh;
 }
 
 .ml-modal {
@@ -1388,6 +1415,13 @@
     display: flex;
     flex-direction: column;
     gap: 14px;
+}
+
+/* Wider consolidation modal in the docked (non-popout) context. Inside the
+   popout, #ml-popout .ml-modal overrides this to fit the panel. */
+.ml-modal-consolidate {
+    width: 640px;
+    max-width: 95vw;
 }
 
 .ml-modal-title {
@@ -2019,3 +2053,89 @@ body.ml-disabled .ml-scene-btn {
     font-size: 12px; cursor: pointer; color: #ccc;
 }
 .ml-scene-bulk-all input { margin: 0; cursor: pointer; }
+
+/* ─── Consolidation modal: category groups ─── */
+.ml-consld-group { margin-bottom: 10px; }
+.ml-consld-group-hdr {
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.05em; color: #9a8fd8;
+    padding: 4px 2px; margin-top: 4px;
+    border-bottom: 0.5px solid #3a3550; position: sticky; top: 0;
+    background: var(--ml-panel-bg, #1a1a1f);
+}
+.ml-consld-group-count { color: #777; font-weight: 400; }
+.ml-consld-group-all { font-size: 10px; padding: 2px 8px; }
+
+/* ─── Consolidation modal: mobile responsiveness ─── */
+@media (max-width: 600px) {
+    .ml-modal-overlay { padding: 12px 8px; align-items: center; }
+    .ml-modal {
+        width: 96vw !important;
+        max-width: 96vw !important;
+        max-height: 88vh;
+        padding: 14px;
+        overflow-y: auto;
+    }
+    /* Stack Memories and Scenes columns vertically */
+    .ml-consld-cols { flex-direction: column; gap: 14px; }
+    .ml-consld-col { width: 100%; }
+    /* Shorter lists so both are reachable without the modal overflowing */
+    .ml-consld-list { max-height: 38vh; }
+    .ml-consld-group-hdr { font-size: 10px; }
+    .ml-consld-row { padding: 9px 10px; }   /* larger touch target */
+    .ml-consld-row-title { font-size: 13px; }
+    .ml-btn-row { flex-wrap: wrap; }
+    .ml-consld-group-hdr { position: static; }
+}
+
+/* ─── Custom folder icon picker ─── */
+.ml-icon-grid {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    gap: 5px;
+    max-height: 180px;
+    overflow-y: auto;
+}
+.ml-icon-pick {
+    aspect-ratio: 1;
+    border: 1px solid #3a3a3a;
+    border-radius: 6px;
+    background: #1d1d1d;
+    font-size: 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: background 0.12s, border-color 0.12s;
+}
+.ml-icon-pick:hover { background: #2a2a2a; }
+.ml-icon-pick.sel { border-color: #9a8fd8; background: #2c2740; }
+.ml-icon-pick[data-icon=""] {
+    grid-column: span 8;
+    aspect-ratio: auto;
+    font-size: 12px;
+    color: #aaa;
+    padding: 6px;
+}
+@media (max-width: 600px) {
+    .ml-icon-grid { grid-template-columns: repeat(6, 1fr); }
+    .ml-icon-pick[data-icon=""] { grid-column: span 6; }
+}
+
+/* Folder edit modal — themed text input (was rendering white) */
+.ml-folder-edit-input {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px;
+    padding: 7px 10px;
+    background: #222;
+    border: 1px solid #484848;
+    border-radius: 4px;
+    color: var(--SmartThemeBodyColor, #ccc);
+    width: 100%;
+}
+.ml-folder-edit-input:focus {
+    outline: none;
+    border-color: #9a8fd8;
+}

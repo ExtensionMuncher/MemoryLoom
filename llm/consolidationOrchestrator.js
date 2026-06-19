@@ -25,7 +25,7 @@
 
 import { generateConsolidation, generateCharacterConsolidatedMemory } from "./consolidator.js";
 import { createConsolidation } from "../data/consolidations.js";
-import { getEntry, getEntriesByFolder, getAllEntries, createEntry, setEntryStatus } from "../data/entries.js";
+import { getEntry, getEntriesByFolder, getAllEntries, createEntry, setEntryStatus, updateEntry } from "../data/entries.js";
 import { getScene, markSceneConsolidated } from "../data/scenes.js";
 import { embedEntry } from "../embed/embedder.js";
 import { getSetting } from "../settings.js";
@@ -93,7 +93,9 @@ export async function runConsolidation({ entryIds = [], sceneIds = [], mode = "s
             keyCharacters: [],
             category: "character",
             status: "consolidation",
-            tags: [...(draft.tags || [])],
+            // Per-character tags specific to THIS character's arc experience.
+            // Fall back to arc-level tags only if the model returned none.
+            tags: (written.tags && written.tags.length) ? written.tags : [...(draft.tags || [])],
             consolidationId: consolidation.id,
         });
         updatedMemories.push(mem);
@@ -119,7 +121,10 @@ export async function runConsolidation({ entryIds = [], sceneIds = [], mode = "s
     // ── 3. Demote source memories (non-destructive) ──────
     // Important/core memories are NEVER demoted — the user flagged them as
     // pivotal and they keep full priority even after being folded into an arc.
+    // But ALL sources (starred included) get stamped with consolidatedSourceOf so
+    // they don't reappear in the consolidate modal as if never consolidated.
     for (const e of sourceEntries) {
+        try { updateEntry(e.id, { consolidatedSourceOf: consolidation.id }); } catch (err) { console.warn("[ML] mark consolidated source failed:", err); }
         if (e.important) continue;
         setEntryStatus(e.id, "consolidated");
     }

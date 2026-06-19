@@ -115,6 +115,7 @@ function ensureChatNamespace() {
             openSceneId: null,     // ID of the currently open scene (null = none open)
             stickiness: {},        // Tracks which entries are currently "sticky" { entryId: messagesRemaining }
             cooldowns: {},         // Tracks cooldown timers { entryId: messagesRemaining }
+            worldScale: "",        // Per-chat free-text describing the world's scale/scope, read by the world writer to anchor world-EVENT detection altitude
         };
     }
 }
@@ -156,7 +157,30 @@ export function saveEntries(entries) {
     saveChat();
 }
 
+// ─── World scale (per-chat setting context) ───────────────
+
+/**
+ * Get the per-chat world scale / setting description. Anchors how the world
+ * writer judges what counts as a world EVENT (town-scale vs cosmic).
+ * @returns {string}
+ */
+export function getWorldScale() {
+    ensureChatNamespace();
+    return chat_metadata[NAMESPACE].worldScale || "";
+}
+
+/**
+ * Save the per-chat world scale description.
+ * @param {string} text
+ */
+export function saveWorldScale(text) {
+    ensureChatNamespace();
+    chat_metadata[NAMESPACE].worldScale = String(text || "");
+    saveChat();
+}
+
 // ─── Folders ──────────────────────────────────────────────
+
 
 /**
  * Get all folders for this chat.
@@ -404,7 +428,16 @@ export function getDefaultSettings() {
         injection: {
             enabled: true,             // Whether matched memories are injected at all
             placement: "below_card",   // Where in the system prompt: above_card, below_card, top, bottom
-            maxEntriesPerMessage: 3,   // Cap on simultaneous injections per message
+            maxEntriesPerMessage: 3,   // Global cap on simultaneous injections per message
+            // Per-category caps. Each limits how many of that category's memories
+            // can inject in one message. The global cap above still applies as an
+            // overall ceiling across all categories combined.
+            maxPerCategory: {
+                character: 3,
+                world: 2,
+                plot: 1,
+                custom: 2,
+            },
         },
 
         // ── Vectorization ─────────────────────────────────

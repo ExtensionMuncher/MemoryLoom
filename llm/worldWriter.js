@@ -17,7 +17,7 @@
 import { makeRequest } from "./connections.js";
 import { getScene, getPreviousSceneSummaries } from "../data/scenes.js";
 import { getAllEntries } from "../data/entries.js";
-import { getPendingEntries, savePendingEntries } from "../data/storage.js";
+import { getPendingEntries, savePendingEntries, getWorldScale } from "../data/storage.js";
 import { getSetting } from "../settings.js";
 import { getSceneMessages } from "./writer.js";
 import { dlog } from "../lib/debug.js";
@@ -49,8 +49,37 @@ WHAT ACTUALLY QUALIFIES (be selective, but DO record these when present):
 - The nature of a major faction/organization AS AN INSTITUTION: what the Kagutsuchi-gumi IS, its place in the city's power structure, how the yakuza world operates. NOT its current operations or roster.
 - How the world's systems work: its rules, its supernatural/technological laws, its social order.
 - The character of a significant, enduring LOCATION as a place in the world. NOT what happened there in a scene.
-- A genuinely world-altering EVENT whose structural consequences outlive the scene and change the setting for everyone.
-- A SHIFT: a previously-recorded world fact has genuinely changed.
+
+WORLD EVENTS — A SEPARATE, DISTINCT KIND OF ENTRY (read carefully):
+Apart from static facts above, you must also watch for a WORLD EVENT: something that HAPPENS and changes the state of the SETTING for many people, not just the characters in the room. A world event has structural consequences that outlive the scene — the kind of thing that would get a dated entry in a setting's timeline or a history book.
+
+CRUCIAL — JUDGE EVENTS RELATIVE TO THIS WORLD'S OWN SCALE:
+Worlds differ enormously in size. Some span multiple dimensions and civilizations; some are a single prefecture with rival factions; some are as small as one town or one school. The user has described THIS world's scale in the context provided below (look for "WORLD SCALE"). You MUST judge events against that scale, not an absolute one:
+- In a LARGE world (multiple realms, nations, great powers): only realm/nation/great-power-level events qualify. A single town's fire does not.
+- In a MEDIUM world (a region, a city, competing factions): faction-level and city-level events qualify.
+- In a SMALL world (a town, a school, a community): town-level and community-level events DO qualify — the school board dissolves, a fire guts the shopping district, the town floods, an institution that anchors the community collapses. Do NOT reject these for "not being faction-level" — in a town-scale world, the town IS the world.
+What stays rejected AT EVERY SCALE is the INTERPERSONAL floor: two people falling out, a single person's fate, a private deal. Lowering the ceiling to meet a small world never lowers this floor.
+If no WORLD SCALE is provided, infer it conservatively from the story, and lean toward treating community/town-level structural events as qualifying in an evidently small-scale setting.
+
+A world event qualifies ONLY if it clears this bar (relative to the world's scale):
+- It changes something at the structural level for that world — a faction, institution, community, region, population, or the world's rules — not a single relationship or a single person's circumstances.
+- Its consequences persist and affect people beyond those present in the scene.
+- A chronicler of THIS world would record it.
+
+A SPECIAL TOP-TIER CASE — A CHANGE TO THE WORLD'S RULES OR GENRE:
+If the fundamental nature of the setting changes — its genre shifts, its physical/supernatural laws change, something latent becomes active and alters what is possible in this world — that is ALWAYS a world event of the highest order, at ANY scale. Example: a town that was ordinary slice-of-life has a dormant supernatural contamination ACTIVATE, flipping the setting into urban fantasy. That changes the rules for everyone and qualifies absolutely.
+BUT distinguish LATENT from ACTIVATED: a threat that is merely sensed, foreshadowed, leaking faintly, or known-but-dormant is NOT yet an event — it is standing tension. The event is the moment it actually breaks containment and the setting's nature genuinely changes. "A character feels something wrong in the air" or "one location is known to be tainted" = not an event. "The taint erupts and the town's reality visibly shifts" = a top-tier world event.
+
+Examples that QUALIFY as world events (scaled appropriately): a war or open conflict breaks out between factions/groups; a faction or institution falls, is destroyed, or seizes power; a treaty/alliance/truce is formed or broken; a barrier/seal protecting a place is breached; a public revelation changes how a population understands their world; a leader of an institution is overthrown or installed; a catastrophe reshapes a location for everyone who lives there; the world's rules or genre change.
+
+Examples that DO NOT qualify (interpersonal or plot-local, NOT world events — REJECT at every scale):
+✗ Two characters meet, fight, reconcile, kiss, or make a personal deal.
+✗ One character is injured, captured, healed, or discharged from somewhere.
+✗ Someone is tracked, followed, or has orders issued about them personally.
+✗ A character joins/leaves/visits a place, has a realization, or changes how they feel.
+✗ A small group's plan, errand, or outing — even if it feels momentous to them.
+✗ A latent/dormant/sensed threat that has not actually activated.
+The test for a world event: "Would this be recorded in THIS world's history, affecting people who weren't even in this scene, at this world's scale?" If it's really about what happened between specific people, it is NOT a world event. Most scenes contain NO world event. That is expected and correct.
 
 REJECT THESE — they are NOT world memories (these are your most common mistakes):
 ✗ A specific named underling and their role. "Takeshi is a lieutenant with a scar who works from a garage in Nakano" → CHARACTER DATA. A roster of who's in an organization is not worldbuilding. REJECT.
@@ -79,7 +108,22 @@ Otherwise, for EACH genuine NEW world-lore fact, output a block in this exact fo
 
 **Content**: (The world fact, stated neutrally and concretely.)
 
-**Type**: (one of: organization, location, structure, rule, event, shift)
+**Type**: (one of: organization, location, structure, rule)
+
+---
+
+And for EACH genuine WORLD EVENT (something that happened with setting-wide consequences — usually NONE per scene), output a block in this exact format:
+
+---
+
+# WORLD EVENT
+
+**Title**: (3-6 word evocative title for the event)
+**Date/Time**: (when it happened, if known)
+
+**Content**: (What happened and its consequences for the setting, stated concretely in third person. Make clear WHY it matters beyond the people present.)
+
+**Type**: event
 
 ---
 
@@ -101,8 +145,12 @@ And for EACH revision to an existing fact, output an UPDATE block in this exact 
 Output nothing else — no preamble, no commentary.`;
 }
 
-function buildWorldUserPrompt(sceneSummary, messages, previousSummaries, knownFacts) {
+function buildWorldUserPrompt(sceneSummary, messages, previousSummaries, knownFacts, worldScale) {
     let p = "";
+    if (worldScale && String(worldScale).trim()) {
+        p += "WORLD SCALE (the user's description of this world's size/scope — judge what counts as a world EVENT relative to THIS scale):\n";
+        p += String(worldScale).trim() + "\n\n";
+    }
     if (knownFacts.length > 0) {
         p += "WORLD LORE ALREADY ON RECORD (do not restate or rephrase any of these — only a genuine CHANGE to one, or something at this same altitude that is brand new, qualifies):\n";
         p += knownFacts.join("\n") + "\n\n";
@@ -134,7 +182,7 @@ Record what genuinely qualifies. Only if the scene establishes nothing new at th
 /** Parse world-memory and world-update blocks out of the LLM response. */
 function parseWorldResponse(response, sceneId) {
     if (!response) return [];
-    const hasBlocks = /#\s*WORLD\s+(MEMORY|UPDATE)/i.test(response);
+    const hasBlocks = /#\s*WORLD\s+(MEMORY|UPDATE|EVENT)/i.test(response);
     if (!hasBlocks && /\[NO WORLD MEMORY\]/i.test(response)) return [];
     const out = [];
 
@@ -150,7 +198,7 @@ function parseWorldResponse(response, sceneId) {
     };
 
     // Split into typed blocks, keeping the header capture so we know MEMORY vs UPDATE.
-    const parts = response.split(/#\s*WORLD\s+(MEMORY|UPDATE)/i);
+    const parts = response.split(/#\s*WORLD\s+(MEMORY|UPDATE|EVENT)/i);
     for (let i = 1; i < parts.length; i += 2) {
         const kind = (parts[i] || "").toUpperCase();
         const block = parts[i + 1] || "";
@@ -160,18 +208,23 @@ function parseWorldResponse(response, sceneId) {
         const content = contentFrom(block);
         if (!content && !title) continue;
 
+        const isEvent = (kind === "EVENT") || (type && type.toLowerCase() === "event");
+
         const base = {
             id: `mlpend_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-            title: title || "World fact",
+            title: title || (isEvent ? "World event" : "World fact"),
             datetime,
             content,
             category: "world",
+            // worldEvent distinguishes setting-altering events (which flow into
+            // consolidation) from static world facts (which do not).
+            worldEvent: isEvent,
             primaryCharacter: "",
             primaryCharacters: [],
             keyCharacters: [],
-            tags: type ? ["world", type.toLowerCase()] : ["world"],
+            tags: isEvent ? ["world", "event"] : (type ? ["world", type.toLowerCase()] : ["world"]),
             sceneId: sceneId || null,
-            source: "scene_world",
+            source: isEvent ? "scene_world_event" : "scene_world",
             status: "pending",
         };
 
@@ -215,7 +268,7 @@ export async function generateWorldMemories(sceneId, force = false) {
     const knownFacts = getKnownWorldFacts();
 
     const sys = buildWorldSystemPrompt();
-    const user = buildWorldUserPrompt(scene.llmSummary, sceneMessages, previousSummaries, knownFacts);
+    const user = buildWorldUserPrompt(scene.llmSummary, sceneMessages, previousSummaries, knownFacts, getWorldScale());
 
     dlog(`World memory: scanning scene ${sceneId} against ${knownFacts.length} known world facts…`);
     const response = await makeRequest(profileName, sys, user, getMaxResponseTokens(), 0.4);

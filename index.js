@@ -34,7 +34,7 @@ import { maybeAutoConsolidate } from "./llm/consolidationOrchestrator.js";
 import { runRetrievalPipeline, tickCounters } from "./embed/retriever.js";
 import { updateInjection, removeInjection } from "./inject/promptInjector.js";
 import { createScene, closeScene, getOpenScene, isMessageInClosedScene, initSceneCounter, recordLastClosedScene } from "./data/scenes.js";
-import { getAllEntries } from "./data/entries.js";
+import { getAllEntries, resetEntryMigrationGuards } from "./data/entries.js";
 
 let _sidecarRunning = false;
 const _processedMesIds = new Set();
@@ -159,6 +159,7 @@ function registerEventHandlers() {
     });
     eventSource.on(event_types.CHAT_CHANGED, () => {
         _processedMesIds.clear();
+        resetEntryMigrationGuards();   // re-run per-chat migrations for the new chat
         initDefaultFolders();
         initSceneCounter();
         renderHomeTab($("#ml-p-home"));
@@ -259,25 +260,83 @@ function registerMagicWandMenuEntry() {
     entry.className = 'list-group-item flex-container flexGap5 interactable';
     entry.title = 'Open Memory Loom'; entry.tabIndex = 0;
     entry.innerHTML = '<i class="fa-solid fa-book-open-reader"></i><span>Memory Loom</span>';
-    entry.addEventListener('click', () => { mlPopoutVisible ? closeMlPopout() : openMlPopout(); });
+    entry.addEventListener('click', () => {
+        // Use real DOM presence, not just the flag, so a desynced flag can't
+        // wedge the toggle (the "won't reopen" bug). open() self-heals stale state.
+        const reallyOpen = mlPopoutVisible && $mlPopout && document.body.contains($mlPopout[0]);
+        reallyOpen ? closeMlPopout() : openMlPopout();
+    });
     menu.appendChild(entry);
 }
 function openMlPopout() {
+    // Self-heal: if state says open but the popout DOM is gone (destroyed by an
+    // outside event, interrupted fade, etc.), reset so we can reopen instead of
+    // being permanently stuck. This was the "popup won't reopen until refresh" bug.
+    if (mlPopoutVisible && (!$mlPopout || !document.body.contains($mlPopout[0]))) {
+        recoverOrphanedPopoutContent();
+        mlPopoutVisible = false;
+        $mlPopout = null;
+    }
     if (mlPopoutVisible) return;
-    const $c = $('#ml_container .inline-drawer-content'); if (!$c.length) return;
+
+    // The drawer content may be orphaned inside a removed popout from a prior
+    // botched close — recover it back to #ml_container before we grab it.
+    recoverOrphanedPopoutContent();
+
+    let $c = $('#ml_container .inline-drawer-content');
+    if (!$c.length) {
+        // Last resort: the panel was never built or content is missing — rebuild.
+        try { createPanel(); } catch (e) { console.error("[ML] popout: panel rebuild failed:", e); }
+        $c = $('#ml_container .inline-drawer-content');
+        if (!$c.length) { console.warn("[ML] popout: no panel content to show."); return; }
+    }
+
     $mlPopout = $(`<div id="ml-popout" class="draggable"><div id="ml-popout-header" class="ml-popout-header"><div class="ml-popout-title"><i class="fa-solid fa-book-open-reader"></i><span>Memory Loom</span></div><div class="ml-popout-close" title="Close"><i class="fa-solid fa-xmark"></i></div></div><div id="ml-popout-content"></div></div>`);
-    $('body').append($mlPopout); $mlPopout.find('#ml-popout-content')[0].appendChild($c[0]);
+    $('body').append($mlPopout);
+    $mlPopout.find('#ml-popout-content')[0].appendChild($c[0]);
     $mlPopout.find('.ml-popout-close').on('click', closeMlPopout);
     $(document).on('keydown.ml_popout', e => { if (e.key === 'Escape') closeMlPopout(); });
     if (typeof window.dragElement === 'function') window.dragElement($mlPopout);
     $mlPopout.fadeIn(200); mlPopoutVisible = true;
 }
+
+/** Move the drawer content back into #ml_container if it's stranded in a
+ *  (possibly detached) popout. Safe to call anytime; no-op if nothing stranded. */
+function recoverOrphanedPopoutContent() {
+    try {
+        const content = document.getElementById('ml-popout-content')?.firstElementChild
+            || (document.querySelector('#ml-popout .inline-drawer-content'));
+        if (content && !$('#ml_container .inline-drawer-content').length) {
+            const p = $('#ml_container .inline-drawer');
+            (p.length ? p : $('#ml_container')).append(content);
+        }
+        // Remove any leftover popout shells
+        $('#ml-popout').each(function () { if (this !== ($mlPopout && $mlPopout[0])) this.remove(); });
+    } catch (e) { console.warn("[ML] popout recovery skipped:", e); }
+}
+
 function closeMlPopout() {
-    if (!mlPopoutVisible || !$mlPopout) return;
+    if (!mlPopoutVisible || !$mlPopout) {
+        // State already says closed — make sure nothing is stranded, then bail.
+        recoverOrphanedPopoutContent();
+        mlPopoutVisible = false; $mlPopout = null;
+        $(document).off('keydown.ml_popout');
+        return;
+    }
+    const popoutEl = $mlPopout;
     const dc = document.getElementById('ml-popout-content')?.firstElementChild;
-    $mlPopout.fadeOut(200, () => {
-        if (dc) { const p = $('#ml_container .inline-drawer'); (p.length ? p : $('#ml_container')).append(dc); }
-        $mlPopout.remove(); $mlPopout = null;
-    });
-    mlPopoutVisible = false; $(document).off('keydown.ml_popout');
+    // Flip state FIRST so a mid-fade interruption can't leave us stuck "open".
+    mlPopoutVisible = false; $mlPopout = null;
+    $(document).off('keydown.ml_popout');
+    const restore = () => {
+        if (dc && !$('#ml_container .inline-drawer-content').length) {
+            const p = $('#ml_container .inline-drawer');
+            (p.length ? p : $('#ml_container')).append(dc);
+        }
+        popoutEl.remove();
+    };
+    popoutEl.fadeOut(200, restore);
+    // Safety net: if fadeOut's callback never fires (tab backgrounded, etc.),
+    // force the restore shortly after so content is never left orphaned.
+    setTimeout(() => { if (document.body.contains(popoutEl[0])) restore(); }, 600);
 }

@@ -18,6 +18,7 @@ import { chat, name1 } from "../../../../../script.js";
 import { getContext } from "../../../../extensions.js";
 import { getScene, getPreviousSceneSummaries, updateSceneSummary } from "../data/scenes.js";
 import { getPendingEntries, savePendingEntries } from "../data/storage.js";
+import { getAllEntries } from "../data/entries.js";
 
 
 import { resolveCanonicalCharacter } from "../data/folders.js";
@@ -260,6 +261,17 @@ function buildMemoryEntryUserPrompt(sceneSummary, messages, previousSummaries) {
         });
     }
     prompt += "\nReview the scene above and create the Core Memory.";
+
+    // Title-diversity guard: if recent memory titles cluster around a repeated
+    // opening (e.g. many "The Weight of…"), tell the model to avoid it. Gated by
+    // a setting so it can be turned off. Default on.
+    if (getSetting("memoryWriting.titleDiversity", true)) {
+        const overused = getOverusedTitleOpenings();
+        if (overused.length > 0) {
+            prompt += `\n\nTITLE VARIETY: The library already has many titles beginning with ${overused.map(o => `"${o}"`).join(", ")}. Do NOT begin this memory's title with ${overused.length > 1 ? "any of those openings" : "that opening"}. Find a fresh, distinct title — vary the structure (not every title needs to start with "The"). The title should still be evocative and specific to this moment.`;
+        }
+    }
+
     const banned = getBannedPrimaries();
     if (banned.length > 0) {
         prompt += ` FINAL RULE, overriding everything else: never create a memory whose Primary Character is ${banned.join(" or ")}. This governs ONLY the Primary Character field — inside a memory's Content, refer to them freely and by full name like any other character; never avoid or dance around their names. They are valid Key Characters. If a defining moment belongs solely to them — with no NPC present — that is not a memory: SKIP it and output nothing for it. Do NOT write an entry with an empty, placeholder, "Unknown", or explanatory Primary Character (for example, never write something like "(No NPC present...)" in the name field). The Primary Character field must contain a real NPC name or the entry must not exist.`;
@@ -388,6 +400,34 @@ export function getSceneMessages(scene, includeHidden = false) {
 // persona name (so "Sachiko" alone is caught when the persona is "Furukawa
 // Sachiko"). The prompt tells the model not to write these; this guarantees
 // none survive even when the model ignores that.
+/**
+ * Returns title openings (first 2 words) that are over-represented in the
+ * library, so the writer can be told to avoid them. Threshold scales a little
+ * with library size but stays conservative. Returns up to 3 worst offenders.
+ */
+function getOverusedTitleOpenings() {
+    let entries = [];
+    try { entries = getAllEntries() || []; } catch (e) { return []; }
+    if (entries.length < 6) return [];   // too small to judge repetition
+    const counts = {};
+    for (const e of entries) {
+        const words = String(e.title || "").trim().split(/\s+/);
+        if (words.length < 2) continue;
+        const opening = (words[0] + " " + words[1]).toLowerCase();
+        // skip trivial openings that aren't really a "style" (e.g. "a the")
+        counts[opening] = (counts[opening] || 0) + 1;
+    }
+    // "overused" = appears in >= 20% of entries, min 3 occurrences
+    const threshold = Math.max(3, Math.ceil(entries.length * 0.2));
+    const overused = Object.entries(counts)
+        .filter(([, c]) => c >= threshold)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        // present in original casing-ish form (Title Case the opening)
+        .map(([opening]) => opening.replace(/\b\w/g, ch => ch.toUpperCase()));
+    return overused;
+}
+
 function getBannedPrimaries() {
     // Persona is always banned; the user can ban additional characters in
     // Settings > Memory Writing (comma-separated). Banned characters may still
