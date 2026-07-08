@@ -397,8 +397,8 @@ export function getSceneMessages(scene, includeHidden = false) {
 // Hard backstop: discard any entry that cannot be attributed to a real NPC.
 // Catches blank primaries, "Unknown"/"None"/"N/A" placeholders, the literal
 // {{user}} macro, the player persona's full name, AND any single token of the
-// persona name (so "Sachiko" alone is caught when the persona is "Furukawa
-// Sachiko"). The prompt tells the model not to write these; this guarantees
+// persona name (so "Doe" alone is caught when the persona is "Jane
+// Doe"). The prompt tells the model not to write these; this guarantees
 // none survive even when the model ignores that.
 /**
  * Returns title openings (first 2 words) that are over-represented in the
@@ -447,7 +447,7 @@ function isPlayerOrUnknownEntry(primary) {
     if (["unknown", "none", "n/a", "na", "{{user}}", "user", "the human player", "player"].includes(p)) return true;
     // Prose-evasion guard: models try to dodge the ban by writing an explanatory
     // sentence INTO the name field, e.g. "(No NPC present—this moment belongs
-    // solely to Furukawa Sachiko)". Any primary that talks about absence of an
+    // solely to Jane Doe)". Any primary that talks about absence of an
     // NPC, or reads like a sentence rather than a name, is rejected outright.
     if (/\bno\s+(npc|character|one)\b|belongs\s+solely|only\s+(the\s+)?(user|player)|solely\s+to\b/i.test(p)) return true;
     if (p.length > 40 || /[.!?;]|—|--/.test(p)) return true; // names aren't sentences
@@ -544,7 +544,7 @@ function parseWriterResponse(response, sceneId) {
             sceneId: sceneId,
         })).map(e => {
             // Split joint primaries, resolve canonical names, drop banned/unknown
-            // names individually ("Ichigo Kurosaki" → "Kurosaki Ichigo")
+            // names individually ("Jane Doe" → "Doe Jane")
             const primaries = normalizePrimaries(e.primaryCharacter || e.primaryCharacters);
             e.primaryCharacter = primaries.length === 1 ? primaries[0] : "";
             e.primaryCharacters = primaries;

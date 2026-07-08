@@ -8,8 +8,8 @@
  *   - Consolidation output must NOT contain open_threads, future_questions,
  *     or suggested_next_steps. Unresolved context must be expressed as
  *     present state only.
- *   - Example of what NOT to do: "Will Sachiko forgive Rukia?"
- *   - Example of correct approach: "Sachiko has not forgiven Rukia and
+ *   - Example of what NOT to do: "Will Mira forgive Elena?"
+ *   - Example of correct approach: "Mira has not forgiven Elena and
  *     remains guarded around her."
  *   - Consolidation does not delete source memories — it reduces their
  *     injection priority, not removes them.
@@ -167,10 +167,10 @@ RULES:
 4. Use neutral, clinical language. This is reference material for the AI, not narrative prose.
 
 Example of WRONG output:
-  "Will Sachiko forgive Rukia for the betrayal?"
+  "Will Mira forgive Elena for the betrayal?"
 
 Example of CORRECT output:
-  "Sachiko has not forgiven Rukia for the betrayal and remains guarded around her."
+  "Mira has not forgiven Elena for the betrayal and remains guarded around her."
 
 Output as JSON with these fields:
 {

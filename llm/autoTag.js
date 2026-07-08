@@ -43,7 +43,7 @@ function buildTagSystemPrompt() {
     return `You are a tagging assistant for a memory archive. Given a memory entry, suggest 3-8 descriptive tags that would help a user browse and filter entries in a library.
 
 Tags should be:
-- Lowercase, single words or short compound phrases (e.g. "heian_era", "trust_building", "betrayal")
+- Lowercase, single words or short compound phrases (e.g. "victorian_era", "trust_building", "betrayal")
 - Descriptive of content, themes, emotions, relationships, or events
 - NOT character names (characters are tracked separately)
 

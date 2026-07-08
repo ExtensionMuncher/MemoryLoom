@@ -881,7 +881,7 @@ function renderCharacterSubfolder(folder) {
     const $aliasRow = $(`
         <div class="ml-alias-row">
             <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#888;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:4px">Name aliases</div>
-            <input type="text" class="ml-alias-input" placeholder="e.g. Ichigo, Strawberry Boy, Chanichi" value="${escapeHtml(aliasVal)}">
+            <input type="text" class="ml-alias-input" placeholder="e.g. Jane, Janey, JD" value="${escapeHtml(aliasVal)}">
             <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#666;margin-top:3px">Comma-separated · memories written under these names file into this folder</div>
         </div>
     `);
@@ -1819,7 +1819,7 @@ function renderNewEntryModal($pane) {
                             <label class="ml-form-label">Date / Time</label>
                             <i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="ml-ne-datetime" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer;transition:all var(--animation-duration-2x,0.3s) ease-in-out"></i>
                         </div>
-                        <input class="ml-form-input" type="text" id="ml-ne-datetime" placeholder="e.g. Heian Era · ~1104 CE · dusk">
+                        <input class="ml-form-input" type="text" id="ml-ne-datetime" placeholder="e.g. Victorian Era · 1888 · dusk">
                     </div>
                 </div>
                 <div class="ml-form-group">
@@ -2040,7 +2040,7 @@ function renderNewFolderModal($pane) {
                 </div>
                 <div class="ml-form-group">
                     <label class="ml-form-label">Folder name</label>
-                    <input class="ml-form-input" type="text" id="ml-nf-name" placeholder="e.g. Heian Era, Side Characters, Arcs…">
+                    <input class="ml-form-input" type="text" id="ml-nf-name" placeholder="e.g. Victorian Era, Side Characters, Arcs…">
                 </div>
                 <div class="ml-form-group">
                     <label class="ml-form-label">Folder level</label>

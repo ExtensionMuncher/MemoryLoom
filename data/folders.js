@@ -227,7 +227,7 @@ export function hasCharacterSubfolder(charName) {
 /**
  * Set the alias list for a character folder.
  * Aliases are alternate names/nicknames the writer LLM might use for the same
- * character ("Ichigo", "Strawberry Boy", "Chanichi"). All of them resolve to
+ * character ("Jane", "Janey", "JD"). All of them resolve to
  * this folder's canonical character name, so memories never land in a
  * duplicate folder spawned by a name variant.
  */
@@ -242,7 +242,7 @@ export function setFolderAliases(folderId, aliases) {
  * Resolve any name variant to the canonical character name of an existing
  * character folder. Three matching layers, all case-insensitive:
  *   1. Exact match on a folder's character name
- *   2. Token-set match — "Kurosaki Ichigo" and "Ichigo Kurosaki" are the same
+ *   2. Token-set match — "Doe Jane" and "Jane Doe" are the same
  *      words in a different order, so they resolve to the same folder
  *      automatically, no alias needed
  *   3. Alias match — user-defined nicknames stored on the folder

@@ -142,7 +142,45 @@ globalThis.memoryLoomGenerateInterceptor = async function (chat, contextSize, ab
     }
 };
 
+// One delegated listener handles every scene button, no matter how many times
+// the buttons are rebuilt. Bound to document so it survives ST's frequent
+// message-row re-renders (the reason direct handlers failed on mobile). We guard
+// against the double-fire that touch devices produce (touchend THEN click) with
+// a short timestamp lock.
+let _lastSceneTap = 0;
+function registerSceneButtonDelegate() {
+    const run = (e) => {
+        const el = e.target && e.target.closest ? e.target.closest(".ml-scene-btn") : null;
+        if (!el) return;
+        const action = el.getAttribute("data-ml-action");
+        if (!action) return;  // "Already scanned" state — no action
+        const now = Date.now();
+        if (now - _lastSceneTap < 400) return;  // de-dupe rapid double events
+        _lastSceneTap = now;
+        const mesId = parseInt(el.getAttribute("data-ml-mesid"), 10);
+        if (isNaN(mesId)) return;
+        console.log("[ML] scene button tapped:", action, "mesId:", mesId);
+        handleSceneButtonAction(action, mesId).catch((err) => {
+            console.error("[ML] Scene button action failed:", err);
+            toastr?.error?.("Memory Loom scene action failed. Check the console for details.");
+            try {
+                hidePanelLoading();
+                setProcessingStatus(null);
+                refreshSceneButtons();
+            } catch (cleanupErr) {
+                console.error("[ML] Scene button cleanup failed:", cleanupErr);
+            }
+        });
+    };
+    // Namespaced so re-init doesn't stack duplicates. 'click' covers desktop and
+    // mobile taps on modern browsers; we intentionally do NOT preventDefault or
+    // stopPropagation so we never interfere with SillyTavern's own handling.
+    $(document).off("click.mlscene");
+    $(document).on("click.mlscene", ".ml-scene-btn", run);
+}
+
 function registerEventHandlers() {
+    registerSceneButtonDelegate();
     eventSource.on(event_types.MESSAGE_RECEIVED, async (mesId) => {
         if (!isEnabled()) return;
         if (mesId !== undefined && _processedMesIds.has(mesId)) return;
@@ -179,53 +217,59 @@ function addMessageButtons(mesId) {
     if (!$bar.length) return;
     $bar.find(".ml-scene-btn").remove();
     const openScene = getOpenScene();
-    let icon, title, css, handler;
+    let icon, title, css, action;
     if (openScene && mesId >= openScene.messageStart && (openScene.messageEnd === null || mesId <= openScene.messageEnd)) {
         icon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><use href="#ico-feather"/></svg>';
-        title = "Close scene"; css = "ml-scene-btn ml-scene-active";
-        handler = async () => {
-            const closed = closeScene(openScene.id, mesId);
-            if (!closed) return;
-            recordLastClosedScene(closed.id);
-            refreshSceneButtons();
-            toastr?.info?.("Scene closed — generating entries...");
-            // Persistent indicators: panel overlay + Home-tab processing banner.
-            // Toasts vanish; these stay up until the writer flow finishes.
-            showPanelLoading("Scene closed — generating memory entries...");
-            setProcessingStatus("Generating memory entries for closed scene...");
-            renderHomeTab($("#ml-p-home"));
-            try {
-                const result = await runWriterFlow(closed.id);
-                if (result && result.length > 0) toastr?.success?.(result.length + " entr" + (result.length === 1 ? "y" : "ies") + " ready for review.");
-                else toastr?.warning?.("Scene closed. Check LLM connection.");
-            } catch (e) { console.error(e); toastr?.error?.("Entry generation failed."); }
-            hidePanelLoading();
-            setProcessingStatus(null);
-            // Refresh Home (pending entries) AND Library (Scenes view) so the new
-            // material shows without flipping between tabs
-            renderHomeTab($("#ml-p-home"));
-            const $lib = $("#ml-p-library");
-            if ($lib.length) renderLibraryTab($lib);
-            // Automatic consolidation check — only fires if enabled and a folder
-            // crossed its threshold. Runs after entries are committed, not pending.
-            maybeAutoConsolidate().then(() => {
-                const $l = $("#ml-p-library"); if ($l.length) renderLibraryTab($l);
-            }).catch(err => console.error("[ML] Auto-consolidate error:", err));
-        };
+        title = "Close scene"; css = "ml-scene-btn ml-scene-active"; action = "close";
     } else if (isMessageInClosedScene(mesId)) {
         icon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><use href="#ico-book"/></svg>';
-        title = "Already scanned"; css = "ml-scene-btn"; handler = null;
+        title = "Already scanned"; css = "ml-scene-btn"; action = "";
     } else {
         icon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><use href="#ico-book-open"/></svg>';
-        title = "Open scene"; css = "ml-scene-btn";
-        handler = () => {
-            if (getOpenScene()) { toastr?.warning?.("Scene already open."); return; }
-            createScene(mesId); refreshSceneButtons(); toastr?.success?.("Scene opened.");
-        };
+        title = "Open scene"; css = "ml-scene-btn"; action = "open";
     }
-    const $btn = $(`<div class="${css}" title="${title}">${icon}</div>`);
-    if (handler) $btn.on("click", handler);
+    // Data-driven button: the click is handled by ONE delegated listener on
+    // document (see registerSceneButtonDelegate). Direct per-button handlers were
+    // unreliable on mobile — ST re-renders message rows frequently, swapping the
+    // element out from under a tap before the click fired, so nothing happened.
+    const $btn = $(`<div class="${css}" title="${title}" data-ml-action="${action}" data-ml-mesid="${mesId}" role="button" tabindex="0">${icon}</div>`);
     $bar.prepend($btn);
+}
+
+// Runs the scene action for a given message. Called by the delegated listener.
+async function handleSceneButtonAction(action, mesId) {
+    if (action === "open") {
+        if (getOpenScene()) { toastr?.warning?.("Scene already open."); return; }
+        createScene(mesId); refreshSceneButtons(); toastr?.success?.("Scene opened.");
+        return;
+    }
+    if (action === "close") {
+        const openScene = getOpenScene();
+        console.log("[ML] handleSceneButtonAction close — openScene:", openScene);
+        if (!openScene) { refreshSceneButtons(); return; }
+        const closed = closeScene(openScene.id, mesId);
+        console.log("[ML] closeScene returned:", closed);
+        if (!closed) return;
+        recordLastClosedScene(closed.id);
+        refreshSceneButtons();
+        toastr?.info?.("Scene closed — generating entries...");
+        showPanelLoading("Scene closed — generating memory entries...");
+        setProcessingStatus("Generating memory entries for closed scene...");
+        renderHomeTab($("#ml-p-home"));
+        try {
+            const result = await runWriterFlow(closed.id);
+            if (result && result.length > 0) toastr?.success?.(result.length + " entr" + (result.length === 1 ? "y" : "ies") + " ready for review.");
+            else toastr?.warning?.("Scene closed. Check LLM connection.");
+        } catch (e) { console.error(e); toastr?.error?.("Entry generation failed."); }
+        hidePanelLoading();
+        setProcessingStatus(null);
+        renderHomeTab($("#ml-p-home"));
+        const $lib = $("#ml-p-library");
+        if ($lib.length) renderLibraryTab($lib);
+        maybeAutoConsolidate().then(() => {
+            const $l = $("#ml-p-library"); if ($l.length) renderLibraryTab($l);
+        }).catch(err => console.error("[ML] Auto-consolidate error:", err));
+    }
 }
 function refreshSceneButtons() {
     $(".mes[mesid]").each(function() {

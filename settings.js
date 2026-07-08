@@ -238,6 +238,7 @@ export async function importAllData(jsonString, options = {}) {
             const {
                 getEntries, saveEntries, getFolders, saveFolders,
                 getScenes, saveScenes, getConsolidations, saveConsolidations,
+                getPendingEntries, savePendingEntries, getChatData, persistChatData,
             } = await import("./data/storage.js");
             const cd = data.chatData;
 
@@ -247,6 +248,9 @@ export async function importAllData(jsonString, options = {}) {
                 if (cd.folders !== undefined)        saveFolders(cd.folders || []);
                 if (cd.scenes !== undefined)         saveScenes(cd.scenes || []);
                 if (cd.consolidations !== undefined) saveConsolidations(normalizeMap(cd.consolidations));
+                if (cd.pendingEntries !== undefined) savePendingEntries(normalizePendingEntries(cd.pendingEntries));
+                importChatMetaFields(cd, getChatData(), "replace");
+                persistChatData();
             } else {
                 // MERGE: keep everything existing, add/overlay imported items by id.
                 // Imported items win on id collision (they're the explicit import).
@@ -262,6 +266,11 @@ export async function importAllData(jsonString, options = {}) {
                 if (cd.scenes !== undefined) {
                     saveScenes(mergeArrayById(getScenes(), cd.scenes || []));
                 }
+                if (cd.pendingEntries !== undefined) {
+                    savePendingEntries(mergePendingEntries(getPendingEntries(), cd.pendingEntries));
+                }
+                importChatMetaFields(cd, getChatData(), "merge");
+                persistChatData();
             }
         }
 
@@ -283,6 +292,53 @@ function normalizeMap(val) {
         return out;
     }
     return val;
+}
+
+// Pending review entries are intentionally allowed to be id-less: generated
+// pending cards receive their real id only when the user commits them. Older
+// exports may store this as either an array or an object map, so normalize to
+// the array shape the Home tab already handles best.
+function normalizePendingEntries(val) {
+    if (!val) return null;
+    const list = Array.isArray(val) ? val : Object.values(val || {});
+    const clean = list.filter(item => item && typeof item === "object");
+    return clean.length ? clean : null;
+}
+
+// Merge pending entries without requiring ids. When ids exist, use them as the
+// stable key; otherwise fall back to a content fingerprint so re-importing the
+// same export does not duplicate the same pending cards.
+function mergePendingEntries(existing, incoming) {
+    const out = [];
+    const seen = new Set();
+    const add = (item) => {
+        if (!item || typeof item !== "object") return;
+        const key = item.id
+            ? `id:${item.id}`
+            : `fp:${item.title || ""}|${item.datetime || ""}|${item.primaryCharacter || (item.primaryCharacters || []).join(",")}|${item.sceneId || ""}|${item.content || ""}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        out.push(item);
+    };
+    (normalizePendingEntries(existing) || []).forEach(add);
+    (normalizePendingEntries(incoming) || []).forEach(add);
+    return out.length ? out : null;
+}
+
+// Import chat-scoped metadata that exportAllData already writes but the old
+// importer silently ignored. In merge mode, current worldScale/openSceneId are
+// preserved when already populated; replace mode takes the imported values.
+function importChatMetaFields(source, target, mode) {
+    if (!source || !target) return;
+    const replace = mode === "replace";
+    if (source.messageCounter !== undefined) {
+        const n = Number(source.messageCounter);
+        if (Number.isFinite(n)) target.messageCounter = n;
+    }
+    if (source.stickiness !== undefined) target.stickiness = mergeById(replace ? {} : (target.stickiness || {}), normalizeMap(source.stickiness));
+    if (source.cooldowns !== undefined) target.cooldowns = mergeById(replace ? {} : (target.cooldowns || {}), normalizeMap(source.cooldowns));
+    if (source.worldScale !== undefined && (replace || !target.worldScale)) target.worldScale = String(source.worldScale || "");
+    if (source.openSceneId !== undefined && (replace || !target.openSceneId)) target.openSceneId = source.openSceneId || null;
 }
 
 // Merge two id-keyed object maps; imported (source) wins on collision.

@@ -17,6 +17,7 @@
 import { getScenes, saveScenes, getOpenSceneId, saveOpenSceneId, getConsolidations as getConsolidationsForScenes, getPendingEntries, savePendingEntries } from "./storage.js";
 import { getAllEntries, deleteEntry } from "./entries.js";
 import { deleteEntryVector } from "../embed/embedder.js";
+import { getSetting, setSetting } from "../settings.js";
 
 // ─── ID Generation ────────────────────────────────────────
 
@@ -330,7 +331,7 @@ export function initSceneCounter() {
 
 /**
  * Track the last closed scene for undo functionality.
- * Stored in chat_metadata directly (not in the scenes array).
+ * Stored in extension settings (not in the scenes array) so it survives reloads.
  */
 let _lastClosedSceneId = null;
 let _batchScanPerformed = false;

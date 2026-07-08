@@ -46,7 +46,7 @@ A world memory must be a fact about the SETTING that would still be worth knowin
 POV: third-person omniscient. Refer to everyone, including the player character, by name and he/she/they. Never "I/me/my/we/us". The player character MAY appear if a genuine world fact centers on them, but their personal situation is almost never world lore (see rejections below).
 
 WHAT ACTUALLY QUALIFIES (be selective, but DO record these when present):
-- The nature of a major faction/organization AS AN INSTITUTION: what the Kagutsuchi-gumi IS, its place in the city's power structure, how the yakuza world operates. NOT its current operations or roster.
+- The nature of a major faction/organization AS AN INSTITUTION: what the Ravenshade Syndicate IS, its place in the city's power structure, how the criminal underworld operates. NOT its current operations or roster.
 - How the world's systems work: its rules, its supernatural/technological laws, its social order.
 - The character of a significant, enduring LOCATION as a place in the world. NOT what happened there in a scene.
 
@@ -83,9 +83,9 @@ The test for a world event: "Would this be recorded in THIS world's history, aff
 
 REJECT THESE — they are NOT world memories (these are your most common mistakes):
 ✗ A specific named underling and their role. "Takeshi is a lieutenant with a scar who works from a garage in Nakano" → CHARACTER DATA. A roster of who's in an organization is not worldbuilding. REJECT.
-✗ Anything about surveillance/tracking/orders concerning a specific person (especially the player character). "A network is tracking Sachiko," "the clan issued orders about Sachiko," "her conversations are being logged" → these are PLOT EVENTS about a character, not world structure. REJECT, no matter how many vehicles are described.
-✗ A specific person's reputation, presence, abilities, habits, or psychology. "Sukuna commands territorial presence," "Sukuna is triggered by vanilla," "Sukuna's courtship style" → CHARACTER MEMORIES wearing a costume. REJECT.
-✗ A personal arrangement, deal, or relationship between specific characters. "Sukuna has a pact with Sachiko for sketches" → a plot/relationship beat. REJECT.
+✗ Anything about surveillance/tracking/orders concerning a specific person (especially the player character). "A network is tracking Mira," "the clan issued orders about Mira," "her conversations are being logged" → these are PLOT EVENTS about a character, not world structure. REJECT, no matter how many vehicles are described.
+✗ A specific person's reputation, presence, abilities, habits, or psychology. "Kellan commands territorial presence," "Kellan is triggered by vanilla," "Kellan's courtship style" → CHARACTER MEMORIES wearing a costume. REJECT.
+✗ A personal arrangement, deal, or relationship between specific characters. "Kellan has a pact with Mira for sketches" → a plot/relationship beat. REJECT.
 ✗ Weather, the atmosphere of a street on one day, the season. "Autumn in Tokyo, 14°C," "Shinjuku smells of chestnuts" → transient scene texture. REJECT.
 ✗ The internal operations, software version, or service protocols of one mundane business. "Kinokuniya's inventory system v4.2.17," "Kinokuniya's tiered customer service" → REJECT.
 ✗ A specific friend group, their chat name, their members. "The Disaster Committee group chat" → CHARACTER ROSTER. REJECT.

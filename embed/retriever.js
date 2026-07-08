@@ -211,7 +211,7 @@ function buildLexicalTerms(sidecarResult, queryText) {
         terms.add(base.replace(/^memory of /, "").trim());
         terms.add(base.replace(/^memory about /, "").trim());
         const words = base.split(" ").filter(w => w.length > 2);
-        // Preserve useful title-like tails, e.g. "memory of yujis first kill" → "first kill".
+        // Preserve useful title-like tails, e.g. "memory of janes first kill" → "first kill".
         for (let n = 2; n <= Math.min(4, words.length); n++) {
             terms.add(words.slice(-n).join(" "));
         }
@@ -360,6 +360,12 @@ export function recordInjection(entryId, stickiness = 0) {
     const effective = stickiness > 0 ? stickiness : getSetting("vectorization.defaultStickiness", 0);
     if (effective <= 0) return;
     const map = getStickinessMap();
+    // Lorebook-style stickiness: set the counter ONCE, when an entry first
+    // injects. If it's already in the sticky map it's mid-countdown — do NOT
+    // reset it, or it would be force-injected forever (re-recorded every message
+    // because it's sticky, never expiring, never reaching cooldown). Leaving it
+    // untouched lets tickCounters() count it down to 0 and hand it to cooldown.
+    if (map[entryId] && map[entryId] > 0) return;
     map[entryId] = effective;
     saveStickinessMap(map);
 }

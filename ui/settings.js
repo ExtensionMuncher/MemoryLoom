@@ -1168,8 +1168,9 @@ function renderData($pane) {
                 const cd = peek.chatData || {};
                 const nEntries = cd.entries ? (Array.isArray(cd.entries) ? cd.entries.length : Object.keys(cd.entries).length) : 0;
                 const nScenes = Array.isArray(cd.scenes) ? cd.scenes.length : 0;
+                const nPending = cd.pendingEntries ? (Array.isArray(cd.pendingEntries) ? cd.pendingEntries.length : Object.keys(cd.pendingEntries).length) : 0;
                 const hasSettings = peek.settings ? "yes" : "no";
-                counts = `<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#888;margin:8px 0;line-height:1.6">Found: ${nEntries} memories, ${nScenes} scenes · settings: ${hasSettings}</div>`;
+                counts = `<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#888;margin:8px 0;line-height:1.6">Found: ${nEntries} memories, ${nScenes} scenes, ${nPending} pending · settings: ${hasSettings}</div>`;
             } catch (err) {
                 toastr?.error?.("That file isn't valid JSON.", "Memory Loom");
                 return;
@@ -1189,7 +1190,7 @@ function renderData($pane) {
                             <input type="radio" name="ml-imp-settings" value="overwrite"> Overwrite with imported settings
                         </label>
                     </div>
-                    <div style="margin:10px 0"><b>Memories, folders &amp; scenes</b>
+                    <div style="margin:10px 0"><b>Memories, folders, scenes &amp; pending entries</b>
                         <label class="checkbox_label" style="display:flex;gap:8px;align-items:center;margin:6px 0">
                             <input type="radio" name="ml-imp-data" value="merge" checked> Merge (keep existing, add imported)
                         </label>
@@ -1219,14 +1220,24 @@ function renderData($pane) {
 
             // Belt-and-suspenders for the destructive combo: extra confirm
             if (dataMode === "replace") {
-                const sure = await mlPopupConfirm("<b>Replace</b> will permanently delete your existing memories, folders, and scenes before importing. This cannot be undone. Continue?");
+                const sure = await mlPopupConfirm("<b>Replace</b> will permanently delete your existing memories, folders, scenes, and pending entries before importing. This cannot be undone. Continue?");
                 if (!sure) return;
             }
 
             const { importAllData } = await import("../settings.js");
             const ok = await importAllData(text, { settingsMode, dataMode });
             if (ok) {
-                toastr?.success?.("Data imported. Reload to see changes.", "Memory Loom");
+                toastr?.success?.("Data imported.", "Memory Loom");
+                try {
+                    const { renderLibraryTab } = await import("./library.js");
+                    const { renderHomeTab } = await import("./home.js");
+                    renderHomeTab($("#ml-p-home"));
+                    renderLibraryTab($("#ml-p-library"));
+                    $(document).trigger("ml:scene-state-changed");
+                } catch (renderErr) {
+                    console.warn("[ML] Import succeeded but UI refresh failed:", renderErr);
+                    toastr?.info?.("Import succeeded. Reload if the Home tab does not refresh.", "Memory Loom");
+                }
             } else {
                 toastr?.error?.("Import failed. Check console.", "Memory Loom");
             }
