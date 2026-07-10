@@ -497,11 +497,17 @@ export function getDefaultSettings() {
             querySource: "keywords",   // "keywords" = use sidecar output, "raw" = use recent messages directly
             raw: {                     // Only used when querySource is "raw"
                 scanDepth: 10,         // Number of recent messages to include in query
-                chunkSize: 256,        // Token size per text chunk sent to embedding model
-                overlapTokens: 32,     // Token overlap between consecutive chunks
+                chunkSize: 256,        // Token size per text chunk sent to embedding model (reserved/future)
+                overlapTokens: 32,     // Token overlap between consecutive chunks (reserved/future)
                 topK: 10,              // Max candidates returned before threshold filtering
-                distanceMetric: "cosine", // cosine, dot_product, or euclidean
-                rerank: false,         // Apply a second-pass sort on top-k before injecting
+                distanceMetric: "cosine", // reserved/future; ST vector query currently controls similarity internally
+                rerank: false,         // Legacy flag; vectorization.rerank.enabled is the active setting
+            },
+            rerank: {
+                enabled: false,        // Optional LLM second pass after vector search; uses the Keyword sidecar LLM profile
+                maxCandidates: 8,      // Max filtered candidates to send to the reranker prompt
+                contextDepth: 5,       // Recent chat messages included as reranker context
+                maxResponseTokens: 1200,
             },
             defaultStickiness: 0,      // Messages to stay injected after firing (0 = no stickiness)
             defaultCooldown: 0,        // Messages before entry can fire again (0 = no cooldown)
@@ -510,6 +516,7 @@ export function getDefaultSettings() {
         // ── Memory Writing ────────────────────────────────
         memoryWriting: {
             folderSuggestions: false,  // Memory writer suggests a folder for new entries
+            autoTagOnCommit: false,    // After accepting a pending memory, tag it before embedding it
             sceneSummaryPrompt: "Write a detailed scene summary for internal narrative reference. Include: key events, emotional turning points, psychological shifts, characters present, unresolved tensions, and any significant relationship developments. Write in a clinical but narratively aware voice — this is a note for future memory generation, not a retelling.",
             memoryEntryPrompt: "Write a core memory entry from the perspective of the primary character. Use rich, specific, sensory and emotionally precise prose. Capture the psychological significance of the moment. Format: bold Title, bold Date, narrative body, Primary Character, Key Characters. Never write memories for {{user}}.",
         },

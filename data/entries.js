@@ -7,7 +7,7 @@
  * Also handles:
  *   - Status management (active, consolidated, archived, pinned, superseded)
  *   - Delta block management
- *   - Tag management (for library browsing only — NOT used in embedding pipeline)
+ *   - Tag management (for library browsing/filtering and embedding recall labels)
  *   - Entry routing (determining which folder an entry belongs in)
  *   - ID generation
  */

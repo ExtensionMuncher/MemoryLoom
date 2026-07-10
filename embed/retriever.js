@@ -18,6 +18,7 @@ import { getEntry } from "../data/entries.js";
 import { getEntries, getStickinessMap, saveStickinessMap, getCooldownsMap, saveCooldownsMap, getFolders } from "../data/storage.js";
 import { getCollectionId } from "./embedder.js";
 import { dlog } from "../lib/debug.js";
+import { rerankCandidates } from "../llm/reranker.js";
 
 
 /** Build the provider settings object used for vector queries — shared with the recall tool. */
@@ -73,15 +74,21 @@ export async function runRetrievalPipeline(sidecarResult) {
         return [];
     }
 
-    const filtered = applyFilters(candidates);
+    let filtered = applyFilters(candidates);
     if (!filtered.length) {
         dlog(`Retriever: ${candidates.length} candidate(s) found but all were filtered by threshold/cooldown/status`);
         return [];
     }
 
+    // Optional LLM rerank: after vector/lexical retrieval and normal filters,
+    // before category/global caps choose the final injection set. Disabled by
+    // default because it adds one extra LLM call only when there are more
+    // candidates than injection slots. Uses the Keyword sidecar profile.
+    filtered = await rerankCandidates(filtered, sidecarResult, queryText, maxEntries);
+
     // Per-category caps: limit how many of each category inject, then apply the
-    // global cap as an overall ceiling. Filtered is already score-sorted, so we
-    // keep the highest-scoring entries within each category's allowance.
+    // global cap as an overall ceiling. Filtered is score/rerank-sorted, so we
+    // keep the highest-ranked entries within each category's allowance.
     const perCat = getSetting("injection.maxPerCategory", {}) || {};
     const catCounts = {};
     const catLimited = [];

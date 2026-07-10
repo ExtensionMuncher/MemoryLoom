@@ -3,8 +3,8 @@
  *
  * Renders the complete Settings tab with six accordion sections:
  *   1. Connections — LLM profile dropdowns (from ST's connection manager)
- *   2. Scanning — Sidecar scan frequency
- *   3. Memory Writing — Prompts + folder suggestions toggle
+ *   2. Scanning — Sidecar scan frequency + optional LLM reranker
+ *   3. Memory Writing — Prompts + folder suggestions/auto-tag toggles
  *   4. Injection — Inject toggle, placement, max entries per message
  *   5. Vectorization — Similarity threshold, query source, advanced raw settings,
  *      embedding source/model, stickiness, cooldown
@@ -128,6 +128,45 @@ function renderDebug($pane) {
         } finally {
             hidePanelLoading(); setProcessingStatus(null);
             $btn.prop("disabled", false).text("Backfill");
+        }
+    });
+
+    // ── Auto-tag memories needing tags ───────────────────────
+    $body.append(`
+        <div class="ml-setting-row">
+            <div style="flex:1;min-width:0">
+                <div class="ml-setting-label">Auto-tag memories needing tags</div>
+                <div class="ml-setting-sub">Memory Writer LLM suggests browsing tags for memories that only have source/status tags; skips synthesis memories · re-embeds newly tagged entries · uses the same profile and pacing as delta backfill</div>
+            </div>
+            <button class="ml-btn" id="ml-autotag-btn">Auto-tag</button>
+        </div>
+    `);
+    $body.find("#ml-autotag-btn").on("click", async function () {
+        const $btn = $(this);
+        $btn.prop("disabled", true).text("Scanning…");
+        const { showPanelLoading, hidePanelLoading, setProcessingStatus } = await import("./panel.js");
+        try {
+            const { autoTagUntaggedEntries } = await import("../llm/autoTag.js");
+            const result = await autoTagUntaggedEntries((done, total) => {
+                const msg = `Auto-tagging memories… ${done}/${total}`;
+                $btn.text(`${done}/${total}`);
+                showPanelLoading(msg);
+                setProcessingStatus(msg);
+            });
+            if (result.total > 0) {
+                toastr?.success?.(
+                    `Auto-tagged memories: ${result.tagged}/${result.total}${result.failed ? ` · ${result.failed} failed` : ""}.`,
+                    "Memory Loom", { timeOut: 6000 }
+                );
+                const { renderLibraryTab } = await import("./library.js");
+                const $lib = $("#ml-p-library"); if ($lib.length) renderLibraryTab($lib);
+            }
+        } catch (err) {
+            console.error("[ML] Auto-tag failed:", err);
+            toastr?.error?.("Auto-tagging failed. Check console.", "Memory Loom");
+        } finally {
+            hidePanelLoading(); setProcessingStatus(null);
+            $btn.prop("disabled", false).text("Auto-tag");
         }
     });
 
@@ -398,6 +437,44 @@ function renderScanning($pane) {
         setSetting("connections.maxResponseTokens", v);
     });
 
+    // ── LLM rerank ──────────────────────────────────────
+    const rerankSettings = getSetting('vectorization.rerank', {}) || {};
+    const legacyRerank = getSetting('vectorization.raw.rerank', false);
+    const rerankEnabled = rerankSettings.enabled !== undefined ? !!rerankSettings.enabled : !!legacyRerank;
+    const rerankMaxCandidates = Math.max(2, Number(rerankSettings.maxCandidates) || 8);
+    const rerankContextDepth = Math.max(1, Number(rerankSettings.contextDepth) || 5);
+
+    $body.append(settingRow('LLM reranker', 'Optional second pass after vector search · uses the Keyword sidecar LLM profile · adds one extra LLM call only when candidates compete for limited injection slots',
+        `<label class="ml-toggle"><input type="checkbox" id="ml-setting-rerank-enabled" ${rerankEnabled ? 'checked' : ''}><span class="ml-slider"></span></label>`
+    ));
+    $body.find('#ml-setting-rerank-enabled').on('change', function(){
+        const cfg = getSetting('vectorization.rerank', {}) || {};
+        cfg.enabled = $(this).prop('checked');
+        setSetting('vectorization.rerank', cfg);
+        // Preserve backward compatibility for users who already had the old raw.rerank flag saved.
+        const raw = getSetting('vectorization.raw', {}) || {};
+        raw.rerank = cfg.enabled;
+        setSetting('vectorization.raw', raw);
+    });
+
+    $body.append(settingRow('Rerank candidate pool', 'Max filtered memories sent to the reranker prompt; keep this near Top-k, not huge',
+        `<input type="number" id="ml-setting-rerank-maxCandidates" value="${rerankMaxCandidates}" min="2" max="20" step="1">`
+    ));
+    $body.find('#ml-setting-rerank-maxCandidates').on('change', function(){
+        const cfg = getSetting('vectorization.rerank', {}) || {};
+        cfg.maxCandidates = Math.max(2, parseInt($(this).val()) || 8);
+        setSetting('vectorization.rerank', cfg);
+    });
+
+    $body.append(settingRow('Rerank context depth', 'Recent chat messages included in the reranker prompt',
+        `<input type="number" id="ml-setting-rerank-contextDepth" value="${rerankContextDepth}" min="1" max="20" step="1">`
+    ));
+    $body.find('#ml-setting-rerank-contextDepth').on('change', function(){
+        const cfg = getSetting('vectorization.rerank', {}) || {};
+        cfg.contextDepth = Math.max(1, parseInt($(this).val()) || 5);
+        setSetting('vectorization.rerank', cfg);
+    });
+
     $pane.append($section);
 }
 
@@ -413,6 +490,15 @@ function renderMemoryWriting($pane) {
     ));
     $body.find("#ml-setting-folderSuggestions").on("change", function () {
         setSetting("memoryWriting.folderSuggestions", $(this).prop("checked"));
+    });
+
+    // Auto-tag on commit toggle
+    const autoTagOnCommit = getSetting("memoryWriting.autoTagOnCommit", false);
+    $body.append(settingRow("Auto-tag accepted memories", "When a pending memory is accepted, the Memory Writer LLM adds descriptive tags before the entry is embedded · off by default", 
+        `<label class="ml-toggle"><input type="checkbox" id="ml-setting-autoTagOnCommit" ${autoTagOnCommit ? "checked" : ""}><span class="ml-slider"></span></label>`
+    ));
+    $body.find("#ml-setting-autoTagOnCommit").on("change", function () {
+        setSetting("memoryWriting.autoTagOnCommit", $(this).prop("checked"));
     });
 
     // Banned memory owners
@@ -857,21 +943,12 @@ function renderVectorization($pane) {
         </div>
     `);
 
-    // Re-rank
-    const rerank = rawSettings.rerank || false;
-    $rawAdvanced.append(`
-        <div class="ml-decay-row">
-            <div><div class="ml-decay-label">Re-rank results</div><div class="ml-decay-sub">Second-pass sort before injecting</div></div>
-            <label class="ml-toggle"><input type="checkbox" id="ml-setting-rerank" ${rerank ? "checked" : ""}><span class="ml-slider"></span></label>
-        </div>
-    `);
 
     // Wire raw settings
     $rawAdvanced.find("#ml-setting-scanDepth").on("change", function () { saveRaw("scanDepth", parseInt($(this).val())); });
     $rawAdvanced.find("#ml-setting-chunkSize").on("change", function () { saveRaw("chunkSize", parseInt($(this).val())); });
     $rawAdvanced.find("#ml-setting-overlapTokens").on("change", function () { saveRaw("overlapTokens", parseInt($(this).val())); });
     $rawAdvanced.find("#ml-setting-distanceMetric").on("change", function () { saveRaw("distanceMetric", $(this).val()); });
-    $rawAdvanced.find("#ml-setting-rerank").on("change", function () { saveRaw("rerank", $(this).prop("checked")); });
 
     function saveRaw(key, value) {
         const raw = getSetting("vectorization.raw", {});

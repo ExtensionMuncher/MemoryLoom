@@ -58,6 +58,15 @@ export function getEmbeddingText(entry) {
     if (entry.primaryCharacter)        parts.push(`Primary: ${entry.primaryCharacter}`);
     if (entry.primaryCharacters?.length) parts.push(`Primaries: ${entry.primaryCharacters.join(", ")}`);
     if (entry.keyCharacters?.length)   parts.push(`Key: ${entry.keyCharacters.join(", ")}`);
+
+    // Descriptive tags are intentionally embedded too. They act as compact
+    // semantic labels that help vector recall connect indirect scene language
+    // to stored memories (e.g. "abandonment_fear", "hidden_injury").
+    const tags = Array.isArray(entry.tags)
+        ? entry.tags.map(t => String(t || "").trim()).filter(Boolean)
+        : [];
+    if (tags.length) parts.push(`Tags: ${tags.join(", ")}`);
+
     return parts.join("\n");
 }
 

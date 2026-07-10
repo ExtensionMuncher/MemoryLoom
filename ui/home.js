@@ -34,9 +34,34 @@ function commitPendingEntry(e) {
     return createEntry(Object.assign({}, e, { status: "active" }));
 }
 import { embedEntry, deleteEntryVector } from "../embed/embedder.js";
+import { autoTagEntry, TAG_BATCH_SIZE, TAG_BATCH_PAUSE_MS } from "../llm/autoTag.js";
 import { regenerateEntry, generateMemoryEntries } from "../llm/writer.js";
 import { iconSvg } from "../lib/icons.js";
 const NS = ".ml-home";
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function finalizeCommittedEntry(entry) {
+    if (!entry) return null;
+
+    let finalEntry = entry;
+    if (getSetting("memoryWriting.autoTagOnCommit", false)) {
+        try {
+            finalEntry = await autoTagEntry(entry) || entry;
+        } catch (err) {
+            console.warn("[ML] Auto-tag on commit failed:", err);
+            toastr?.warning?.("Auto-tag failed for one memory; embedding it without new tags.", "Memory Loom");
+            finalEntry = entry;
+        }
+    }
+
+    try { await embedEntry(finalEntry); }
+    catch (err) { console.warn("[ML] Embed failed:", err); }
+
+    return finalEntry;
+}
 
 function getSceneDisplayNum(sceneId) {
     const scenes = getScenes() || [];
@@ -119,7 +144,42 @@ function renderPendingSection($pane) {
         worldItems.forEach(([e, i]) => $pane.append(renderCard(e, i, $pane)));
     }
     const $ga = $('<div class="ml-btn-row" style="margin-top:11px"><button class="ml-btn-confirm" id="ml-commit-all" style="font-size:12px;padding:7px 18px">Commit all</button><button class="ml-btn-danger" id="ml-discard-all">Discard all</button></div>');
-    $(document).on("click"+NS, "#ml-commit-all", async () => { const ok = await popup(`Commit all ${pl.length} entries?`); if(ok) { pl.forEach(e => { try{ const created = commitPendingEntry(e); embedEntry(created).catch(err => console.warn("[ML] Embed failed:", err)); }catch(err){console.error(err)} }); savePendingEntries(null); renderHomeTab($pane); }});
+    $(document).on("click"+NS, "#ml-commit-all", async () => {
+        const ok = await popup(`Commit all ${pl.length} entries?`);
+        if (!ok) return;
+
+        const autoTagging = getSetting("memoryWriting.autoTagOnCommit", false);
+        const { showPanelLoading, hidePanelLoading, setProcessingStatus } = await import("./panel.js");
+        try {
+            for (let n = 0; n < pl.length; n++) {
+                const msg = autoTagging
+                    ? `Committing + auto-tagging memories… ${n + 1}/${pl.length}`
+                    : `Committing memories… ${n + 1}/${pl.length}`;
+                showPanelLoading(msg);
+                setProcessingStatus(msg);
+
+                try {
+                    const created = commitPendingEntry(pl[n]);
+                    await finalizeCommittedEntry(created);
+                } catch (err) {
+                    console.error("[ML] Commit failed:", err);
+                }
+
+                // Same burst pacing as delta backfill / debug auto-tagging when
+                // commit-time auto-tagging is enabled, so Commit All does not
+                // flood the Memory Writer profile with concurrent requests.
+                if (autoTagging && (n + 1) % TAG_BATCH_SIZE === 0 && n + 1 < pl.length) {
+                    await sleep(TAG_BATCH_PAUSE_MS);
+                }
+            }
+            savePendingEntries(null);
+            renderHomeTab($pane);
+            toastr?.success?.(`Committed ${pl.length} ${pl.length === 1 ? "memory" : "memories"}.`, "Memory Loom");
+        } finally {
+            hidePanelLoading();
+            setProcessingStatus(null);
+        }
+    });
     $(document).on("click"+NS, "#ml-discard-all", async () => { const ok = await popup("Discard all pending entries?"); if(ok) { savePendingEntries(null); renderHomeTab($pane); }});
     $pane.append($ga);
 }
@@ -127,7 +187,23 @@ function renderCard(entry,i,$pane) {
     const lo = entry.delta?.low_delta_flag;
     const $c = $(`<div class="ml-entry-card" id="ml-pc-${i}"><div class="ml-entry-card-hdr"><div style="flex:1;min-width:0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;flex-wrap:wrap"><div class="ml-entry-title" style="margin-bottom:0">${h(entry.title||"Untitled")}</div>${entry.updateTargetId?'<span class="ml-update-badge">✎ updates existing</span>':''}${lo?'<span class="ml-delta-flag">low delta</span>':''}</div><div class="ml-entry-meta">${entry.category==="world" ? (entry.updateTargetId ? "\ud83c\udf10 World update" : (entry.worldEvent ? "\ud83c\udf10 World event" : "\ud83c\udf10 World fact")) : (h(entry.primaryCharacter||(entry.primaryCharacters||[]).join(", ")||"Unknown")+" · "+h(entry.category||"character"))}${entry.sceneId?' · Scene '+getSceneDisplayNum(entry.sceneId):''}</div></div>${iconSvg("ico-chevron-down",16,16,"#666")}</div><div class="ml-entry-card-body">${entry.updateTargetId?`<div class="ml-update-note">Replaces existing entry: ${h((getEntry(entry.updateTargetId)||{}).title||entry.updateTargetId)}</div>`:''}<div class="ml-entry-prose">${h(entry.content||"")}</div><div class="ml-entry-chars">${entry.category!=="world" && entry.primaryCharacter?`<span>Primary</span> · ${h(entry.primaryCharacter)}<br>`:''}${entry.keyCharacters?.length?`<span>Key</span> · ${h(entry.keyCharacters.join(", "))}`:''}</div>${db(entry)}<div class="ml-btn-row"><button class="ml-btn-confirm ml-co" data-idx="${i}">Commit</button><button class="ml-btn ml-rt" data-idx="${i}">Regen</button><button class="ml-btn ml-ee" data-idx="${i}">Edit</button><button class="ml-btn-danger ml-do" data-idx="${i}">Discard</button></div><div class="ml-regen-box" id="ml-rg-${i}"><div class="ml-field-hdr"><div class="ml-regen-hint" style="margin-bottom:0">Optional guidance</div><i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="ml-ri-${i}" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer;transition:all var(--animation-duration-2x,0.3s) ease-in-out"></i></div><textarea id="ml-ri-${i}" rows="2" style="margin-bottom:8px" placeholder="Guidance…"></textarea><div class="ml-btn-row"><button class="ml-btn ml-rg" data-idx="${i}">Regen with prompt</button><button class="ml-btn ml-rs" data-idx="${i}">Regen from scene</button></div></div></div></div>`);
     $c.find(".ml-entry-card-hdr").on("click",function(){$c.toggleClass("open")});
-    $(document).on("click"+NS,`#ml-pc-${i} .ml-co`,()=>{const pl=getPendingEntries();const plist=pl?(Array.isArray(pl)?pl:Object.values(pl)):[];if(i<0||i>=plist.length)return;const created=commitPendingEntry(plist[i]);embedEntry(created).catch(err=>console.warn("[ML] Embed failed:",err));plist.splice(i,1);savePendingEntries(plist.length?plist:null);renderHomeTab($pane)});
+    $(document).on("click"+NS,`#ml-pc-${i} .ml-co`,async()=>{
+        const pl=getPendingEntries();const plist=pl?(Array.isArray(pl)?pl:Object.values(pl)):[];
+        if(i<0||i>=plist.length)return;
+        const $btn = $(`#ml-pc-${i} .ml-co`);
+        $btn.prop("disabled", true).text(getSetting("memoryWriting.autoTagOnCommit", false) ? "Tagging…" : "Committing…");
+        try {
+            const created=commitPendingEntry(plist[i]);
+            await finalizeCommittedEntry(created);
+            plist.splice(i,1);
+            savePendingEntries(plist.length?plist:null);
+            renderHomeTab($pane);
+        } catch(err) {
+            console.error("[ML] Commit failed:", err);
+            toastr?.error?.("Commit failed. Check console.", "Memory Loom");
+            $btn.prop("disabled", false).text("Commit");
+        }
+    });
     $(document).on("click"+NS,`#ml-pc-${i} .ml-do`,async()=>{const ok=await popup("Discard this entry?");if(!ok)return;const pl=getPendingEntries();const plist=pl?(Array.isArray(pl)?pl:Object.values(pl)):[];if(i<0||i>=plist.length)return;plist.splice(i,1);savePendingEntries(plist.length?plist:null);renderHomeTab($pane)});
     $(document).on("click"+NS,`#ml-pc-${i} .ml-rt`,()=>{$(`#ml-rg-${i}`).toggleClass("open")});
     // Edit entry — replace static prose with editable fields inline
