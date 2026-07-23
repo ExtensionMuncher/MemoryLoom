@@ -2406,13 +2406,6 @@ export function closeModal(id) {
 // ─── Crop Helpers ─────────────────────────────────────────
 
 /**
- * Open the crop dialog by triggering the hidden file input.
- */
-export function openCrop() {
-    $("#ml-img-upload").click();
-}
-
-/**
  * Apply the cropped/uploaded image to the target character subfolder.
  */
 async function applyBannerImage() {

@@ -248,22 +248,6 @@ export function getEntriesByFolder(folderId) {
 }
 
 /**
- * Get entries where the given character is a primary.
- * Checks both primaryCharacter (string) and primaryCharacters (array).
- * @param {string} charName
- * @returns {object[]}
- */
-export function getEntriesByCharacter(charName) {
-    const entries = getEntries();
-    const lower = charName.toLowerCase();
-    return Object.values(entries).filter(e => {
-        if (e.primaryCharacter && e.primaryCharacter.toLowerCase() === lower) return true;
-        if (e.primaryCharacters && e.primaryCharacters.some(n => n.toLowerCase() === lower)) return true;
-        return false;
-    });
-}
-
-/**
  * Update an existing entry. Merges the provided updates into the entry.
  * @param {string} id
  * @param {object} updates - Fields to update
@@ -328,76 +312,7 @@ export function setEntryStatus(id, status) {
     return updateEntry(id, { status });
 }
 
-/**
- * Get entries filtered by status.
- * @param {string} status
- * @returns {object[]}
- */
-export function getEntriesByStatus(status) {
-    const entries = getEntries();
-    return Object.values(entries).filter(e => e.status === status);
-}
-
-/**
- * Pin an entry (always injects at full priority).
- * @param {string} id
- * @returns {object|null}
- */
-export function pinEntry(id) {
-    return setEntryStatus(id, "pinned");
-}
-
-/**
- * Unpin an entry (returns to active status).
- * @param {string} id
- * @returns {object|null}
- */
-export function unpinEntry(id) {
-    return setEntryStatus(id, "active");
-}
-
-/**
- * Archive an entry (searchable but never injected).
- * @param {string} id
- * @returns {object|null}
- */
-export function archiveEntry(id) {
-    return setEntryStatus(id, "archived");
-}
-
 // ─── Tag Management ───────────────────────────────────────
-
-/**
- * Add tags to an entry.
- * @param {string} id
- * @param {string[]} tags - Tags to add (duplicates are ignored)
- * @returns {object|null}
- */
-export function addTags(id, tags) {
-    const entry = getEntry(id);
-    if (!entry) return null;
-
-    const currentTags = new Set(entry.tags || []);
-    for (const tag of tags) {
-        currentTags.add(tag);
-    }
-    return updateEntry(id, { tags: [...currentTags] });
-}
-
-/**
- * Remove tags from an entry.
- * @param {string} id
- * @param {string[]} tags - Tags to remove
- * @returns {object|null}
- */
-export function removeTags(id, tags) {
-    const entry = getEntry(id);
-    if (!entry) return null;
-
-    const removeSet = new Set(tags);
-    const newTags = (entry.tags || []).filter(t => !removeSet.has(t));
-    return updateEntry(id, { tags: newTags });
-}
 
 // ─── Delta Management ─────────────────────────────────────
 
@@ -408,19 +323,6 @@ export function removeTags(id, tags) {
  * @returns {object|null}
  */
 export function updateDelta(id, delta) {
-    return updateEntry(id, { delta });
-}
-
-/**
- * Flag an entry as low-delta (meaningful change was minimal).
- * @param {string} id
- * @param {boolean} [flag=true]
- * @returns {object|null}
- */
-export function flagLowDelta(id, flag = true) {
-    const entry = getEntry(id);
-    if (!entry) return null;
-    const delta = { ...entry.delta, low_delta_flag: flag };
     return updateEntry(id, { delta });
 }
 

@@ -46,7 +46,7 @@ A world memory must be a fact about the SETTING that would still be worth knowin
 POV: third-person omniscient. Refer to everyone, including the player character, by name and he/she/they. Never "I/me/my/we/us". The player character MAY appear if a genuine world fact centers on them, but their personal situation is almost never world lore (see rejections below).
 
 WHAT ACTUALLY QUALIFIES (be selective, but DO record these when present):
-- The nature of a major faction/organization AS AN INSTITUTION: what the Ravenshade Syndicate IS, its place in the city's power structure, how the criminal underworld operates. NOT its current operations or roster.
+- The nature of a major faction/organization AS AN INSTITUTION: what the Ravenshade Syndicate IS, its place in the city's power structure, how the yakuza world operates. NOT its current operations or roster.
 - How the world's systems work: its rules, its supernatural/technological laws, its social order.
 - The character of a significant, enduring LOCATION as a place in the world. NOT what happened there in a scene.
 
