@@ -18,9 +18,14 @@ function getRerankSettings() {
     const legacyRaw = getSetting("vectorization.raw.rerank", false);
     return {
         enabled: cfg.enabled !== undefined ? !!cfg.enabled : !!legacyRaw,
-        maxCandidates: Math.max(2, Number(cfg.maxCandidates) || 8),
-        contextDepth: Math.max(1, Number(cfg.contextDepth) || 5),
-        maxResponseTokens: Math.max(300, Number(cfg.maxResponseTokens) || 1200),
+        // Keep this intentionally small. The reranker runs inside the generation
+        // path, so huge candidate pools can stall the sidecar before the reply
+        // even starts. Users can still lower it further from Scanning settings.
+        maxCandidates: Math.min(6, Math.max(2, Number(cfg.maxCandidates) || 5)),
+        contextDepth: Math.min(8, Math.max(1, Number(cfg.contextDepth) || 3)),
+        maxResponseTokens: Math.min(700, Math.max(200, Number(cfg.maxResponseTokens) || 450)),
+        timeoutMs: Math.min(30000, Math.max(5000, Number(cfg.timeoutMs) || 12000)),
+        maxPromptChars: Math.min(14000, Math.max(5000, Number(cfg.maxPromptChars) || 9000)),
     };
 }
 
@@ -35,7 +40,7 @@ function buildRecentContext(depth) {
     if (!Array.isArray(chat) || !chat.length) return "";
     return chat.slice(-depth).map(msg => {
         const speaker = msg?.is_user ? (name1 || "User") : (msg?.name || "Character");
-        const text = stripHtml(msg?.mes).slice(0, 900);
+        const text = stripHtml(msg?.mes).slice(0, 420);
         return `${speaker}: ${text}`;
     }).filter(Boolean).join("\n");
 }
@@ -62,22 +67,17 @@ function summarizeCandidate(candidate, index) {
     if (keyCharacters) lines.push(`key_characters: ${keyCharacters}`);
     if (tags) lines.push(`tags: ${tags}`);
     if (flags.length) lines.push(`flags: ${flags.join(", ")}`);
-    if (delta.delta) lines.push(`delta: ${stripHtml(delta.delta).slice(0, 420)}`);
-    if (delta.after_state) lines.push(`after_state: ${stripHtml(delta.after_state).slice(0, 300)}`);
-    lines.push(`content: ${stripHtml(entry.content).slice(0, 850)}`);
+    if (delta.delta) lines.push(`delta: ${stripHtml(delta.delta).slice(0, 180)}`);
+    if (delta.after_state) lines.push(`after_state: ${stripHtml(delta.after_state).slice(0, 140)}`);
+    lines.push(`content: ${stripHtml(entry.content).slice(0, 320)}`);
     return lines.join("\n");
 }
 
 function buildSystemPrompt() {
-    return `You are Memory Loom's retrieval reranker. Your job is to sort candidate memories by usefulness for the current roleplay moment.
-
-Rank memories higher when they are directly relevant to the current emotional conflict, active characters, unresolved tension, prior reveals, promises, injuries, secrets, relationship shifts, or world facts needed for continuity.
-Rank memories lower when they only share a vague theme, a generic emotion, or a character name without helping the next response.
-
-Return ONLY valid JSON in this exact shape:
-{"ranked":[{"id":"memory_id_here","score":0-100}]}
-
-Use every candidate id exactly once. Do not invent ids. Do not include prose.`;
+    return `Rerank Memory Loom candidates for the current roleplay moment.
+Prefer memories that directly affect active characters, unresolved tension, promises, secrets, injuries, reveals, relationship shifts, or required continuity. Lower vague theme/name matches.
+Return ONLY JSON: {"ranked":[{"id":"memory_id_here","score":0-100}]}
+Use each candidate id once. No prose.`;
 }
 
 function buildUserPrompt(candidates, sidecarResult, queryText, contextDepth) {
@@ -168,13 +168,26 @@ export async function rerankCandidates(candidates, sidecarResult, queryText, inj
     const tail = candidates.slice(poolSize);
 
     try {
-        dlog(`Reranker: ranking ${pool.length} candidate(s) via Keyword sidecar profile`);
+        const userPrompt = buildUserPrompt(pool, sidecarResult, queryText, cfg.contextDepth);
+        if (userPrompt.length > cfg.maxPromptChars) {
+            console.warn(`[ML] Reranker skipped — prompt would be too large (${userPrompt.length} chars > ${cfg.maxPromptChars})`);
+            return candidates;
+        }
+
+        dlog(`Reranker: ranking ${pool.length} candidate(s) via Keyword sidecar profile (timeout ${cfg.timeoutMs}ms)`);
         const response = await makeRequest(
             profileName,
             buildSystemPrompt(),
-            buildUserPrompt(pool, sidecarResult, queryText, cfg.contextDepth),
+            userPrompt,
             cfg.maxResponseTokens,
             0.1,
+            {
+                // Reranking is optional. It must never retry itself into a long
+                // generation stall while the turn is waiting on retrieval.
+                maxRetries: 0,
+                timeoutMs: cfg.timeoutMs,
+                suppressToasts: true,
+            },
         );
         if (!response) return candidates;
 

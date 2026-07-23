@@ -171,57 +171,6 @@ export function deleteFolder(id) {
 
 // ─── Character Subfolder Helpers ──────────────────────────
 
-/**
- * Find or create a character subfolder under the Characters folder.
- * This is the canonical way to get a character's folder — callers should
- * use this instead of manually searching the folders array.
- *
- * @param {string} charName - The character's display name
- * @returns {object} The folder object
- */
-export function getOrCreateCharacterSubfolder(charName) {
-    const folders = getFolders();
-    const normalized = charName.trim();
-
-    // Look for existing subfolder
-    const existing = folders.find(f =>
-        f.parentId === "ml_folder_characters" &&
-        f.characterName === normalized
-    );
-    if (existing) return existing;
-
-    // Create new
-    const folder = {
-        id: `ml_folder_char_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        name: normalized,
-        type: "subfolder",
-        parentId: "ml_folder_characters",
-        characterName: normalized,
-        hasImage: false,
-        imagePath: null,
-        entryCount: 0,
-        createdAt: Date.now(),
-    };
-    folders.push(folder);
-    saveFolders(folders);
-    console.log(`[ML] Auto-created character subfolder: "${normalized}"`);
-    return folder;
-}
-
-/**
- * Check if a character subfolder exists.
- * @param {string} charName
- * @returns {boolean}
- */
-export function hasCharacterSubfolder(charName) {
-    const folders = getFolders();
-    const normalized = charName.trim();
-    return folders.some(f =>
-        f.parentId === "ml_folder_characters" &&
-        f.characterName === normalized
-    );
-}
-
 // ─── Name Aliases & Canonical Resolution ──────────────────
 
 /**
@@ -317,18 +266,6 @@ export function setFolderImage(folderId, dataUrl) {
     return updateFolder(folderId, {
         hasImage: true,
         imagePath: dataUrl,
-    });
-}
-
-/**
- * Remove a character subfolder's banner image.
- * @param {string} folderId
- * @returns {object|null}
- */
-export function removeFolderImage(folderId) {
-    return updateFolder(folderId, {
-        hasImage: false,
-        imagePath: null,
     });
 }
 

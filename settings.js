@@ -138,30 +138,6 @@ export function setSidecarPaused(paused) {
 // ─── Connection Profile Helpers ───────────────────────────
 
 /**
- * Get the configured LLM connection profile names.
- * @returns {{memoryWriterLLM: string, consolidationLLM: string, sidecarLLM: string}}
- */
-export function getConnectionNames() {
-    return getSetting("connections", {
-        memoryWriterLLM: "",
-        consolidationLLM: "",
-        sidecarLLM: "",
-    });
-}
-
-/**
- * Get injection settings as a convenience object.
- * @returns {object}
- */
-export function getInjectionSettings() {
-    return getSetting("injection", {
-        enabled: true,
-        placement: "below_card",
-        maxEntriesPerMessage: 3,
-    });
-}
-
-/**
  * Get vectorization settings as a convenience object.
  * @returns {object}
  */
