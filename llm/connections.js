@@ -39,19 +39,18 @@ export class RateLimiter {
         this.windows.get(profileId).push(Date.now());
     }
 
-    async executeWithRetry(profileId, fn, options = {}) {
-        const maxRetries = Number.isFinite(options.maxRetries) ? Math.max(0, options.maxRetries) : this.maxRetries;
+    async executeWithRetry(profileId, fn) {
         let lastError;
-        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
             await this.acquire(profileId);
             try {
                 return await fn();
             } catch (err) {
                 lastError = err;
-                if (attempt >= maxRetries) break;
+                if (attempt >= this.maxRetries) break;
                 if (!isRetryable(err)) throw err;
                 const delay = Math.min(this.baseDelayMs * Math.pow(2, attempt) + Math.random() * 1000, this.maxDelayMs);
-                console.log(`[ML] Retry ${attempt + 1}/${maxRetries} for "${profileId}" in ${Math.ceil(delay)}ms`);
+                console.log(`[ML] Retry ${attempt + 1}/${this.maxRetries} for "${profileId}" in ${Math.ceil(delay)}ms`);
                 await new Promise(r => setTimeout(r, delay));
             }
         }
@@ -116,16 +115,6 @@ let _mlInternalGen = false;
 export function setMLInternalGen(val) { _mlInternalGen = val; }
 export function isMLInternalGen() { return _mlInternalGen; }
 
-function withTimeout(promise, timeoutMs, label = "LLM request") {
-    const ms = Number(timeoutMs) || 0;
-    if (!Number.isFinite(ms) || ms <= 0) return promise;
-    let timer;
-    const timeout = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
-    });
-    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
-
 // ─── Core Request ─────────────────────────────────────────
 
 /**
@@ -138,9 +127,9 @@ function withTimeout(promise, timeoutMs, label = "LLM request") {
  * @param {number|null} [temperature=null]
  * @returns {Promise<string|null>}
  */
-export async function makeRequest(profileKey, systemPrompt, userPrompt, maxTokens = 500, temperature = null, options = {}) {
+export async function makeRequest(profileKey, systemPrompt, userPrompt, maxTokens = 500, temperature = null) {
     if (!profileKey) {
-        if (!options?.suppressToasts) toastr?.warning?.('No connection profile selected. Check Settings > Connections.');
+        toastr?.warning?.('No connection profile selected. Check Settings > Connections.');
         return null;
     }
 
@@ -149,7 +138,7 @@ export async function makeRequest(profileKey, systemPrompt, userPrompt, maxToken
     const profile = resolveProfile(profileKey);
     if (!profile) {
         console.warn(`[ML] makeRequest — profile not found: "${profileKey}". Check Settings > Connections.`);
-        if (!options?.suppressToasts) toastr?.warning?.(`Connection profile "${profileKey}" not found. Check Settings > Connections.`);
+        toastr?.warning?.(`Connection profile "${profileKey}" not found. Check Settings > Connections.`);
         return null;
     }
 
@@ -179,7 +168,7 @@ export async function makeRequest(profileKey, systemPrompt, userPrompt, maxToken
             ? !!noThinkHardMap[profile.id]
             : legacyHard;
 
-        const requestPromise = rateLimiter.executeWithRetry(profile.id, async () => {
+        const response = await rateLimiter.executeWithRetry(profile.id, async () => {
             const messages = [];
             if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
             // No-think soft switch: append "/no_think" to the END of the USER
@@ -206,7 +195,7 @@ export async function makeRequest(profileKey, systemPrompt, userPrompt, maxToken
                 );
             }
 
-            // Pass profile.id (UUID) — this is what ST's sendRequest requires.
+            // Pass profile.id (UUID) — this is what ST's sendRequest requires
             return await ConnectionManagerRequestService.sendRequest(
                 profile.id,
                 messages,
@@ -217,9 +206,7 @@ export async function makeRequest(profileKey, systemPrompt, userPrompt, maxToken
                 { includePreset: false, includeInstruct: false, stream: false },
                 overridePayload,
             );
-        }, { maxRetries: options.maxRetries });
-
-        const response = await withTimeout(requestPromise, options.timeoutMs, `ML request for "${profile.name}"`);
+        });
 
         if (typeof response === 'string') return response;
         if (response && typeof response === 'object') {
@@ -240,7 +227,7 @@ export async function makeRequest(profileKey, systemPrompt, userPrompt, maxToken
                         : 'it returned only reasoning with an empty answer';
                     console.error(`[ML] "${profile.name}" is a thinking model and ${why}. ` +
                         'Use a non-thinking model for this role, or raise the token limit.');
-                    if (!options?.suppressToasts) toastr?.error?.(`"${profile.name}" returned only reasoning, no answer — likely a thinking model. Try a non-thinking model for this role.`);
+                    toastr?.error?.(`"${profile.name}" returned only reasoning, no answer — likely a thinking model. Try a non-thinking model for this role.`);
                     return null;
                 }
                 return content || '';
@@ -248,7 +235,7 @@ export async function makeRequest(profileKey, systemPrompt, userPrompt, maxToken
             if (response.content !== undefined) {
                 if (!response.content && response.reasoning) {
                     console.error(`[ML] "${profile.name}" returned only reasoning with an empty answer. Use a non-thinking model or raise the token limit.`);
-                    if (!options?.suppressToasts) toastr?.error?.(`"${profile.name}" returned only reasoning, no answer.`);
+                    toastr?.error?.(`"${profile.name}" returned only reasoning, no answer.`);
                     return null;
                 }
                 return response.content || '';
@@ -260,7 +247,7 @@ export async function makeRequest(profileKey, systemPrompt, userPrompt, maxToken
 
     } catch (err) {
         console.error(`[ML] LLM request failed for "${profile.name}":`, err);
-        if (!options?.suppressToasts) toastr?.error?.(`LLM request failed for "${profile.name}". Check console for details.`);
+        toastr?.error?.(`LLM request failed for "${profile.name}". Check console for details.`);
         return null;
     } finally {
         setMLInternalGen(false);
