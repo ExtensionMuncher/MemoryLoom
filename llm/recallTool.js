@@ -49,7 +49,7 @@ export function registerMemoryRecallTool() {
     ToolManager.registerFunctionTool({
         name: TOOL_NAME,
         displayName: "Search Core Memories",
-        description: "Use when a character references, encounters, or reacts to a past event, person, promise, secret, or unresolved thread logged in Core Memories.",
+        description: "Search the character memory archive for specific Core Memories. Use when a character is actively trying to remember something, when current events might remind a character of a past experience, or to check whether a memory about a person, event, or feeling exists. Returns the full text of matching memories.",
         stealth: false,
         parameters: {
             type: "object",

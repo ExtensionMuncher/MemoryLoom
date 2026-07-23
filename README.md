@@ -151,7 +151,3 @@ Memories live in the chat's metadata. **Export regularly** — there's an Export
 - Storage is per-chat and lives in chat metadata; deleting a chat removes its memories.
 - The sidecar runs before every reply — if latency matters, use a small fast model for that role.
 - Stricter is safer for world memories: a missed fact can be added later, but a flood of trivial ones is just noise.
-
----
-
-*Memory Loom is a community SillyTavern extension. It orchestrates your own configured models through ST's vector API; it ships no models of its own.*
