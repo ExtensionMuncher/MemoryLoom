@@ -441,10 +441,11 @@ function renderScanning($pane) {
     const rerankSettings = getSetting('vectorization.rerank', {}) || {};
     const legacyRerank = getSetting('vectorization.raw.rerank', false);
     const rerankEnabled = rerankSettings.enabled !== undefined ? !!rerankSettings.enabled : !!legacyRerank;
-    const rerankMaxCandidates = Math.max(2, Number(rerankSettings.maxCandidates) || 8);
-    const rerankContextDepth = Math.max(1, Number(rerankSettings.contextDepth) || 5);
+    const rerankMaxCandidates = Math.min(6, Math.max(2, Number(rerankSettings.maxCandidates) || 5));
+    const rerankContextDepth = Math.min(8, Math.max(1, Number(rerankSettings.contextDepth) || 3));
+    const rerankTimeoutMs = Math.min(30000, Math.max(5000, Number(rerankSettings.timeoutMs) || 12000));
 
-    $body.append(settingRow('LLM reranker', 'Optional second pass after vector search · uses the Keyword sidecar LLM profile · adds one extra LLM call only when candidates compete for limited injection slots',
+    $body.append(settingRow('LLM reranker', 'Optional second pass after vector search · uses the Keyword sidecar profile · skips quickly if it stalls',
         `<label class="ml-toggle"><input type="checkbox" id="ml-setting-rerank-enabled" ${rerankEnabled ? 'checked' : ''}><span class="ml-slider"></span></label>`
     ));
     $body.find('#ml-setting-rerank-enabled').on('change', function(){
@@ -457,21 +458,30 @@ function renderScanning($pane) {
         setSetting('vectorization.raw', raw);
     });
 
-    $body.append(settingRow('Rerank candidate pool', 'Max filtered memories sent to the reranker prompt; keep this near Top-k, not huge',
-        `<input type="number" id="ml-setting-rerank-maxCandidates" value="${rerankMaxCandidates}" min="2" max="20" step="1">`
+    $body.append(settingRow('Rerank candidate pool', 'Max filtered memories sent to the reranker prompt; keep this small for local sidecar models',
+        `<input type="number" id="ml-setting-rerank-maxCandidates" value="${rerankMaxCandidates}" min="2" max="6" step="1">`
     ));
     $body.find('#ml-setting-rerank-maxCandidates').on('change', function(){
         const cfg = getSetting('vectorization.rerank', {}) || {};
-        cfg.maxCandidates = Math.max(2, parseInt($(this).val()) || 8);
+        cfg.maxCandidates = Math.min(6, Math.max(2, parseInt($(this).val()) || 5));
         setSetting('vectorization.rerank', cfg);
     });
 
     $body.append(settingRow('Rerank context depth', 'Recent chat messages included in the reranker prompt',
-        `<input type="number" id="ml-setting-rerank-contextDepth" value="${rerankContextDepth}" min="1" max="20" step="1">`
+        `<input type="number" id="ml-setting-rerank-contextDepth" value="${rerankContextDepth}" min="1" max="8" step="1">`
     ));
     $body.find('#ml-setting-rerank-contextDepth').on('change', function(){
         const cfg = getSetting('vectorization.rerank', {}) || {};
-        cfg.contextDepth = Math.max(1, parseInt($(this).val()) || 5);
+        cfg.contextDepth = Math.min(8, Math.max(1, parseInt($(this).val()) || 3));
+        setSetting('vectorization.rerank', cfg);
+    });
+
+    $body.append(settingRow('Rerank timeout', 'Milliseconds before ML gives up and keeps vector order',
+        `<input type="number" id="ml-setting-rerank-timeoutMs" value="${rerankTimeoutMs}" min="5000" max="30000" step="1000">`
+    ));
+    $body.find('#ml-setting-rerank-timeoutMs').on('change', function(){
+        const cfg = getSetting('vectorization.rerank', {}) || {};
+        cfg.timeoutMs = Math.min(30000, Math.max(5000, parseInt($(this).val()) || 12000));
         setSetting('vectorization.rerank', cfg);
     });
 

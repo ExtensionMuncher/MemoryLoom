@@ -255,42 +255,7 @@ export function isMessageInClosedScene(mesId) {
     return scenes.some(s => s.status === "closed" && isMessageInScene(s, mesId));
 }
 
-/**
- * Check if a message is in the currently open scene.
- * @param {number} mesId
- * @returns {boolean}
- */
-export function isMessageInOpenScene(mesId) {
-    const openScene = getOpenScene();
-    return openScene ? isMessageInScene(openScene, mesId) : false;
-}
-
-/**
- * Get the scene that contains a given message, if any.
- * @param {number} mesId
- * @returns {object|undefined}
- */
-export function getSceneForMessage(mesId) {
-    const scenes = getScenes();
-    return scenes.find(s => isMessageInScene(s, mesId));
-}
-
 // ─── Consolidation Helpers ────────────────────────────────
-
-/**
- * Get scenes that are eligible for consolidation.
- * These are closed scenes that haven't already been consolidated.
- *
- * @returns {object[]}
- */
-export function getScenesForConsolidation() {
-    const scenes = getScenes();
-    return scenes.filter(s =>
-        s.status === "closed" &&
-        s.llmSummary &&
-        !s.consolidatedInto
-    );
-}
 
 /**
  * Mark a scene as having been consolidated into a consolidation entry.
@@ -345,14 +310,6 @@ let _batchScanPerformed = false;
 export function recordLastClosedScene(sceneId) {
     _lastClosedSceneId = sceneId;
     setSetting("scan.lastClosedSceneId", sceneId);  // persist so undo survives reload
-}
-
-/**
- * Mark that a batch scan has been performed.
- * After a batch scan, Undo Last Scan is disabled.
- */
-export function markBatchScanPerformed() {
-    _batchScanPerformed = true;
 }
 
 /**
