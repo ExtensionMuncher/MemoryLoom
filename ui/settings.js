@@ -20,6 +20,7 @@ import { resolveMemoryEntryPrompt, resolveSceneSummaryPrompt } from "../llm/writ
 import { getAllEntries } from "../data/entries.js";
 import { reEmbedEntry } from "../embed/embedder.js";
 import { getContext } from "../../../../extensions.js";
+import { getLastRetrievalTrace, clearLastRetrievalTrace } from "../lib/debug.js";
 
 // ─── Main Render ──────────────────────────────────────────
 
@@ -63,6 +64,29 @@ function renderDebug($pane) {
         setSetting("debug.enabled", on);
         window.__ML_DEBUG = on;
         toastr?.info?.(`Debug logging ${on ? "enabled" : "disabled"}.`, "Memory Loom");
+    });
+
+    // ── Last passive-retrieval explanation ───────────────
+    // This is session-only diagnostic state. It does not add prompt tokens,
+    // persist in the chat, or trigger any additional vector/LLM calls.
+    const $traceBlock = $(`
+        <div class="ml-retrieval-trace-block">
+            <div class="ml-retrieval-trace-header">
+                <div style="min-width:0">
+                    <div class="ml-setting-label">Last passive retrieval</div>
+                    <div class="ml-setting-sub">Explains vector/lexical matches, filters, reranking, cooldowns, and final injection decisions · session-only · no extra model calls</div>
+                </div>
+                <button class="ml-btn" id="ml-clear-retrieval-trace">Clear</button>
+            </div>
+            <div id="ml-retrieval-trace-view"></div>
+        </div>
+    `);
+    $body.append($traceBlock);
+    const $traceView = $traceBlock.find("#ml-retrieval-trace-view");
+    renderRetrievalTrace($traceView, getLastRetrievalTrace());
+    $traceBlock.find("#ml-clear-retrieval-trace").on("click", () => clearLastRetrievalTrace());
+    $(document).on("ml:retrieval-trace-updated.ml-settings", (event) => {
+        renderRetrievalTrace($traceView, event.originalEvent?.detail ?? null);
     });
 
     // ── Re-embed all memories ────────────────────────────
@@ -259,6 +283,109 @@ function renderDebug($pane) {
 }
 
 // ─── Accordion Helper ─────────────────────────────────────
+
+function formatRetrievalScore(value) {
+    return Number.isFinite(Number(value)) ? Number(value).toFixed(3) : "—";
+}
+
+function truncateRetrievalText(value, maxLength = 1200) {
+    const text = String(value || "");
+    return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
+}
+
+function formatRetrievalTime(timestamp) {
+    const date = new Date(Number(timestamp));
+    if (Number.isNaN(date.getTime())) return "Unknown time";
+    return date.toLocaleString();
+}
+
+function retrievalDecisionClass(decision) {
+    if (decision === "Selected") return "selected";
+    if (decision === "Filtered") return "filtered";
+    if (decision === "Capped") return "capped";
+    return "eligible";
+}
+
+/** Render the most recent retrieval trace as mobile-safe cards rather than a wide table. */
+function renderRetrievalTrace($target, trace) {
+    if (!$target?.length) return;
+    if (!trace) {
+        $target.html(`<div class="ml-retrieval-trace-empty">No passive retrieval has been captured in this chat session yet. The report will appear after the Keyword sidecar next runs.</div>`);
+        return;
+    }
+
+    const summary = trace.summary || {};
+    const reranker = trace.reranker || {};
+    const rerankerText = reranker.applied
+        ? `Applied to ${reranker.poolSize || 0} candidate${reranker.poolSize === 1 ? "" : "s"}`
+        : (reranker.enabled ? (reranker.skipReason || "Enabled but not applied") : "Disabled");
+    const query = escapeHtml(truncateRetrievalText(trace.queryText || "(empty query)"));
+    const note = escapeHtml(trace.note || "");
+    const status = escapeHtml(trace.status || "completed");
+
+    const allCandidates = trace.candidates || [];
+    const visibleCandidates = allCandidates.slice(0, 50);
+    const candidateCards = visibleCandidates.map(candidate => {
+        const vector = formatRetrievalScore(candidate.vectorScore);
+        const lexical = formatRetrievalScore(candidate.lexicalScore);
+        const adjusted = formatRetrievalScore(candidate.adjustedScore);
+        const finalScore = formatRetrievalScore(candidate.finalScore);
+        const rerank = formatRetrievalScore(candidate.rerankScore);
+        const matched = Array.isArray(candidate.lexicalTerms) && candidate.lexicalTerms.length
+            ? `<div class="ml-retrieval-trace-line"><span>Lexical terms</span><strong>${candidate.lexicalTerms.map(escapeHtml).join(", ")}</strong></div>`
+            : "";
+        const flags = Array.isArray(candidate.flags) && candidate.flags.length
+            ? `<div class="ml-retrieval-trace-flags">${candidate.flags.map(flag => `<span>${escapeHtml(flag)}</span>`).join("")}</div>`
+            : "";
+        const rerankMeta = candidate.rerankRank
+            ? ` · rank #${candidate.rerankRank}`
+            : "";
+        const finalMeta = candidate.finalRank
+            ? ` · injected #${candidate.finalRank}`
+            : "";
+        const decision = escapeHtml(candidate.decision || "Matched");
+        const reason = escapeHtml(candidate.reason || "No additional explanation recorded.");
+
+        return `
+            <div class="ml-retrieval-trace-card">
+                <div class="ml-retrieval-trace-card-head">
+                    <div class="ml-retrieval-trace-title">${escapeHtml(candidate.title || "Untitled memory")}</div>
+                    <span class="ml-retrieval-decision ${retrievalDecisionClass(candidate.decision)}">${decision}${finalMeta}</span>
+                </div>
+                <div class="ml-retrieval-trace-meta">${escapeHtml(candidate.category || "memory")} · status ${escapeHtml(candidate.status || "active")}</div>
+                <div class="ml-retrieval-trace-scores">
+                    <span>Vector <strong>${vector}</strong></span>
+                    <span>Lexical <strong>${lexical}</strong></span>
+                    <span>Adjusted <strong>${adjusted}</strong></span>
+                    <span>Rerank <strong>${rerank}</strong>${rerankMeta}</span>
+                    <span>Final <strong>${finalScore}</strong></span>
+                </div>
+                ${matched}
+                ${candidate.stickyRemaining ? `<div class="ml-retrieval-trace-line"><span>Stickiness</span><strong>${candidate.stickyRemaining} remaining</strong></div>` : ""}
+                ${candidate.cooldownRemaining ? `<div class="ml-retrieval-trace-line"><span>Cooldown</span><strong>${candidate.cooldownRemaining} remaining</strong></div>` : ""}
+                ${flags}
+                <div class="ml-retrieval-trace-reason">${reason}</div>
+            </div>`;
+    }).join("");
+
+    $target.html(`
+        <div class="ml-retrieval-trace-summary">
+            <div><span>Captured</span><strong>${escapeHtml(formatRetrievalTime(trace.timestamp))}</strong></div>
+            <div><span>Status</span><strong>${status}</strong></div>
+            <div><span>Threshold</span><strong>${formatRetrievalScore(trace.threshold)}</strong></div>
+            <div><span>Top-K</span><strong>${Number(trace.topK) || 0}</strong></div>
+            <div><span>Matched</span><strong>${Number(summary.matched) || 0}</strong></div>
+            <div><span>Selected</span><strong>${Number(summary.selected) || 0}</strong></div>
+        </div>
+        <div class="ml-retrieval-trace-query"><span>Query (${escapeHtml(trace.querySource || "keywords")})</span><div>${query}</div></div>
+        <div class="ml-retrieval-trace-query"><span>Reranker</span><div>${escapeHtml(rerankerText)}</div></div>
+        ${note ? `<div class="ml-retrieval-trace-note">${note}</div>` : ""}
+        <div class="ml-retrieval-trace-candidates">
+            ${candidateCards || `<div class="ml-retrieval-trace-empty">No candidate memories were produced.</div>`}
+            ${allCandidates.length > visibleCandidates.length ? `<div class="ml-retrieval-trace-empty">Showing the first ${visibleCandidates.length} of ${allCandidates.length} matched candidates.</div>` : ""}
+        </div>
+    `);
+}
 
 /**
  * Create a collapsible accordion section.

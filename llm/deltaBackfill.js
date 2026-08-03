@@ -42,6 +42,10 @@ function buildSystemPrompt() {
 Rules:
 - Express everything as present/past state, never as open questions.
 - Base it strictly on the memory content provided — do not invent events.
+- Explicitly stated motives and emotions outrank dramatic tone. Do NOT turn fear, desperation, panic, confusion, impulsiveness, self-preservation, or reactive behavior into confidence, strategy, dominance, courage, manipulation, competence, or calculated control unless the memory explicitly establishes it.
+- Planning one part of a situation does not make every later reaction planned. Preserve the difference between deliberate setup and improvised survival.
+- Do not make the character more composed, sinister, romantic, insightful, strategic, or “badass” than the memory supports. Preserve ambiguity rather than upgrading an inference into fact.
+- The primary character may reach a wrong or biased conclusion. If the memory establishes a subjective belief rather than objective truth, phrase the delta as \"the character now believes/suspects/assumes...\" rather than \"the character now knows...\". Do not erase a meaningful misinterpretation, but do not certify it as fact.
 - If the memory genuinely reflects little or no change (a quiet beat), still fill the fields with the best reading and set "low_delta_flag": true.
 - Keep each field to one concise sentence.`;
 }

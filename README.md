@@ -13,6 +13,7 @@ It is built for long-form collaborative roleplay where continuity is the whole p
 - **Tracks the world, not just the cast.** A separate, stricter pass records *world memories* — the durable lore of your setting (factions, locations, rules, world-altering events) — kept apart from character memories and able to update itself as the world changes.
 - **Consolidates over time.** As memories pile up, you can fold groups of them into higher-level summaries, keeping the working set lean while preserving meaning.
 - **Keeps you in control.** Nothing is committed silently. Generated memories land in a *pending* review area where you approve, edit, regenerate, or discard them.
+- **Explains passive retrieval decisions.** The Debug panel keeps a session-only report of the latest sidecar retrieval, including vector and lexical scores, threshold/decay changes, cooldown or status filtering, optional reranker rank, category/global caps, and the final memories selected for injection. This adds no prompt tokens or extra model calls.
 
 Everything is stored **per chat**, inside that chat's metadata — memories from one chat never leak into another.
 
@@ -87,7 +88,7 @@ The Library tab is your memory store, organized into folders:
 - **Plot** — arc-level summaries, including the products of consolidation.
 - **Custom folders** — make your own top-level folders and subfolders, with images and their own menu bars.
 
-Each memory card shows an estimated token cost and when its folder was last updated. You can search, sort, bulk-select, move, edit, star (mark as core/important), or exclude entries from consolidation.
+Each memory card shows an estimated token cost and when its folder was last updated. You can search, sort, bulk-select, move, edit, star (mark as core/important), or exclude entries from consolidation. Editing a memory also lets you correct, add, or remove its browsing/recall tags; the entry is re-embedded after saving so tag fixes take effect in retrieval.
 
 ### World memories
 
@@ -115,6 +116,8 @@ If your chat backend supports tool calling, Memory Loom registers a `search_core
 4. Scoring applies your settings — similarity threshold, stickiness (a memory stays active for a few messages after firing), cooldown (a memory won't re-fire immediately), and optional decay (older memories gradually lose priority). Starred/important memories bypass decay and suppression.
 5. The surviving memories are injected into the prompt, in the format and placement you chose.
 
+The **Debug → Last passive retrieval** report shows how the most recent run moved through those steps, including why a matched memory was filtered or lost to an injection cap.
+
 A 45-second watchdog guards the whole pass, so a hung LLM call can never freeze your chat.
 
 ---
@@ -126,7 +129,7 @@ A 45-second watchdog guards the whole pass, so a hung LLM call can never freeze 
 - **Injection** — what gets injected and where; max entries per message; stickiness; cooldown; max recall-tool memories.
 - **Vectorization** — embedding source mirror, similarity threshold, top-K, consolidated-priority multiplier, distance metric.
 - **Consolidation** — token cap, auto-consolidation threshold, important-priority multiplier.
-- **Debug** — verbose console logging (highly recommended while tuning), world scan, delta backfill, re-embed, undo last scan, memory decay, reset to defaults.
+- **Debug** — verbose console logging, a session-only explanation of the latest passive retrieval, world scan, delta backfill, re-embed, undo last scan, memory decay, reset to defaults.
 - **Data** — import / export everything.
 
 ---
@@ -139,7 +142,7 @@ Memories live in the chat's metadata. **Export regularly** — there's an Export
 
 ## Troubleshooting
 
-- **No memories retrieved / nothing injects:** check that your embedding backend is reachable and the similarity threshold isn't too high. Turn on Debug logging and watch the retriever's score lines.
+- **No memories retrieved / nothing injects:** check that your embedding backend is reachable and the similarity threshold isn't too high. Open **Debug → Last passive retrieval** to see whether candidates were below threshold, on cooldown, excluded by status, reranked lower, or removed by category/global caps.
 - **World scan returns "[NO WORLD MEMORY]" everywhere:** this is often correct — either the scenes contain no new setting lore, or the facts are already on record (re-scanning the same scenes dedupes). Confirm with Debug logging, which prints the raw model response for each scene.
 - **A feature button seems to do nothing:** open the browser console (F12). Memory Loom logs its actions; errors there point to the cause (often an embedding backend not configured).
 - **Memories from another chat showing up:** they shouldn't — storage is per-chat. If something looks crossed, check that you didn't import another chat's export into this one.

@@ -294,6 +294,15 @@ export function saveOpenSceneId(sceneId) {
 // ─── Message Counter (for scan frequency) ─────────────────
 
 /**
+ * Get the current message counter value.
+ * @returns {number}
+ */
+export function getMessageCounter() {
+    ensureChatNamespace();
+    return typeof chat_metadata[NAMESPACE].messageCounter === "number" ? chat_metadata[NAMESPACE].messageCounter : 0;
+}
+
+/**
  * Set and save the message counter.
  *
  * Historically this value was an ever-incrementing sidecar trigger counter. It
@@ -309,6 +318,20 @@ export function setMessageCounter(value) {
     const parsed = Number(value);
     const safeValue = Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
     chat_metadata[NAMESPACE].messageCounter = safeValue;
+    saveChat();
+    return chat_metadata[NAMESPACE].messageCounter;
+}
+
+/**
+ * Increment the message counter and save.
+ * Retained for compatibility with older internal callers/exports. New sidecar
+ * scheduling should prefer setMessageCounter()/syncMessageCounterToLiveCount().
+ * @returns {number} New counter value
+ */
+export function incrementMessageCounter() {
+    ensureChatNamespace();
+    const current = typeof chat_metadata[NAMESPACE].messageCounter === "number" ? chat_metadata[NAMESPACE].messageCounter : 0;
+    chat_metadata[NAMESPACE].messageCounter = current + 1;
     saveChat();
     return chat_metadata[NAMESPACE].messageCounter;
 }
@@ -340,6 +363,16 @@ export function syncMessageCounterToLiveCount(liveMessageCount) {
     }
 
     return { counter: previous, previous, changed: false };
+}
+
+/**
+ * Reset the message counter to zero.
+ * Called when the user changes scan frequency or on chat switch.
+ */
+export function resetMessageCounter() {
+    ensureChatNamespace();
+    chat_metadata[NAMESPACE].messageCounter = 0;
+    saveChat();
 }
 
 // ─── Stickiness & Cooldown Tracking ───────────────────────

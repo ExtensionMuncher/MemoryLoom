@@ -1128,6 +1128,26 @@ function renderMemoryEntry(entry) {
 // ─── Inline Entry Editing ─────────────────────────────────
 
 /**
+ * Parse a user-edited tag list. Commas or new lines separate tags; empty and
+ * case-insensitive duplicate values are removed while the user's spelling is kept.
+ * @param {string} raw
+ * @returns {string[]}
+ */
+function parseEditableTags(raw) {
+    const tags = [];
+    const seen = new Set();
+    for (const part of String(raw || "").split(/[,\n]+/)) {
+        const tag = part.trim();
+        if (!tag) continue;
+        const key = tag.toLocaleLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        tags.push(tag);
+    }
+    return tags;
+}
+
+/**
  * Toggle a committed memory entry into edit mode, replacing static text with inputs.
  * @param {string} entryId
  */
@@ -1171,6 +1191,9 @@ function toggleEntryEdit(entryId) {
             <input class="ml-form-input" id="ml-edit-primary-${entryId}" value="${escapeHtml((entry.primaryCharacters && entry.primaryCharacters.length ? entry.primaryCharacters : (entry.primaryCharacter ? [entry.primaryCharacter] : [])).join(", "))}" placeholder="Who this memory belongs to">
             <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#666;margin-top:6px">Key characters · comma-separate · optional</div>
             <input class="ml-form-input" id="ml-edit-key-${entryId}" value="${escapeHtml((entry.keyCharacters || []).join(", "))}" placeholder="Supporting cast (optional)">` : ""}
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#666;margin-top:6px">Tags · comma-separate</div>
+            <input class="ml-form-input" id="ml-edit-tags-${entryId}" value="${escapeHtml((entry.tags || []).map(String).join(", "))}" placeholder="e.g. unresolved_conflict, trust_shift, winter">
+            <div style="font-size:11px;color:#777;line-height:1.4;margin-top:3px">Used for library browsing, filtering, reranking, and embedding recall. Edit or remove any incorrect LLM-generated tag here.</div>
         </div>
         <label class="ml-important-row" style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer">
             <input type="checkbox" id="ml-edit-important-${entryId}" ${entry.important ? "checked" : ""}>
@@ -1210,13 +1233,14 @@ function toggleEntryEdit(entryId) {
         }) : (entry.delta || {});
         const primaries = isChar ? ($(`#ml-edit-primary-${entryId}`).val() || "").split(",").map(s => s.trim()).filter(Boolean) : [];
         const keyChars  = isChar ? ($(`#ml-edit-key-${entryId}`).val() || "").split(",").map(s => s.trim()).filter(Boolean) : (entry.keyCharacters || []);
+        const tags = parseEditableTags($(`#ml-edit-tags-${entryId}`).val());
         const important = $(`#ml-edit-important-${entryId}`).prop("checked");
         const excludeFromConsolidation = $(`#ml-edit-exclude-${entryId}`).prop("checked");
         const stickiness = Math.max(0, parseInt($(`#ml-edit-stickiness-${entryId}`).val(), 10) || 0);
         const cooldown = Math.max(0, parseInt($(`#ml-edit-cooldown-${entryId}`).val(), 10) || 0);
 
         const update = {
-            title, datetime, content, delta, important, excludeFromConsolidation,
+            title, datetime, content, delta, tags, important, excludeFromConsolidation,
             stickiness, cooldown,
             keyCharacters: keyChars,
         };
@@ -2404,6 +2428,13 @@ export function closeModal(id) {
 }
 
 // ─── Crop Helpers ─────────────────────────────────────────
+
+/**
+ * Open the crop dialog by triggering the hidden file input.
+ */
+export function openCrop() {
+    $("#ml-img-upload").click();
+}
 
 /**
  * Apply the cropped/uploaded image to the target character subfolder.

@@ -196,6 +196,18 @@ export async function regenerateEntry(entry, guidance = "") {
 
 // ─── Prompt Builders ──────────────────────────────────────
 
+function buildInterpretationGroundingRules() {
+    return `INTERPRETATION GROUNDING — ABSOLUTE RULES:
+- Treat explicit narration, dialogue, and stated motives as higher-confidence evidence than dramatic tone, genre convention, or the apparent effectiveness of an action.
+- Do NOT upgrade fear, desperation, panic, confusion, impulsiveness, self-preservation, dissociation, or reactive behavior into confidence, courage, strategy, dominance, manipulation, competence, or calculated control unless the source text explicitly establishes that interpretation.
+- Planning one part of a situation does not make every later reaction planned. Preserve the boundary between deliberate setup and improvised survival.
+- Do not make a character more composed, sinister, romantic, insightful, strategic, or “badass” than the source supports.
+- Preserve uncertainty and mixed motives when the source is uncertain. Never convert an inference into a confirmed inner truth.
+- SUBJECTIVE MISINTERPRETATION IS ALLOWED: an NPC may misunderstand another character, assign the wrong motive, or form a distorted conclusion when that belief is plausible from what the NPC actually perceived. Preserve that as the NPC's belief, suspicion, fear, assumption, or interpretation. Do NOT silently correct the NPC into omniscience.
+- Keep subjective belief separate from objective scene fact. Write \"the character became convinced every step had been planned\" rather than \"every step had been planned\" when the source establishes only that character's conclusion. Explicit narration or the other character's stated motive still governs what actually happened.
+- When concrete behavior conflicts with an interpretive flourish, anchor objective claims to the concrete behavior and the character's explicitly stated experience.`;
+}
+
 function buildDefaultSceneSummaryPrompt() {
     return `[MLv4] Write a factual scene reference note. Start with:
 
@@ -282,13 +294,13 @@ function buildMemoryEntryUserPrompt(sceneSummary, messages, previousSummaries) {
 export function resolveMemoryEntryPrompt() {
     const saved = getSetting("memoryWriting.memoryEntryPrompt", "");
     const prompt = (saved && saved.includes("[MLv4]")) ? saved : buildDefaultMemoryEntryPrompt();
-    return substituteUserMacro(prompt);
+    return substituteUserMacro(`${prompt}\n\n${buildInterpretationGroundingRules()}`);
 }
 
 export function resolveSceneSummaryPrompt() {
     const saved = getSetting("memoryWriting.sceneSummaryPrompt", "");
     const prompt = (saved && saved.includes("[MLv4]")) ? saved : buildDefaultSceneSummaryPrompt();
-    return substituteUserMacro(prompt);
+    return substituteUserMacro(`${prompt}\n\n${buildInterpretationGroundingRules()}`);
 }
 
 // The {{user}} macro is only substituted by ST inside the chat pipeline — raw API

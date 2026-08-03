@@ -141,36 +141,61 @@ function parseRanking(response) {
  * @param {object} sidecarResult keyword extraction result
  * @param {string} queryText text used for vector query
  * @param {number} injectionLimit global injection cap; rerank skips when there is no competition
- * @returns {Promise<{entry:object,score:number,rerankScore?:number}[]>}
+ * @param {object|null} debugInfo optional mutable diagnostic summary
+ * @returns {Promise<{entry:object,score:number,rerankScore?:number,rerankRank?:number}[]>}
  */
-export async function rerankCandidates(candidates, sidecarResult, queryText, injectionLimit = 3) {
+export async function rerankCandidates(candidates, sidecarResult, queryText, injectionLimit = 3, debugInfo = null) {
     const cfg = getRerankSettings();
-    if (!cfg.enabled) return candidates;
-    if (!Array.isArray(candidates) || candidates.length <= 1) return candidates;
+    if (debugInfo) {
+        Object.assign(debugInfo, {
+            enabled: cfg.enabled,
+            attempted: false,
+            applied: false,
+            skipReason: "",
+            poolSize: 0,
+        });
+    }
+    if (!cfg.enabled) {
+        if (debugInfo) debugInfo.skipReason = "LLM reranker is disabled.";
+        return candidates;
+    }
+    if (!Array.isArray(candidates) || candidates.length <= 1) {
+        if (debugInfo) debugInfo.skipReason = "One or fewer eligible candidates; reranking was unnecessary.";
+        return candidates;
+    }
 
     const limit = Math.max(1, Number(injectionLimit) || 3);
     // If every surviving candidate can inject anyway, a second LLM call mostly
     // burns money/time for prompt-order cosmetics. Skip until there is actual
     // competition for limited injection slots.
     if (candidates.length <= limit) {
-        dlog(`Reranker skipped — ${candidates.length} candidate(s) fit within injection cap ${limit}`);
+        const reason = `${candidates.length} eligible candidate(s) fit within injection cap ${limit}.`;
+        dlog(`Reranker skipped — ${reason}`);
+        if (debugInfo) debugInfo.skipReason = reason;
         return candidates;
     }
 
     const profileName = getSetting("connections.sidecarLLM", "");
     if (!profileName) {
         console.warn("[ML] Reranker skipped — no Keyword sidecar LLM configured");
+        if (debugInfo) debugInfo.skipReason = "No Keyword sidecar LLM profile is configured.";
         return candidates;
     }
 
     const poolSize = Math.min(candidates.length, cfg.maxCandidates);
     const pool = candidates.slice(0, poolSize);
+    if (debugInfo) {
+        debugInfo.attempted = true;
+        debugInfo.poolSize = poolSize;
+    }
     const tail = candidates.slice(poolSize);
 
     try {
         const userPrompt = buildUserPrompt(pool, sidecarResult, queryText, cfg.contextDepth);
         if (userPrompt.length > cfg.maxPromptChars) {
-            console.warn(`[ML] Reranker skipped — prompt would be too large (${userPrompt.length} chars > ${cfg.maxPromptChars})`);
+            const reason = `Prompt would be too large (${userPrompt.length} characters > ${cfg.maxPromptChars}).`;
+            console.warn(`[ML] Reranker skipped — ${reason}`);
+            if (debugInfo) debugInfo.skipReason = reason;
             return candidates;
         }
 
@@ -189,11 +214,15 @@ export async function rerankCandidates(candidates, sidecarResult, queryText, inj
                 suppressToasts: true,
             },
         );
-        if (!response) return candidates;
+        if (!response) {
+            if (debugInfo) debugInfo.skipReason = "Reranker returned an empty response.";
+            return candidates;
+        }
 
         const { order, scores } = parseRanking(response);
         if (!order.length) {
             console.warn("[ML] Reranker returned no usable ranking; keeping vector order");
+            if (debugInfo) debugInfo.skipReason = "Reranker response contained no usable ranking.";
             return candidates;
         }
 
@@ -213,6 +242,7 @@ export async function rerankCandidates(candidates, sidecarResult, queryText, inj
                 ...found.candidate,
                 score: blendedScore,
                 rerankScore: llmScore,
+                rerankRank: ranked.length + 1,
             });
             used.add(id);
         }
@@ -229,9 +259,15 @@ export async function rerankCandidates(candidates, sidecarResult, queryText, inj
         // candidate.score for logging/downstream tie-break intuition, but the
         // reranker's ordered list is the source of truth.
         console.log(`[ML] Reranker: reordered ${ranked.length} candidate(s)`);
+        if (debugInfo) {
+            debugInfo.applied = true;
+            debugInfo.skipReason = "";
+            debugInfo.returnedCount = ranked.length;
+        }
         return [...ranked, ...tail];
     } catch (err) {
         console.warn("[ML] Reranker failed; keeping vector order:", err);
+        if (debugInfo) debugInfo.skipReason = `Reranker failed: ${err?.message || String(err)}`;
         return candidates;
     }
 }

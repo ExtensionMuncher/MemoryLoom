@@ -17,7 +17,7 @@ import { getSetting } from "../settings.js";
 import { getEntry } from "../data/entries.js";
 import { getEntries, getStickinessMap, saveStickinessMap, getCooldownsMap, saveCooldownsMap, getFolders } from "../data/storage.js";
 import { getCollectionId } from "./embedder.js";
-import { dlog } from "../lib/debug.js";
+import { dlog, publishRetrievalTrace } from "../lib/debug.js";
 import { rerankCandidates } from "../llm/reranker.js";
 
 
@@ -41,17 +41,99 @@ export function buildVectorSettings() {
 
 export async function runRetrievalPipeline(sidecarResult) {
     const collectionId = getCollectionId();
-    if (!collectionId) return [];
-
     const queryText = buildQueryText(sidecarResult);
-    if (!queryText) { dlog("Retriever skipped — empty query text"); return []; }
+    const threshold = Number(getSetting("vectorization.similarityThreshold", 0.75));
+    const maxEntries = Math.max(1, Number(getSetting("injection.maxEntriesPerMessage", 3)) || 3);
+    const topK = Math.max(1, Number(getSetting("vectorization.raw.topK", 10)) || 10);
+    const querySource = getSetting("vectorization.querySource", "keywords");
+    const recordById = new Map();
+    let discoveryIndex = 0;
+
+    const trace = {
+        timestamp: Date.now(),
+        collectionId: collectionId || "",
+        queryText: queryText || "",
+        querySource,
+        threshold,
+        topK,
+        maxEntries,
+        status: "running",
+        note: "",
+        vectorHitCount: 0,
+        lexicalAddedCount: 0,
+        reranker: {
+            enabled: false,
+            attempted: false,
+            applied: false,
+            skipReason: "",
+            poolSize: 0,
+        },
+        candidates: [],
+        summary: { matched: 0, eligible: 0, selected: 0, filtered: 0 },
+    };
+
+    const ensureRecord = (candidate) => {
+        const entry = candidate?.entry;
+        if (!entry?.id) return null;
+        let record = recordById.get(entry.id);
+        if (!record) {
+            record = {
+                id: entry.id,
+                title: entry.title || "Untitled memory",
+                status: entry.status || "active",
+                category: categoryOfEntry(entry),
+                discoveryIndex: discoveryIndex++,
+                vectorScore: null,
+                lexicalScore: null,
+                lexicalTerms: [],
+                initialScore: null,
+                adjustedScore: null,
+                finalScore: null,
+                rerankScore: null,
+                rerankRank: null,
+                finalRank: null,
+                stickyRemaining: 0,
+                cooldownRemaining: 0,
+                flags: [],
+                decision: "Matched",
+                reason: "",
+            };
+            recordById.set(entry.id, record);
+        }
+        if (Number.isFinite(candidate.vectorScore)) record.vectorScore = candidate.vectorScore;
+        if (Number.isFinite(candidate.lexicalScore)) record.lexicalScore = candidate.lexicalScore;
+        if (Array.isArray(candidate.lexicalTerms) && candidate.lexicalTerms.length) {
+            record.lexicalTerms = [...new Set([...record.lexicalTerms, ...candidate.lexicalTerms])].slice(0, 6);
+        }
+        if (Number.isFinite(candidate.score)) record.initialScore = candidate.score;
+        return record;
+    };
+
+    const finish = (status, note, result = []) => {
+        trace.status = status;
+        trace.note = note || "";
+        trace.finishedAt = Date.now();
+        trace.candidates = [...recordById.values()].sort((a, b) => a.discoveryIndex - b.discoveryIndex);
+        trace.summary = {
+            matched: trace.candidates.length,
+            eligible: trace.candidates.filter(c => c.decision === "Eligible" || c.decision === "Selected").length,
+            selected: trace.candidates.filter(c => c.decision === "Selected").length,
+            filtered: trace.candidates.filter(c => c.decision === "Filtered" || c.decision === "Capped").length,
+        };
+        publishRetrievalTrace(trace);
+        return result;
+    };
+
+    if (!collectionId) {
+        dlog("Retriever skipped — no active vector collection");
+        return finish("skipped", "No active vector collection was available.");
+    }
+    if (!queryText) {
+        dlog("Retriever skipped — empty query text");
+        return finish("skipped", "The sidecar produced no usable retrieval query.");
+    }
 
     const mlSettings = buildVectorSettings();
-
-    const threshold = getSetting("vectorization.similarityThreshold", 0.75);
-    const maxEntries = getSetting("injection.maxEntriesPerMessage", 3);
-    const topK = getSetting("vectorization.raw.topK", 10);
-
     dlog(`Retriever query: "${queryText}" (collection ${collectionId}, topK ${topK}, threshold ${threshold})`);
     const rawResults = await queryCollection(collectionId, queryText, topK, threshold, mlSettings);
 
@@ -64,27 +146,40 @@ export async function runRetrievalPipeline(sidecarResult) {
     if (!rawResults || !rawResults.hashes || rawResults.hashes.length === 0) {
         dlog("Retriever: no vector hits above threshold; trying lexical fallback");
     } else {
+        trace.vectorHitCount = rawResults.hashes.length;
         dlog(`Retriever: ${rawResults.hashes.length} raw vector hit(s)`);
         candidates = mapHashesToEntries(rawResults);
     }
 
+    const beforeLexical = candidates.length;
     candidates = addLexicalFallbacks(candidates, sidecarResult, queryText);
+    trace.lexicalAddedCount = Math.max(0, candidates.length - beforeLexical);
+    candidates.forEach(ensureRecord);
+
     if (!candidates.length) {
         dlog("Retriever: no vector or lexical candidates");
-        return [];
+        return finish("completed", "No stored memory matched the current query.");
     }
 
-    let filtered = applyFilters(candidates);
+    let filtered = applyFilters(candidates, recordById);
     if (!filtered.length) {
         dlog(`Retriever: ${candidates.length} candidate(s) found but all were filtered by threshold/cooldown/status`);
-        return [];
+        return finish("completed", "Candidates matched, but none survived the retrieval filters.");
     }
 
     // Optional LLM rerank: after vector/lexical retrieval and normal filters,
     // before category/global caps choose the final injection set. Disabled by
     // default because it adds one extra LLM call only when there are more
     // candidates than injection slots. Uses the Keyword sidecar profile.
-    filtered = await rerankCandidates(filtered, sidecarResult, queryText, maxEntries);
+    filtered = await rerankCandidates(filtered, sidecarResult, queryText, maxEntries, trace.reranker);
+    filtered.forEach((candidate, index) => {
+        const record = ensureRecord(candidate);
+        if (!record) return;
+        record.finalScore = Number.isFinite(candidate.score) ? candidate.score : record.adjustedScore;
+        if (Number.isFinite(candidate.rerankScore)) record.rerankScore = candidate.rerankScore;
+        if (Number.isFinite(candidate.rerankRank)) record.rerankRank = candidate.rerankRank;
+        record.postRerankPosition = index + 1;
+    });
 
     // Per-category caps: limit how many of each category inject, then apply the
     // global cap as an overall ceiling. Filtered is score/rerank-sorted, so we
@@ -92,18 +187,46 @@ export async function runRetrievalPipeline(sidecarResult) {
     const perCat = getSetting("injection.maxPerCategory", {}) || {};
     const catCounts = {};
     const catLimited = [];
-    for (const c of filtered) {
-        const cat = categoryOfEntry(c.entry);
+    for (const candidate of filtered) {
+        const cat = categoryOfEntry(candidate.entry);
         const limit = Number.isFinite(perCat[cat]) ? perCat[cat] : Infinity;
         const used = catCounts[cat] || 0;
-        if (used < limit) { catLimited.push(c); catCounts[cat] = used + 1; }
+        const record = ensureRecord(candidate);
+        if (used < limit) {
+            catLimited.push(candidate);
+            catCounts[cat] = used + 1;
+        } else if (record) {
+            record.decision = "Capped";
+            record.reason = `${capitalize(cat)} category cap (${limit}) was already filled.`;
+        }
     }
+
     const final = catLimited.slice(0, maxEntries);
+    const selectedIds = new Set(final.map(c => c.entry?.id).filter(Boolean));
+    for (const candidate of catLimited) {
+        const record = ensureRecord(candidate);
+        if (!record || record.decision === "Capped") continue;
+        if (selectedIds.has(candidate.entry.id)) {
+            record.decision = "Selected";
+            record.finalRank = final.findIndex(c => c.entry?.id === candidate.entry.id) + 1;
+            record.reason = `Selected for injection within the global cap of ${maxEntries}.`;
+        } else {
+            record.decision = "Capped";
+            record.reason = `Global injection cap (${maxEntries}) was already filled by higher-ranked memories.`;
+        }
+    }
 
     if (final.length > 0) {
         console.log(`[ML] Retriever: ${final.length} entries selected for injection`);
     }
-    return final;
+    return finish("completed", final.length
+        ? `${final.length} memory entr${final.length === 1 ? "y was" : "ies were"} selected for injection.`
+        : "No memory survived the final injection caps.", final);
+}
+
+function capitalize(value) {
+    const text = String(value || "");
+    return text ? text.charAt(0).toUpperCase() + text.slice(1) : "Memory";
 }
 
 export async function queryCollection(collectionId, searchText, topK, threshold, mlSettings) {
@@ -248,15 +371,33 @@ function addLexicalFallbacks(candidates, sidecarResult, queryText) {
         const hay = entrySearchText(entry);
         const title = normalizeText(entry.title);
         let lexicalScore = 0;
+        const matchedTerms = [];
         for (const term of terms) {
             if (!term || term.length < 3) continue;
-            if (title && (title === term || title.includes(term) || term.includes(title))) lexicalScore = Math.max(lexicalScore, 0.95);
-            else if (hay.includes(term)) lexicalScore = Math.max(lexicalScore, term.includes(" ") ? 0.82 : 0.62);
+            let termScore = 0;
+            if (title && (title === term || title.includes(term) || term.includes(title))) termScore = 0.95;
+            else if (hay.includes(term)) termScore = term.includes(" ") ? 0.82 : 0.62;
+            if (termScore > 0) {
+                lexicalScore = Math.max(lexicalScore, termScore);
+                if (!matchedTerms.includes(term)) matchedTerms.push(term);
+            }
         }
         if (lexicalScore <= 0) continue;
         const existing = byId.get(entry.id);
-        if (existing) existing.score = Math.max(existing.score || 0, lexicalScore);
-        else { byId.set(entry.id, { entry, score: lexicalScore }); added++; }
+        if (existing) {
+            existing.lexicalScore = Math.max(Number(existing.lexicalScore) || 0, lexicalScore);
+            existing.lexicalTerms = [...new Set([...(existing.lexicalTerms || []), ...matchedTerms])].slice(0, 6);
+            existing.score = Math.max(existing.score || 0, lexicalScore);
+        } else {
+            byId.set(entry.id, {
+                entry,
+                score: lexicalScore,
+                vectorScore: null,
+                lexicalScore,
+                lexicalTerms: matchedTerms.slice(0, 6),
+            });
+            added++;
+        }
     }
     if (added > 0) dlog(`Retriever: added ${added} lexical fallback hit(s)`);
     return [...byId.values()];
@@ -293,75 +434,160 @@ function mapHashesToEntries(results) {
     const entries = getEntries();
     for (let i = 0; i < results.hashes.length; i++) {
         const hash = results.hashes[i];
-        const score = results.metadata[i]?.score || 0;
+        const score = Number(results.metadata[i]?.score) || 0;
         const entry = Object.values(entries).find(e => e.vectorHash === hash);
-        if (entry) candidates.push({ entry, score });
+        if (entry) {
+            candidates.push({
+                entry,
+                score,
+                vectorScore: score,
+                lexicalScore: null,
+                lexicalTerms: [],
+            });
+        }
     }
     return candidates;
 }
 
-function applyFilters(candidates) {
+
+function applyFilters(candidates, recordById = new Map()) {
     const stickyMap = getStickinessMap();
     const cooldownMap = getCooldownsMap();
     const decaySettings = getSetting("decay", {});
     const decayEnabled = decaySettings.enabled === true;
-    const threshold = getSetting("vectorization.similarityThreshold", 0.75);
+    const threshold = Number(getSetting("vectorization.similarityThreshold", 0.75));
     const filtered = [];
 
-    for (const { entry, score } of candidates) {
-        const stickyRemaining = stickyMap[entry.id];
-        if (stickyRemaining && stickyRemaining > 0) {
-            filtered.push({ entry, score: Math.max(score, 0.9) });
+    for (const candidate of candidates) {
+        const { entry } = candidate;
+        const score = Number(candidate.score) || 0;
+        const record = recordById.get(entry.id);
+        if (record) record.initialScore = score;
+
+        const stickyRemaining = Number(stickyMap[entry.id]) || 0;
+        const cooldownRemaining = Number(cooldownMap[entry.id]) || 0;
+        if (record) {
+            record.stickyRemaining = stickyRemaining;
+            record.cooldownRemaining = cooldownRemaining;
+        }
+
+        if (stickyRemaining > 0) {
+            const adjustedScore = Math.max(score, 0.9);
+            if (record) {
+                record.adjustedScore = adjustedScore;
+                record.flags.push("sticky");
+                record.decision = "Eligible";
+                record.reason = `Stickiness is active for ${stickyRemaining} more message${stickyRemaining === 1 ? "" : "s"}; similarity was raised to at least 0.900.`;
+            }
+            filtered.push({ ...candidate, score: adjustedScore });
             continue;
         }
-        const cooldownRemaining = cooldownMap[entry.id];
-        if (cooldownRemaining && cooldownRemaining > 0) continue;
-        if (entry.status === "pinned") { filtered.push({ entry, score: 1.0 }); continue; }
-        if (entry.status === "archived" || entry.status === "superseded") continue;
+
+        if (cooldownRemaining > 0) {
+            if (record) {
+                record.decision = "Filtered";
+                record.reason = `Cooldown is active for ${cooldownRemaining} more message${cooldownRemaining === 1 ? "" : "s"}.`;
+            }
+            continue;
+        }
+
+        if (entry.status === "pinned") {
+            if (record) {
+                record.adjustedScore = 1.0;
+                record.flags.push("pinned");
+                record.decision = "Eligible";
+                record.reason = "Pinned memories bypass similarity, decay, and consolidation suppression.";
+            }
+            filtered.push({ ...candidate, score: 1.0 });
+            continue;
+        }
+
+        if (entry.status === "archived" || entry.status === "superseded") {
+            if (record) {
+                record.decision = "Filtered";
+                record.reason = `Memory status is ${entry.status}; it is excluded from passive retrieval.`;
+            }
+            continue;
+        }
 
         // Core/important memories bypass decay AND consolidation suppression — the
         // user has flagged them as pivotal (e.g. childhood memories) and they
         // must not be pushed down the priority order over time.
         if (entry.important) {
-            filtered.push({ entry, score: Math.max(score, 0.95) });
+            const adjustedScore = Math.max(score, 0.95);
+            if (record) {
+                record.adjustedScore = adjustedScore;
+                record.flags.push("important");
+                record.decision = "Eligible";
+                record.reason = "Starred/important memory; priority was raised to at least 0.950 and decay/suppression were bypassed.";
+            }
+            filtered.push({ ...candidate, score: adjustedScore });
             continue;
         }
+
         let adjustedScore = score;
+        const reasons = [];
         if (decayEnabled && entry.status !== "pinned") {
-            adjustedScore = applyDecay(entry, score, decaySettings);
+            const decay = calculateDecay(entry, score, decaySettings);
+            adjustedScore = decay.adjustedScore;
+            if (decay.applied) {
+                if (record) record.flags.push("decayed");
+                reasons.push(`decay ×${decay.factor.toFixed(3)} after ${decay.ageDays} day${decay.ageDays === 1 ? "" : "s"}`);
+            }
         }
+
         // Consolidated source memories stay retrievable but at reduced priority —
         // the consolidation that replaced them carries the meaning now. They
         // still surface for the recall tool and for close keyword matches.
         if (entry.status === "consolidated") {
-            const mult = Number(getSetting("vectorization.consolidatedPriorityMultiplier", 0.5));
-            adjustedScore *= (Number.isFinite(mult) && mult > 0 ? mult : 0.5);
+            const multSetting = Number(getSetting("vectorization.consolidatedPriorityMultiplier", 0.5));
+            const mult = Number.isFinite(multSetting) && multSetting > 0 ? multSetting : 0.5;
+            adjustedScore *= mult;
+            if (record) record.flags.push("consolidated");
+            reasons.push(`consolidated-source priority ×${mult.toFixed(3)}`);
         }
-        if (adjustedScore >= threshold) filtered.push({ entry, score: adjustedScore });
+
+        if (record) record.adjustedScore = adjustedScore;
+        if (adjustedScore >= threshold) {
+            if (record) {
+                record.decision = "Eligible";
+                record.reason = reasons.length
+                    ? `Passed threshold ${threshold.toFixed(3)} after ${reasons.join(" and ")}.`
+                    : `Passed similarity threshold ${threshold.toFixed(3)}.`;
+            }
+            filtered.push({ ...candidate, score: adjustedScore });
+        } else if (record) {
+            record.decision = "Filtered";
+            record.reason = `${reasons.length ? `${reasons.join("; ")}; ` : ""}adjusted score ${adjustedScore.toFixed(3)} fell below threshold ${threshold.toFixed(3)}.`;
+        }
     }
+
     filtered.sort((a, b) => b.score - a.score);
     return filtered;
 }
 
-function applyDecay(entry, score, settings) {
+function calculateDecay(entry, score, settings) {
     const ageMs = Date.now() - entry.createdAt;
-    // Age proxy in DAYS (was mislabeled "scenes" but computed hours). Scene
-    // count isn't tracked per-entry, so age-since-creation in days is the stable
-    // proxy: decayStart and decay windows are interpreted in days.
-    const ageScenes = Math.floor(ageMs / (1000 * 60 * 60 * 24));
-    const decayStart = settings.decayStart || 5;
-    if (ageScenes < decayStart) return score;
-    const minPriority = settings.minimumPriority || 0.3;
+    // Age proxy in DAYS. Scene count isn't tracked per-entry, so age-since-
+    // creation in days is the stable proxy used by the existing decay setting.
+    const ageDays = Math.floor(ageMs / (1000 * 60 * 60 * 24));
+    const decayStart = Number(settings.decayStart) || 5;
+    if (ageDays < decayStart) {
+        return { adjustedScore: score, factor: 1, ageDays, applied: false };
+    }
+    const minPriority = Number(settings.minimumPriority) || 0.3;
     const mode = settings.mode || "linear";
-    const effectiveAge = ageScenes - decayStart;
+    const effectiveAge = ageDays - decayStart;
     let factor;
     switch (mode) {
         case "exponential": factor = Math.exp(-0.1 * effectiveAge); break;
         case "step": factor = effectiveAge < 10 ? 1.0 : effectiveAge < 20 ? 0.7 : 0.4; break;
         default: factor = Math.max(0, 1.0 - effectiveAge * 0.05); break;
     }
-    return score * Math.max(minPriority, factor);
+    factor = Math.max(minPriority, factor);
+    return { adjustedScore: score * factor, factor, ageDays, applied: factor < 1 };
 }
+
 
 export function recordInjection(entryId, stickiness = 0) {
     const effective = stickiness > 0 ? stickiness : getSetting("vectorization.defaultStickiness", 0);

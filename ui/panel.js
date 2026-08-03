@@ -108,6 +108,27 @@ export function switchTab(tabId) {
     $(document).trigger("ml:tab-switched", [tabId]);
 }
 
+/**
+ * Get the jQuery element for a specific tab's content pane.
+ * Used by tab renderers to target where they should render.
+ *
+ * @param {string} tabId
+ * @returns {jQuery}
+ */
+export function getPane(tabId) {
+    return $(`#ml-p-${tabId}`);
+}
+
+/**
+ * Get the ID of the currently active tab.
+ * @returns {string}
+ */
+export function getActiveTab() {
+    const $activeTab = $(".ml-tab.on");
+    const index = $(".ml-tab").index($activeTab);
+    return TABS[index]?.id || "home";
+}
+
 // ─── Home Tab Header ──────────────────────────────────────
 
 /**

@@ -26,7 +26,7 @@ import { renderHomeTab } from "./ui/home.js";
 import { renderLibraryTab } from "./ui/library.js";
 import { renderSettingsTab } from "./ui/settings.js";
 import { extractKeywords } from "./llm/sidecar.js";
-import { dlog } from "./lib/debug.js";
+import { dlog, clearLastRetrievalTrace } from "./lib/debug.js";
 import { isMLInternalGen } from "./llm/connections.js";
 import { registerMemoryRecallTool } from "./llm/recallTool.js";
 import { runWriterFlow } from "./llm/writer.js";
@@ -277,6 +277,7 @@ function registerEventHandlers() {
         addMessageButtons(mesId);
     });
     eventSource.on(event_types.CHAT_CHANGED, () => {
+        clearLastRetrievalTrace();
         resetRuntimeMessageState("CHAT_CHANGED");
         resetEntryMigrationGuards();   // re-run per-chat migrations for the new chat
         initDefaultFolders();

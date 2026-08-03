@@ -61,6 +61,10 @@ export function getConsolidation(id) {
     return consolidations[id] || null;
 }
 
+export function getAllConsolidations() {
+    return Object.values(getConsolidations());
+}
+
 export function updateConsolidation(id, updates) {
     const consolidations = getConsolidations();
     if (!consolidations[id]) return null;
@@ -69,3 +73,28 @@ export function updateConsolidation(id, updates) {
     return consolidations[id];
 }
 
+export function deleteConsolidation(id) {
+    const consolidations = getConsolidations();
+    if (!consolidations[id]) return false;
+    delete consolidations[id];
+    saveConsolidations(consolidations);
+    return true;
+}
+
+/**
+ * Apply status updates from a consolidation to source entries.
+ * Typically sets source entries from "active" → "consolidated".
+ *
+ * @param {Array<{sourceId: string, newStatus: string}>} statusUpdates
+ */
+export function applyStatusUpdates(statusUpdates) {
+    if (!statusUpdates || statusUpdates.length === 0) return;
+
+    // Dynamic import to avoid circular dependency
+    import("./entries.js").then(({ updateEntry }) => {
+        for (const update of statusUpdates) {
+            updateEntry(update.sourceId, { status: update.newStatus });
+        }
+        console.log(`[ML] Applied ${statusUpdates.length} status updates from consolidation`);
+    });
+}

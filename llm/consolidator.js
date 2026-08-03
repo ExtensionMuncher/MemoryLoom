@@ -108,6 +108,10 @@ OTHER RULES:
 - Vivid, specific third-person prose in the same style as the source memories — sensory and emotionally precise, not a clinical report.
 - Present/past state only; never pose open questions.
 - Make it personal to ${charName} and distinct from a neutral arc summary.
+- Explicitly stated motives and emotions outrank dramatic tone or genre convention. Do NOT turn fear, desperation, panic, confusion, impulsiveness, self-preservation, or reactive behavior into confidence, strategy, dominance, courage, manipulation, or calculated control unless the source explicitly establishes it.
+- Planning one part of an encounter does not make every later reaction planned. Preserve the difference between deliberate setup and improvised survival.
+- Do not make anyone more composed, sinister, romantic, insightful, competent, strategic, or “badass” than the sources support. Preserve ambiguity instead of upgrading inference into fact.
+- A character-perspective memory MAY preserve that character's mistaken or biased interpretation when it is plausible from what they perceived. Clearly frame it as what the character believed, suspected, feared, assumed, or concluded; do not promote their interpretation into objective fact, and do not make them omniscient by silently correcting it.
 
 Output ONLY a JSON object, no markdown fences:
 {
@@ -165,6 +169,11 @@ RULES:
 2. Express all unresolved context as present state — what IS true now, not what MIGHT happen.
 3. The consolidation should be compact enough for system prompt injection but comprehensive enough to convey the full arc.
 4. Use neutral, clinical language. This is reference material for the AI, not narrative prose.
+5. Explicitly stated motives and emotions outrank dramatic tone or the apparent effectiveness of an action. Do NOT turn fear, desperation, panic, confusion, impulsiveness, self-preservation, or reactive behavior into confidence, strategy, dominance, courage, manipulation, competence, or calculated control unless the sources explicitly establish it.
+6. Planning one part of a situation does not make every later reaction planned. Preserve the distinction between deliberate setup and improvised survival.
+7. Do not make characters more composed, sinister, romantic, insightful, strategic, or “badass” than the source material supports. Preserve uncertainty and mixed motives; never upgrade an inference into a confirmed inner truth.
+8. Character beliefs may be wrong. Preserve a consequential misinterpretation when it matters to that character, but label it explicitly as their belief/suspicion/assumption rather than presenting it as neutral arc fact. A neutral consolidation must distinguish \"X believed Y\" from \"Y was true.\"
+9. If source memories disagree in interpretation, prioritize concrete actions, explicit narration/dialogue, and the least speculative reading for OBJECTIVE claims rather than escalating the more dramatic version.
 
 Example of WRONG output:
   "Will Mira forgive Elena for the betrayal?"

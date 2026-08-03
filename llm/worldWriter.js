@@ -86,11 +86,13 @@ REJECT THESE — they are NOT world memories (these are your most common mistake
 ✗ Anything about surveillance/tracking/orders concerning a specific person (especially the player character). "A network is tracking Mira," "the clan issued orders about Mira," "her conversations are being logged" → these are PLOT EVENTS about a character, not world structure. REJECT, no matter how many vehicles are described.
 ✗ A specific person's reputation, presence, abilities, habits, or psychology. "Kellan commands territorial presence," "Kellan is triggered by vanilla," "Kellan's courtship style" → CHARACTER MEMORIES wearing a costume. REJECT.
 ✗ A personal arrangement, deal, or relationship between specific characters. "Kellan has a pact with Mira for sketches" → a plot/relationship beat. REJECT.
-✗ Weather, the atmosphere of a street on one day, the season. "Autumn in Tokyo, 14°C," "Shinjuku smells of chestnuts" → transient scene texture. REJECT.
+✗ Weather, the atmosphere of a street on one day, the season. "Autumn in the capital, 14°C," "the market street smells of chestnuts" → transient scene texture. REJECT.
 ✗ The internal operations, software version, or service protocols of one mundane business. "Kinokuniya's inventory system v4.2.17," "Kinokuniya's tiered customer service" → REJECT.
 ✗ A specific friend group, their chat name, their members. "The Disaster Committee group chat" → CHARACTER ROSTER. REJECT.
 
 THE TEST, applied honestly: "Is this a fact about the fictional WORLD that belongs in a setting encyclopedia — or is it (a) about a specific person, (b) something happening in the plot, or (c) a passing scene detail?" Only the encyclopedia case qualifies. When unsure, REJECT — a missed fact costs nothing; this list of garbage is what we are eliminating.
+
+INTERPRETATION GROUNDING: When a character action is evidence for world lore, preserve the source's stated motive and level of certainty. Do not reinterpret fear, desperation, panic, confusion, self-preservation, or reactive behavior as strategy, dominance, competence, or calculated control merely because the action succeeded. A character's belief or misinterpretation is not world truth: if it matters at all, label it as that character's belief, and never upgrade it into an encyclopedia fact.
 
 If nothing in the scene is genuine world lore, output exactly: [NO WORLD MEMORY]. But when real world lore IS present, record it.
 

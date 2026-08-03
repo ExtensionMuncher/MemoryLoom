@@ -2154,3 +2154,171 @@ body.ml-disabled .ml-scene-btn {
     outline: none;
     border-color: #9a8fd8;
 }
+
+/* ─── Debug: retrieval explanation ─── */
+.ml-retrieval-trace-block {
+    border-top: 1px solid #333;
+    border-bottom: 1px solid #333;
+    padding: 12px 0;
+}
+.ml-retrieval-trace-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+.ml-retrieval-trace-empty,
+.ml-retrieval-trace-note {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    line-height: 1.55;
+    color: #888;
+    padding: 9px 10px;
+    border: 1px solid #343434;
+    border-radius: 5px;
+    background: #1d1d1d;
+    overflow-wrap: anywhere;
+}
+.ml-retrieval-trace-note { margin-top: 8px; color: #aaa; }
+.ml-retrieval-trace-summary {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+}
+.ml-retrieval-trace-summary > div,
+.ml-retrieval-trace-query {
+    min-width: 0;
+    padding: 7px 8px;
+    border: 1px solid #343434;
+    border-radius: 5px;
+    background: #1d1d1d;
+}
+.ml-retrieval-trace-summary span,
+.ml-retrieval-trace-query > span {
+    display: block;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 9px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: #777;
+    margin-bottom: 3px;
+}
+.ml-retrieval-trace-summary strong,
+.ml-retrieval-trace-query > div {
+    display: block;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #bbb;
+    font-weight: 500;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+}
+.ml-retrieval-trace-query { margin-top: 6px; }
+.ml-retrieval-trace-candidates {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    margin-top: 9px;
+}
+.ml-retrieval-trace-card {
+    border: 1px solid #383838;
+    border-radius: 6px;
+    padding: 9px 10px;
+    background: #1c1c1c;
+    min-width: 0;
+}
+.ml-retrieval-trace-card-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+}
+.ml-retrieval-trace-title {
+    min-width: 0;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--SmartThemeBodyColor, #ccc);
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+}
+.ml-retrieval-decision {
+    flex: 0 0 auto;
+    border: 1px solid #555;
+    border-radius: 999px;
+    padding: 2px 7px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 9px;
+    line-height: 1.3;
+    white-space: nowrap;
+    color: #aaa;
+}
+.ml-retrieval-decision.selected { border-color: #6a8b69; color: #9fc59c; }
+.ml-retrieval-decision.filtered { border-color: #7d5757; color: #c99a9a; }
+.ml-retrieval-decision.capped { border-color: #786a4c; color: #c6ae75; }
+.ml-retrieval-decision.eligible { border-color: #555e75; color: #9da8ca; }
+.ml-retrieval-trace-meta {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 9px;
+    color: #666;
+    margin-top: 3px;
+    overflow-wrap: anywhere;
+}
+.ml-retrieval-trace-scores {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px 10px;
+    margin-top: 7px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    color: #777;
+}
+.ml-retrieval-trace-scores strong { color: #aaa; font-weight: 500; }
+.ml-retrieval-trace-line {
+    display: flex;
+    gap: 8px;
+    justify-content: space-between;
+    margin-top: 5px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    line-height: 1.4;
+    color: #777;
+}
+.ml-retrieval-trace-line strong {
+    min-width: 0;
+    color: #aaa;
+    font-weight: 500;
+    text-align: right;
+    overflow-wrap: anywhere;
+}
+.ml-retrieval-trace-flags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 7px;
+}
+.ml-retrieval-trace-flags span {
+    border: 1px solid #464646;
+    border-radius: 3px;
+    padding: 1px 5px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 9px;
+    color: #888;
+}
+.ml-retrieval-trace-reason {
+    margin-top: 7px;
+    padding-top: 7px;
+    border-top: 1px solid #303030;
+    font-size: 11px;
+    line-height: 1.45;
+    color: #999;
+    overflow-wrap: anywhere;
+}
+@media (max-width: 600px) {
+    .ml-retrieval-trace-header { align-items: flex-start; }
+    .ml-retrieval-trace-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .ml-retrieval-trace-card-head { flex-direction: column; }
+    .ml-retrieval-decision { white-space: normal; }
+    .ml-retrieval-trace-line { flex-direction: column; gap: 2px; }
+    .ml-retrieval-trace-line strong { text-align: left; }
+}
