@@ -89,7 +89,7 @@ export function updateInjection(candidates) {
     try {
         for (const c of candidates) {
             const e = c.entry;
-            if (!e) continue;
+            if (!e || c.sticky) continue;
             const perEntry = Number(e.stickiness);
             recordInjection(e.id, Number.isFinite(perEntry) && perEntry > 0 ? perEntry : 0);
         }

@@ -41,6 +41,8 @@ export function createConsolidation(data) {
         plot_impact: data.plot_impact || [],
         world_impact: data.world_impact || [],
         source_memories: data.source_memories || [],
+        source_entry_states: data.source_entry_states || {},
+        source_scene_states: data.source_scene_states || {},
         status_updates: data.status_updates || [],
         tags: data.tags || [],
         status: data.status || "active",

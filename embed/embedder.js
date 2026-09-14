@@ -1,3 +1,4 @@
+import { captureChatGuard } from "../lib/chatGuard.js";
 /**
  * embed/embedder.js — Memory entry embedding via ST's vector API
  *
@@ -17,6 +18,26 @@ import { textgen_types, textgenerationwebui_settings } from "../../../../textgen
 import { getSetting } from "../settings.js";
 import { getEntries } from "../data/storage.js";
 import { setEntryVectorHash } from "../data/entries.js";
+
+export const VECTOR_REQUEST_TIMEOUT_MS = 20000;
+
+async function vectorFetch(url, options = {}) {
+    let timer;
+    const Controller = globalThis.AbortController;
+    const controller = typeof Controller === "function" ? new Controller() : null;
+    const request = fetch(url, controller ? { ...options, signal: controller.signal } : options);
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+            controller?.abort();
+            reject(new Error(`Vector request timed out after ${VECTOR_REQUEST_TIMEOUT_MS}ms`));
+        }, VECTOR_REQUEST_TIMEOUT_MS);
+    });
+    try {
+        return await Promise.race([request, timeout]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
 
 // ─── Collection ID ────────────────────────────────────────
 
@@ -179,6 +200,7 @@ function getEmbeddingSettings() {
  * @returns {Promise<boolean>}
  */
 export async function embedEntry(entry) {
+    const assertChat = captureChatGuard();
     const collectionId = getCollectionId();
     if (!collectionId) return false;
 
@@ -198,7 +220,7 @@ export async function embedEntry(entry) {
             source: settings.source,
         };
 
-        const response = await fetch('/api/vector/insert', {
+        const response = await vectorFetch('/api/vector/insert', {
             method: 'POST',
             headers: getRequestHeaders(),
             body: JSON.stringify(body),
@@ -209,6 +231,9 @@ export async function embedEntry(entry) {
             return false;
         }
 
+        assertChat();
+        const current = getEntries()[entry.id];
+        if (!current || getEmbeddingText(current) !== text) return false;
         setEntryVectorHash(entry.id, hash);
         console.log(`[ML] Embedder: entry ${entry.id} embedded into collection "${collectionId}" (hash: ${hash})`);
         return true;
@@ -237,7 +262,7 @@ export async function deleteEntryVector(entry) {
             source: settings.source,
         };
 
-        const response = await fetch('/api/vector/delete', {
+        const response = await vectorFetch('/api/vector/delete', {
             method: 'POST',
             headers: getRequestHeaders(),
             body: JSON.stringify(body),
@@ -263,10 +288,19 @@ export async function deleteEntryVector(entry) {
  * @returns {Promise<boolean>}
  */
 export async function reEmbedEntry(entry) {
-    if (entry.vectorHash) {
-        await deleteEntryVector(entry);
+    const assertChat = captureChatGuard();
+    const oldHash = entry.vectorHash;
+    // Insert the replacement first. Delete-then-insert could leave a memory
+    // pointing at a vector that had already been deleted when the new request
+    // failed.
+    const inserted = await embedEntry(entry);
+    if (!inserted) return false;
+    assertChat();
+    const current = getEntries()[entry.id];
+    if (oldHash && current?.vectorHash && oldHash !== current.vectorHash) {
+        await deleteEntryVector({ ...entry, vectorHash: oldHash });
     }
-    return embedEntry(entry);
+    return true;
 }
 
 /**
@@ -276,16 +310,18 @@ export async function reEmbedEntry(entry) {
  * @returns {Promise<number>} Number of entries embedded
  */
 export async function embedAllPending(onProgress = null) {
+    const assertChat = captureChatGuard();
     const entries = getEntries();
     const pending = Object.values(entries).filter(e => !e.vectorHash);
     if (pending.length === 0) return 0;
 
-    const batchSize = getSetting("embedding.insertBatchSize", 10);
+    const batchSize = Math.max(1, Math.floor(Number(getSetting("embedding.insertBatchSize", 10))) || 10);
     let embedded = 0;
 
     for (let i = 0; i < pending.length; i += batchSize) {
         const batch = pending.slice(i, i + batchSize);
         for (const entry of batch) {
+            assertChat();
             const ok = await embedEntry(entry);
             if (ok) embedded++;
         }

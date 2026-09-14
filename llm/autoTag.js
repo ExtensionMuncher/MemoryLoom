@@ -1,3 +1,4 @@
+import { captureChatGuard } from "../lib/chatGuard.js";
 /**
  * llm/autoTag.js — Auto-tag assist for memory entries
  *
@@ -7,7 +8,7 @@
  */
 
 import { makeRequest } from "./connections.js";
-import { getAllEntries, updateEntry } from "../data/entries.js";
+import { getAllEntries, getEntry, updateEntry } from "../data/entries.js";
 import { getScene } from "../data/scenes.js";
 import { reEmbedEntry } from "../embed/embedder.js";
 import { getSetting } from "../settings.js";
@@ -16,6 +17,11 @@ import { dlog } from "../lib/debug.js";
 export const TAG_BATCH_SIZE = 5;
 export const TAG_BATCH_PAUSE_MS = 2500;
 const MAX_DESCRIPTIVE_TAGS_PER_ENTRY = 8;
+
+function getTagResponseTokens() {
+    const value = Number(getSetting("connections.maxResponseTokens", 8000));
+    return Number.isFinite(value) && value >= 500 ? Math.min(value, 32000) : 8000;
+}
 
 // Tags that are bookkeeping/source markers, not descriptive browse tags.
 // These should not make the debug auto-tagger think a memory is already tagged.
@@ -46,15 +52,25 @@ export async function suggestTags(entry, scene = null) {
     const systemPrompt = buildTagSystemPrompt();
     const userPrompt = buildTagUserPrompt(entry, scene);
 
-    dlog(`[ML] Auto-tag: suggesting tags for \"${entry?.title || entry?.id || "untitled"}\"...`);
-    const response = await makeRequest(profileName, systemPrompt, userPrompt, 200, 0.3);
-
-    if (!response) {
-        console.warn("[ML] Auto-tag: no response from LLM");
-        return [];
+    const label = `auto-tag \"${entry?.title || entry?.id || "untitled"}\"`;
+    const maxTokens = getTagResponseTokens();
+    dlog(`[ML] Auto-tag: suggesting tags for \"${entry?.title || entry?.id || "untitled"}\" (maxTokens=${maxTokens})...`);
+    const response = await makeRequest(profileName, systemPrompt, userPrompt, maxTokens, 0.3, {
+        requestLabel: label,
+        // Structured utility calls do not benefit from hidden reasoning.
+        // The soft directive is harmless for providers that ignore it; hard
+        // backend flags remain controlled by the user's per-profile toggle.
+        preferNoThink: true,
+        // Auto-Tag is one bounded structured request. A failed answer is shown
+        // as failed instead of being hidden behind repeated model calls.
+        maxRetries: 0,
+        timeoutMs: 120000,
+    });
+    const tags = response ? parseTagResponse(response) : [];
+    if (!tags.length) {
+        console.warn(`[ML] Auto-tag: no usable tags for \"${entry?.title || entry?.id || "untitled"}\".`);
     }
-
-    return parseTagResponse(response);
+    return tags;
 }
 
 function buildTagSystemPrompt() {
@@ -62,7 +78,7 @@ function buildTagSystemPrompt() {
 
 Tags should be:
 - lowercase, single words or short compound phrases
-- normalized with underscores instead of spaces, e.g. "trust_building", "victorian_era", "secret_revealed"
+- normalized with underscores instead of spaces, e.g. "trust_building", "heian_era", "secret_revealed"
 - descriptive of themes, emotions, relationship dynamics, decisions, reveals, conflicts, or events
 - NOT character names, because characters are tracked separately
 - NOT generic archive words like "memory", "scene", "roleplay", or "entry"
@@ -168,7 +184,7 @@ function hasDescriptiveTags(entry) {
     });
 }
 
-function needsAutoTags(entry) {
+export function entryNeedsAutoTags(entry) {
     if (!entry || isSynthesisEntry(entry)) return false;
     return !hasDescriptiveTags(entry);
 }
@@ -210,10 +226,14 @@ function sleep(ms) {
  * @returns {Promise<object|null>}
  */
 export async function autoTagEntry(entry, scene = null) {
-    if (!entry || !entry.id || !needsAutoTags(entry)) return entry || null;
+    const assertChat = captureChatGuard();
+    const snapshot = JSON.stringify(entry);
+    if (!entry || !entry.id || !entryNeedsAutoTags(entry)) return entry || null;
 
     const resolvedScene = scene || (entry.sceneId ? getScene(entry.sceneId) : null);
     const suggested = await suggestTags(entry, resolvedScene);
+    assertChat();
+    if (JSON.stringify(getEntry(entry.id)) !== snapshot) return getEntry(entry.id);
     const merged = mergeTags(entry.tags || [], suggested);
 
     if (merged.length > (entry.tags || []).length) {
@@ -237,36 +257,40 @@ export async function autoTagEntry(entry, scene = null) {
  * backfill: 5 sequential requests, then a 2.5s pause.
  *
  * @param {(done:number,total:number)=>void} [onProgress]
- * @returns {Promise<{total:number, tagged:number, failed:number, skipped:number}>}
+ * @returns {Promise<{total:number, tagged:number, failed:number, skipped:number,failedEntries:string[]}>}
  */
 export async function autoTagUntaggedEntries(onProgress) {
+    const assertChat = captureChatGuard();
     const profileName = getSetting("connections.memoryWriterLLM", "");
     if (!profileName) {
         toastr?.warning?.("No Memory Writer LLM configured. Set one in Settings > Connections.", "Memory Loom");
-        return { total: 0, tagged: 0, failed: 0, skipped: 0 };
+        return { total: 0, tagged: 0, failed: 0, skipped: 0, failedEntries: [] };
     }
 
     const all = getAllEntries();
-    const targets = all.filter(entry => needsAutoTags(entry));
+    const targets = all.filter(entry => entryNeedsAutoTags(entry));
     const total = targets.length;
 
     if (total === 0) {
         toastr?.info?.("No taggable memories need descriptive tags. Synthesis memories are skipped.", "Memory Loom");
-        return { total: 0, tagged: 0, failed: 0, skipped: all.length };
+        return { total: 0, tagged: 0, failed: 0, skipped: all.length, failedEntries: [] };
     }
 
     dlog(`Auto-tag: ${total} entries need descriptive tags (of ${all.length} total; synthesis skipped)`);
 
     let tagged = 0;
     let failed = 0;
+    const failedEntries = [];
 
     for (let i = 0; i < targets.length; i++) {
+        assertChat();
         const entry = targets[i];
         const scene = entry.sceneId ? getScene(entry.sceneId) : null;
 
         try {
             const beforeCount = Array.isArray(entry.tags) ? entry.tags.length : 0;
             const updated = await autoTagEntry(entry, scene);
+            assertChat();
             const afterCount = Array.isArray(updated?.tags) ? updated.tags.length : beforeCount;
 
             if (afterCount > beforeCount) {
@@ -278,9 +302,11 @@ export async function autoTagUntaggedEntries(onProgress) {
                 tagged++;
             } else {
                 failed++;
+                failedEntries.push(entry.title || entry.id || "Untitled");
             }
         } catch (err) {
             failed++;
+            failedEntries.push(entry.title || entry.id || "Untitled");
             console.error(`[ML] Auto-tag: request failed for \"${entry.title || entry.id}\":`, err);
         }
 
@@ -291,5 +317,5 @@ export async function autoTagUntaggedEntries(onProgress) {
         }
     }
 
-    return { total, tagged, failed, skipped: all.length - total };
+    return { total, tagged, failed, skipped: all.length - total, failedEntries };
 }

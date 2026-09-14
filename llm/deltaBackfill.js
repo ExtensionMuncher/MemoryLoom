@@ -1,3 +1,4 @@
+import { captureChatGuard } from "../lib/chatGuard.js";
 /**
  * llm/deltaBackfill.js — Backfill missing deltas
  *
@@ -15,7 +16,7 @@
  */
 
 import { makeRequest } from "./connections.js";
-import { getAllEntries, updateDelta } from "../data/entries.js";
+import { getAllEntries, getEntry, updateDelta } from "../data/entries.js";
 import { getScene } from "../data/scenes.js";
 import { getSetting } from "../settings.js";
 import { dlog } from "../lib/debug.js";
@@ -27,7 +28,7 @@ function isDeltaBlank(entry) {
     const b = String(d.before_state || "").trim();
     const a = String(d.after_state || "").trim();
     const x = String(d.delta || "").trim();
-    return !b && !a && !x;
+    return !b || !a || !x;
 }
 
 function buildSystemPrompt() {
@@ -76,7 +77,7 @@ function parseDelta(response) {
         const before = String(parsed.before_state || "").trim();
         const after = String(parsed.after_state || "").trim();
         const delta = String(parsed.delta || "").trim();
-        if (!before && !after && !delta) return null; // nothing usable
+        if (!before || !after || !delta) return null; // nothing usable
         return {
             before_state: before,
             after_state: after,
@@ -97,6 +98,7 @@ function parseDelta(response) {
  * @returns {Promise<{total:number, filled:number, failed:number, skipped:number}>}
  */
 export async function backfillMissingDeltas(onProgress) {
+    const assertChat = captureChatGuard();
     const profileName = getSetting("connections.memoryWriterLLM", "");
     if (!profileName) {
         toastr?.warning?.("No Memory Writer LLM configured. Set one in Settings > Connections.", "Memory Loom");
@@ -119,7 +121,9 @@ export async function backfillMissingDeltas(onProgress) {
     const PAUSE_MS = 2500;  // pause between bursts (rate-limit friendly)
 
     for (let i = 0; i < targets.length; i++) {
+        assertChat();
         const entry = targets[i];
+        const snapshot = JSON.stringify(entry);
         const scene = entry.sceneId ? getScene(entry.sceneId) : null;
         try {
             const resp = await makeRequest(
@@ -129,6 +133,8 @@ export async function backfillMissingDeltas(onProgress) {
                 maxTokens,
                 0.4
             );
+            assertChat();
+            if (JSON.stringify(getEntry(entry.id)) !== snapshot) continue;
             const delta = parseDelta(resp);
             if (delta) {
                 updateDelta(entry.id, delta);

@@ -8,7 +8,7 @@ It is built for long-form collaborative roleplay where continuity is the whole p
 
 ## What it does
 
-- **Writes memories from your scenes.** Mark a scene's start and end (or run a batch scan over existing chat), and a writer LLM distills it into concise third-person memory entries — one per pivotal moment, with concrete sensory detail rather than dry summary.
+- **Writes memories from your scenes.** Mark a scene's start and end (or run a batch scan over existing chat), and a writer LLM transforms pivotal moments into subjective third-person memories — keeping concrete anchors while prioritizing what the character retained, felt, inferred, and changed rather than replaying the scene as a synopsis.
 - **Retrieves the right memories at the right time.** Before each reply, a lightweight *sidecar* LLM reads the recent messages and figures out what's being discussed; an embedding model then surfaces the stored memories most relevant to that moment and injects them into context.
 - **Tracks the world, not just the cast.** A separate, stricter pass records *world memories* — the durable lore of your setting (factions, locations, rules, world-altering events) — kept apart from character memories and able to update itself as the world changes.
 - **Consolidates over time.** As memories pile up, you can fold groups of them into higher-level summaries, keeping the working set lean while preserving meaning.
@@ -83,7 +83,7 @@ All generated entries appear as **pending** on the Home tab — grouped by chara
 
 The Library tab is your memory store, organized into folders:
 
-- **Characters** — per-character subfolders, each with its own memories, optional banner image, and update history.
+- **Characters** — per-character subfolders, each with its own memories, optional banner image (upload/change/remove), aliases, and update history.
 - **World** — setting lore (see below).
 - **Plot** — arc-level summaries, including the products of consolidation.
 - **Custom folders** — make your own top-level folders and subfolders, with images and their own menu bars.
@@ -102,6 +102,8 @@ You can also run a dedicated **world scan** from the Debug settings, and add or 
 
 When memories accumulate, open the Consolidate popout, select the memories and/or scenes to fold together, and confirm. Memory Loom writes one consolidated memory per character over the selection plus a single arc summary in the Plot folder, then demotes the source memories (non-destructively — they stay retrievable at lower priority). World memories can be included in consolidation too.
 
+Consolidation is reversible. A consolidated source can be **Unsuppressed** to restore its normal retrieval priority without losing its provenance, then **Suppressed** again later. This also works for starred consolidation sources, including older imported entries that already carry consolidation provenance. **Undo Consolidation** is broader: it removes the generated consolidation outputs and restores the surviving source memories and scenes to their recorded pre-consolidation state.
+
 ### Recall tool
 
 If your chat backend supports tool calling, Memory Loom registers a `search_core_memories` function the model can call mid-reply to pull specific memories on demand, beyond what's auto-injected.
@@ -113,7 +115,7 @@ If your chat backend supports tool calling, Memory Loom registers a `search_core
 1. You send a message.
 2. The **sidecar** LLM reads recent context and extracts the characters, themes, and events in play.
 3. Those become a query against this chat's **vector collection**; the embedding model returns the closest-matching stored memories.
-4. Scoring applies your settings — similarity threshold, stickiness (a memory stays active for a few messages after firing), cooldown (a memory won't re-fire immediately), and optional decay (older memories gradually lose priority). Starred/important memories bypass decay and suppression.
+4. Scoring applies your settings — similarity threshold, stickiness (a memory stays active for a few messages after firing), cooldown (a memory won't re-fire immediately), and optional decay (older memories gradually lose priority). Starred/important memories normally keep their priority floor, but a starred consolidation source that you explicitly suppress uses the consolidated-source priority until you unsuppress it.
 5. The surviving memories are injected into the prompt, in the format and placement you chose.
 
 The **Debug → Last passive retrieval** report shows how the most recent run moved through those steps, including why a matched memory was filtered or lost to an injection cap.

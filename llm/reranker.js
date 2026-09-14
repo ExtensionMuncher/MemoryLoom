@@ -12,6 +12,7 @@ import { chat, name1 } from "../../../../../script.js";
 import { makeRequest } from "./connections.js";
 import { getSetting } from "../settings.js";
 import { dlog } from "../lib/debug.js";
+import { narrativeMessages } from "../lib/chatMessages.js";
 
 function getRerankSettings() {
     const cfg = getSetting("vectorization.rerank", {}) || {};
@@ -38,7 +39,7 @@ function stripHtml(text) {
 
 function buildRecentContext(depth) {
     if (!Array.isArray(chat) || !chat.length) return "";
-    return chat.slice(-depth).map(msg => {
+    return narrativeMessages(chat).slice(-depth).map(msg => {
         const speaker = msg?.is_user ? (name1 || "User") : (msg?.name || "Character");
         const text = stripHtml(msg?.mes).slice(0, 420);
         return `${speaker}: ${text}`;
@@ -208,7 +209,7 @@ export async function rerankCandidates(candidates, sidecarResult, queryText, inj
             0.1,
             {
                 // Reranking is optional. It must never retry itself into a long
-                // generation stall while the turn is waiting on retrieval.
+                // generation stall.
                 maxRetries: 0,
                 timeoutMs: cfg.timeoutMs,
                 suppressToasts: true,

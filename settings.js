@@ -1,3 +1,4 @@
+import { getChatData, persistChatData } from "./data/storage.js";
 /**
  * settings.js — Settings management for Memory Loom
  *
@@ -35,15 +36,15 @@ export async function initSettings() {
     // Deep merge: user values are preserved, new default fields are added
     const merged = deepMerge(defaults, current);
 
-    // Reset any saved prompt that isn't our current versioned format.
-    // We embed "[MLv4]" in our defaults — anything without it is stale.
+    // Migrate only the exact legacy built-in prompt value to the dynamic default.
+    // Never clear or rewrite an arbitrary custom prompt.
     const _ep = merged?.memoryWriting?.memoryEntryPrompt || "";
     const _sp = merged?.memoryWriting?.sceneSummaryPrompt || "";
-    if (_ep && !_ep.includes("[MLv4]")) {
+    if (_ep === defaults.memoryWriting.memoryEntryPrompt) {
         if (merged.memoryWriting) merged.memoryWriting.memoryEntryPrompt = "";
         console.log("[ML] Cleared stale memory entry prompt");
     }
-    if (_sp && !_sp.includes("[MLv4]")) {
+    if (_sp === defaults.memoryWriting.sceneSummaryPrompt) {
         if (merged.memoryWriting) merged.memoryWriting.sceneSummaryPrompt = "";
         console.log("[ML] Cleared stale scene summary prompt");
     }
@@ -131,8 +132,18 @@ export function setSidecarPaused(paused) {
     if (!extension_settings[NAMESPACE]) {
         extension_settings[NAMESPACE] = {};
     }
-    extension_settings[NAMESPACE].sidecarPaused = paused;
+    const next = Boolean(paused);
+    const previous = extension_settings[NAMESPACE].sidecarPaused === true;
+    extension_settings[NAMESPACE].sidecarPaused = next;
     saveSettingsDebounced();
+
+    // Pause/resume changes cadence state in index.js. Keep the setting module
+    // storage-only, but publish one guarded event so every UI entry point uses
+    // the same freeze/restore transaction.
+    if (previous !== next && typeof document !== "undefined") {
+        const jq = globalThis.jQuery || globalThis.$;
+        if (typeof jq === "function") jq(document).trigger("ml:sidecar-pause-changed", [next]);
+    }
 }
 
 // ─── Connection Profile Helpers ───────────────────────────
@@ -198,7 +209,7 @@ export async function exportAllData(chatData) {
     const data = {
         settings: getSettings(),
         chatData: chatData,
-        version: "0.1.0",
+        version: "0.1.18",
         exportedAt: new Date().toISOString(),
     };
     return JSON.stringify(data, null, 2);
@@ -212,68 +223,57 @@ export async function exportAllData(chatData) {
  * @returns {boolean} True if imported successfully
  */
 export async function importAllData(jsonString, options = {}) {
-    // options:
-    //   settingsMode: "overwrite" | "keep"  — replace global settings or leave current ones
-    //   dataMode:     "merge" | "replace"   — merge chat data into existing, or wipe + replace
-    // Backward-compatible: old exports may omit fields entirely. Anything absent
-    // is simply skipped, never assumed; arrays vs object maps are both handled.
     const { settingsMode = "keep", dataMode = "merge" } = options;
     try {
         const data = JSON.parse(jsonString);
-        if (!data || typeof data !== "object") throw new Error("Invalid file: not a JSON object");
-
-        // ── Settings (global) ──
-        if (data.settings && typeof data.settings === "object") {
-            if (settingsMode === "overwrite") {
-                storageSaveAllSettings(data.settings);
-            } else {
-                // keep current settings; only fill in fields the user doesn't have yet
-                const current = getSettings();
-                storageSaveAllSettings(deepMerge(data.settings, current));
+        const object = value => value && typeof value === "object" && !Array.isArray(value);
+        if (!object(data)) throw new Error("Import must be an object");
+        if (!["keep", "overwrite"].includes(settingsMode) || !["merge", "replace"].includes(dataMode)) throw new Error("Invalid import mode");
+        // Validate all collections before changing settings or chat data.
+        if (data.settings !== undefined && !object(data.settings)) throw new Error("Invalid settings");
+        if (data.chatData !== undefined && !object(data.chatData)) throw new Error("Invalid chat data");
+        const cd = data.chatData;
+        if (cd) {
+            for (const key of ["folders", "scenes"]) {
+                if (cd[key] !== undefined && (!Array.isArray(cd[key]) || cd[key].some(x => !object(x) || !x.id))) throw new Error(`Invalid ${key}`);
             }
-        }
-
-        // ── Chat data (per-chat) ──
-        if (data.chatData && typeof data.chatData === "object") {
-            const {
-                getEntries, saveEntries, getFolders, saveFolders,
-                getScenes, saveScenes, getConsolidations, saveConsolidations,
-                getPendingEntries, savePendingEntries, getChatData, persistChatData,
-            } = await import("./data/storage.js");
-            const cd = data.chatData;
-
-            if (dataMode === "replace") {
-                // Wipe + replace each present collection; absent ones left untouched
-                if (cd.entries !== undefined)        saveEntries(normalizeMap(cd.entries));
-                if (cd.folders !== undefined)        saveFolders(cd.folders || []);
-                if (cd.scenes !== undefined)         saveScenes(cd.scenes || []);
-                if (cd.consolidations !== undefined) saveConsolidations(normalizeMap(cd.consolidations));
-                if (cd.pendingEntries !== undefined) savePendingEntries(normalizePendingEntries(cd.pendingEntries));
-                importChatMetaFields(cd, getChatData(), "replace");
-                persistChatData();
-            } else {
-                // MERGE: keep everything existing, add/overlay imported items by id.
-                // Imported items win on id collision (they're the explicit import).
-                if (cd.entries !== undefined) {
-                    saveEntries(mergeById(getEntries(), normalizeMap(cd.entries)));
-                }
-                if (cd.consolidations !== undefined) {
-                    saveConsolidations(mergeById(getConsolidations(), normalizeMap(cd.consolidations)));
-                }
-                if (cd.folders !== undefined) {
-                    saveFolders(mergeArrayById(getFolders(), cd.folders || []));
-                }
-                if (cd.scenes !== undefined) {
-                    saveScenes(mergeArrayById(getScenes(), cd.scenes || []));
-                }
-                if (cd.pendingEntries !== undefined) {
-                    savePendingEntries(mergePendingEntries(getPendingEntries(), cd.pendingEntries));
-                }
-                importChatMetaFields(cd, getChatData(), "merge");
-                persistChatData();
+            for (const key of ["entries", "consolidations"]) {
+                if (cd[key] !== undefined && (!object(cd[key]) && !Array.isArray(cd[key]))) throw new Error(`Invalid ${key}`);
+                if (cd[key] !== undefined && Object.values(cd[key]).some(x => !object(x) || !x.id)) throw new Error(`Invalid ${key} record`);
             }
+            if (cd.pendingEntries != null && ((!object(cd.pendingEntries) && !Array.isArray(cd.pendingEntries)) || Object.values(cd.pendingEntries).some(x => !object(x)))) throw new Error("Invalid pending entries");
+            for (const key of ["stickiness", "cooldowns"]) {
+                if (cd[key] !== undefined && (!object(cd[key]) || Object.values(cd[key]).some(n => !Number.isFinite(n) || n < 0))) throw new Error(`Invalid ${key}`);
+            }
+            if (cd.messageCounter !== undefined && (!Number.isFinite(Number(cd.messageCounter)) || Number(cd.messageCounter) < 0)) throw new Error("Invalid message counter");
+            if (cd.worldScale !== undefined && typeof cd.worldScale !== "string") throw new Error("Invalid world scale");
+            if (cd.openSceneId !== undefined && cd.openSceneId !== null && typeof cd.openSceneId !== "string") throw new Error("Invalid open scene id");
+            if (cd.sidecarPauseCadence !== undefined && cd.sidecarPauseCadence !== null) {
+                if (!object(cd.sidecarPauseCadence)) throw new Error("Invalid sidecar pause cadence");
+                const live = Number(cd.sidecarPauseCadence.liveCount);
+                const baseline = Number(cd.sidecarPauseCadence.baseline);
+                if (!Number.isFinite(live) || !Number.isFinite(baseline) || live < 0 || baseline < 0 || baseline > live) throw new Error("Invalid sidecar pause cadence");
+            }
+            if (cd.lastSidecarRun !== undefined && cd.lastSidecarRun !== null && !object(cd.lastSidecarRun)) throw new Error("Invalid last sidecar run");
         }
-
+        const target = cd ? getChatData() : null;
+        const next = target ? (dataMode === "replace" ? emptyChatData() : structuredClone(target)) : null;
+        if (cd) {
+            for (const key of ["entries", "consolidations"]) if (cd[key] !== undefined) {
+                const incoming = normalizeMap(cd[key]);
+                next[key] = dataMode === "replace" ? incoming : mergeById(next[key], incoming);
+            }
+            for (const key of ["folders", "scenes"]) if (cd[key] !== undefined) next[key] = dataMode === "replace" ? cd[key] : mergeArrayById(next[key], cd[key]);
+            if (cd.pendingEntries !== undefined) next.pendingEntries = dataMode === "replace" ? normalizePendingEntries(cd.pendingEntries) : mergePendingEntries(next.pendingEntries, cd.pendingEntries);
+            importChatMetaFields(cd, next, dataMode);
+            if (next.openSceneId && !(next.scenes || []).some(s => s.id === next.openSceneId)) next.openSceneId = null;
+        }
+        const settings = data.settings
+            ? deepMerge(getDefaultSettings(), settingsMode === "overwrite" ? data.settings : deepMerge(data.settings, getSettings()))
+            : null;
+        // Everything above is staged; no async gap exists in the commit.
+        if (settings) storageSaveAllSettings(settings);
+        if (next) { Object.assign(target, next); persistChatData(); }
         console.log(`[ML] Import complete (settings: ${settingsMode}, data: ${dataMode})`);
         return true;
     } catch (err) {
@@ -339,6 +339,33 @@ function importChatMetaFields(source, target, mode) {
     if (source.cooldowns !== undefined) target.cooldowns = mergeById(replace ? {} : (target.cooldowns || {}), normalizeMap(source.cooldowns));
     if (source.worldScale !== undefined && (replace || !target.worldScale)) target.worldScale = String(source.worldScale || "");
     if (source.openSceneId !== undefined && (replace || !target.openSceneId)) target.openSceneId = source.openSceneId || null;
+    if (source.sidecarPauseCadence !== undefined) {
+        target.sidecarPauseCadence = source.sidecarPauseCadence === null
+            ? null
+            : {
+                liveCount: Math.max(0, Math.floor(Number(source.sidecarPauseCadence.liveCount))),
+                baseline: Math.max(0, Math.floor(Number(source.sidecarPauseCadence.baseline))),
+            };
+    }
+    if (source.lastSidecarRun !== undefined) target.lastSidecarRun = source.lastSidecarRun === null ? null : structuredClone(source.lastSidecarRun);
+}
+
+/** Clean per-chat baseline used by a true Replace import. */
+function emptyChatData() {
+    return {
+        entries: {},
+        folders: [],
+        scenes: [],
+        consolidations: {},
+        pendingEntries: null,
+        messageCounter: 0,
+        sidecarPauseCadence: null,
+        lastSidecarRun: null,
+        openSceneId: null,
+        stickiness: {},
+        cooldowns: {},
+        worldScale: "",
+    };
 }
 
 // Merge two id-keyed object maps; imported (source) wins on collision.

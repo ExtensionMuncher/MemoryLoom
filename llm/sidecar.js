@@ -12,6 +12,7 @@
 import { makeRequest } from "./connections.js";
 import { getSetting } from "../settings.js";
 import { chat, name1 } from "../../../../../script.js";
+import { narrativeMessages } from "../lib/chatMessages.js";
 
 /**
  * Extract keywords from recent chat context.
@@ -90,7 +91,7 @@ function buildSidecarUserPrompt(recentMessages) {
  */
 function getRecentMessages(count) {
     if (!chat || !Array.isArray(chat)) return "";
-    const recent = chat.slice(-count);
+    const recent = narrativeMessages(chat).slice(-count);
     return recent.map(msg => {
         const speaker = msg.is_user ? (name1 || "User") : (msg.name || "Character");
         const text = String(msg.mes || "").substring(0, 1000); // Truncate long messages

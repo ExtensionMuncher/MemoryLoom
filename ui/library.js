@@ -1,3 +1,5 @@
+import { canToggleSourceSuppression, isEligibleConsolidationSource, isSourceSuppressed, setSourceReleased } from '../data/consolidationSources.js';
+import { captureChatGuard } from "../lib/chatGuard.js";
 /**
  * ui/library.js — Library tab renderer
  *
@@ -18,10 +20,10 @@
 import { iconSvg } from "../lib/icons.js";
 import { getAllEntries, getEntriesByFolder, getEntry, updateEntry, deleteEntry, moveEntryToFolder, ENTRY_STATUSES } from "../data/entries.js";
 import { reEmbedEntry, deleteEntryVector, embedEntry } from "../embed/embedder.js";
-import { getAllFolders, getTopLevelFolders, getSubfolders, getFolder, getFolderIcon, getFolderButtons, isCharacterSubfolder, isGroupFolder, initDefaultFolders, setFolderAliases, deleteFolder } from "../data/folders.js";
+import { getAllFolders, getTopLevelFolders, getSubfolders, getFolder, getFolderIcon, getFolderButtons, isCharacterSubfolder, isGroupFolder, initDefaultFolders, setFolderAliases, deleteFolder, removeFolderImage } from "../data/folders.js";
 import { getAllScenes, getScene, deleteScene, updateSceneSummary, markSceneConsolidated } from "../data/scenes.js";
 import { getScenes, saveScenes } from "../data/storage.js";
-import { getConsolidation, updateConsolidation } from "../data/consolidations.js";
+import { getConsolidation, getAllConsolidations, updateConsolidation } from "../data/consolidations.js";
 
 // ─── Main Render ──────────────────────────────────────────
 
@@ -372,7 +374,7 @@ function applySortMode($container, mode) {
 /** Open the consolidation modal scoped to a single folder, so the user can pick
  *  which of that folder's memories to consolidate (rather than auto-selecting all). */
 async function consolidateFolderFlow(folder) {
-    const eligible = getEntriesByFolder(folder.id).filter(e => (e.status === "active" || e.status === "consolidation") && !e.excludeFromConsolidation && (e.category !== "world" || e.worldEvent === true));
+    const eligible = getEntriesByFolder(folder.id).filter(isEligibleConsolidationSource);
     if (eligible.length < 2) {
         toastr?.warning?.(`${folder.name || folder.characterName || "This folder"} has fewer than 2 eligible memories — nothing to consolidate.`);
         return;
@@ -633,9 +635,13 @@ function renderFolder(folder) {
                         : `${entries.length} ${entries.length === 1 ? "entry" : "entries"}`
                 }</span>
                 ${(folder.parentId && !["ml_folder_world","ml_folder_characters","ml_folder_plot"].includes(folder.id)) ? `
-                <button class="ml-icon-btn ml-subfolder-img-btn" title="Upload folder image" data-folder-id="${folder.id}" style="width:22px;height:22px">
+                <button class="ml-icon-btn ml-subfolder-img-btn" title="${folder.hasImage && folder.imagePath ? "Change folder image" : "Upload folder image"}" data-folder-id="${folder.id}" style="width:22px;height:22px">
                     ${iconSvg("ico-image", 12, 12, "#888")}
                 </button>
+                ${folder.hasImage && folder.imagePath ? `
+                <button class="ml-icon-btn ml-remove-folder-img-btn" title="Remove folder image" data-folder-id="${folder.id}" style="width:22px;height:22px;color:#b05b5b">
+                    ${iconSvg("ico-x", 12, 12, "#b05b5b")}
+                </button>` : ""}
                 <button class="ml-icon-btn ml-rename-folder-btn" title="Rename this folder" data-folder-id="${folder.id}" style="width:22px;height:22px">
                     ${iconSvg("ico-edit", 12, 12, "#888")}
                 </button>
@@ -665,6 +671,11 @@ function renderFolder(folder) {
         e.stopPropagation();
         $("#ml-img-upload").data("target-folder-id", folder.id);
         $("#ml-img-upload").click();
+    });
+
+    $folder.find(".ml-remove-folder-img-btn").on("click", async function (e) {
+        e.stopPropagation();
+        await removeFolderImageFlow(folder);
     });
 
     const $body = $folder.find(".ml-folder-body");
@@ -819,9 +830,13 @@ function renderCharacterSubfolder(folder) {
             </div>
             <div class="ml-btn-row">
                 ${buttons.showImageUpload ? `
-                    <button class="ml-icon-btn ml-crop-open-btn" title="Upload character image" data-folder-id="${folder.id}">
+                    <button class="ml-icon-btn ml-crop-open-btn" title="${folder.hasImage && folder.imagePath ? "Change character image" : "Upload character image"}" data-folder-id="${folder.id}">
                         ${iconSvg("ico-image", 14, 14, "#888")}
                     </button>
+                    ${folder.hasImage && folder.imagePath ? `
+                    <button class="ml-icon-btn ml-remove-folder-img-btn" title="Remove character image" data-folder-id="${folder.id}" style="color:#b05b5b">
+                        ${iconSvg("ico-x", 14, 14, "#b05b5b")}
+                    </button>` : ""}
                 ` : ""}
                 ${buttons.showNewEntry ? `
                     <button class="ml-icon-btn ml-char-new-entry-btn" title="Add memory entry" data-folder-id="${folder.id}">
@@ -846,6 +861,11 @@ function renderCharacterSubfolder(folder) {
         // Trigger hidden file input for image upload
         $("#ml-img-upload").data("target-folder-id", folder.id);
         $("#ml-img-upload").click();
+    });
+
+    $infoRow.find(".ml-remove-folder-img-btn").on("click", async (e) => {
+        e.stopPropagation();
+        await removeFolderImageFlow(folder);
     });
 
     // Wire new entry button
@@ -881,7 +901,7 @@ function renderCharacterSubfolder(folder) {
     const $aliasRow = $(`
         <div class="ml-alias-row">
             <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#888;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:4px">Name aliases</div>
-            <input type="text" class="ml-alias-input" placeholder="e.g. Jane, Janey, JD" value="${escapeHtml(aliasVal)}">
+            <input type="text" class="ml-alias-input" placeholder="e.g. Alex, Red, Captain" value="${escapeHtml(aliasVal)}">
             <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#666;margin-top:3px">Comma-separated · memories written under these names file into this folder</div>
         </div>
     `);
@@ -969,6 +989,7 @@ function buildDeltaDisplay(entry) {
 }
 
 function renderMemoryEntry(entry) {
+    const assertChat = captureChatGuard();
     const statusBadge = getStatusBadge(entry.status);
 
     // Build tags HTML
@@ -1017,6 +1038,7 @@ function renderMemoryEntry(entry) {
             </div>
             ${buildDeltaDisplay(entry)}` : ""}
             <div class="ml-btn-row">
+                ${canToggleSourceSuppression(entry) ? `<button class="ml-btn ml-source-release-btn">${isSourceSuppressed(entry) ? "Unsuppress" : "Suppress"}</button>` : ""}
                 <button class="ml-btn ml-edit-entry-btn" data-entry-id="${entry.id}">Edit</button>
                 ${entry.category === "character" && hasDelta(entry) ? '<button class="ml-btn ml-impact-btn" data-entry-id="' + entry.id + '">Show Impact</button>' : ''}
                 <button class="ml-btn ml-important-entry-btn" data-entry-id="${entry.id}">${entry.important ? "★ Core" : "☆ Mark core"}</button>
@@ -1047,6 +1069,21 @@ function renderMemoryEntry(entry) {
         if (this.checked) bulkSelected.add(entry.id);
         else bulkSelected.delete(entry.id);
         updateBulkBar();
+    });
+
+    $entry.find(".ml-source-release-btn").on("click", (event) => {
+        event.stopPropagation();
+        try {
+            assertChat();
+            const current = getEntry(entry.id);
+            if (current !== entry) throw new Error("Memory changed. Reopen it before editing.");
+            const released = isSourceSuppressed(current);
+            setSourceReleased(entry.id, released);
+            toastr?.success?.(released
+                ? "Memory restored to normal retrieval priority. Consolidation membership retained."
+                : "Memory retired to consolidated-source priority. Consolidation membership retained.");
+            renderLibraryTab($("#ml-p-library"));
+        } catch (error) { toastr?.warning?.(error.message, "Memory Loom"); }
     });
 
     // Edit button
@@ -1382,16 +1419,17 @@ function renderScenesView($pane) {
         if (typeof fn === "function") fn();
     }
 
-    // ── Consolidated scenes: grouped into per-consolidation folders ──
-    if (consolidatedScenes.length > 0) {
-        // group by the consolidation they were folded into
-        const groups = new Map();
-        for (const s of consolidatedScenes) {
-            if (!groups.has(s.consolidatedInto)) groups.set(s.consolidatedInto, []);
-            groups.get(s.consolidatedInto).push(s);
-        }
-        $container.append(`<div class="ml-scene-archive-hdr">Consolidated scene archive</div>`);
-        for (const [consId, members] of groups) {
+    // Render every consolidation record, even when it has zero archived scenes,
+    // so undo never disappears merely because a scene was deleted.
+    const consolidationGroups = new Map();
+    for (const cons of getAllConsolidations()) consolidationGroups.set(cons.id, []);
+    for (const s of consolidatedScenes) {
+        if (!consolidationGroups.has(s.consolidatedInto)) consolidationGroups.set(s.consolidatedInto, []);
+        consolidationGroups.get(s.consolidatedInto).push(s);
+    }
+    if (consolidationGroups.size > 0) {
+        $container.append(`<div class="ml-scene-archive-hdr">Consolidation archive</div>`);
+        for (const [consId, members] of consolidationGroups) {
             $container.append(renderConsolidatedSceneFolder(consId, members));
         }
     }
@@ -1425,6 +1463,8 @@ function renderConsolidatedSceneFolder(consolidationId, scenes) {
                 <textarea class="ml-form-textarea" id="ml-${fid}-summary" rows="4" style="margin-bottom:8px">${escapeHtml(folderSummary)}</textarea>
                 <div class="ml-btn-row" style="margin-bottom:10px">
                     <button class="ml-btn ml-${fid}-save">Save folder</button>
+                    ${cons ? `<button class="ml-btn ml-${fid}-undo">Undo consolidation</button>` : ""}
+                    ${scenes.length ? `<button class="ml-btn-danger ml-${fid}-delete-scenes">Delete archived ${scenes.length === 1 ? "scene" : "scenes"}</button>` : ""}
                 </div>
                 <div class="ml-scene-archive-members"></div>
             </div>
@@ -1451,6 +1491,31 @@ function renderConsolidatedSceneFolder(consolidationId, scenes) {
         }
     });
 
+    $folder.find(`.ml-${fid}-undo`).on("click", async function (e) {
+        e.stopPropagation();
+        const ok = await popup(`Undo <b>${escapeHtml(folderTitle)}</b>? Source memories and scenes will become eligible again. Generated consolidated memories and the arc summary will be removed.`);
+        if (!ok) return;
+        const { undoConsolidation } = await import("../llm/consolidationOrchestrator.js");
+        const result = await undoConsolidation(consolidationId);
+        if (!result) { toastr?.warning?.("Consolidation record not found."); return; }
+        toastr?.success?.(`Consolidation undone: restored ${result.restoredEntries} memories and ${result.restoredScenes} scenes; removed ${result.removedOutputs} generated outputs.`);
+        sceneBulkSelected.clear();
+        $(document).trigger("ml:scene-state-changed");
+        const $pane = $("#ml-p-library");
+        if ($pane.length) renderLibraryTab($pane);
+    });
+
+    $folder.find(`.ml-${fid}-delete-scenes`).on("click", async function (e) {
+        e.stopPropagation();
+        const ok = await popup(`Permanently delete ${scenes.length} archived ${scenes.length === 1 ? "scene" : "scenes"}? This leaves the consolidation and its memory outputs intact.`);
+        if (!ok) return;
+        for (const scene of scenes) deleteScene(scene.id);
+        sceneBulkSelected.clear();
+        $(document).trigger("ml:scene-state-changed");
+        const $pane = $("#ml-p-library");
+        if ($pane.length) renderLibraryTab($pane);
+    });
+
     // member scenes (each rendered as its normal card, still individually editable)
     const $members = $folder.find(".ml-scene-archive-members");
     scenes.forEach((scene, idx) => {
@@ -1467,7 +1532,7 @@ function renderConsolidatedSceneFolder(consolidationId, scenes) {
  * @returns {jQuery}
  */
 function renderSceneEntry(scene, sceneIndex) {
-    const mesRange = scene.messageEnd
+    const mesRange = scene.messageEnd !== null && scene.messageEnd !== undefined
         ? `msgs ${scene.messageStart}–${scene.messageEnd}`
         : `msg ${scene.messageStart}+`;
     const titleText = scene.sceneTitle || extractSceneTitle(scene.llmSummary);
@@ -1558,6 +1623,7 @@ const consolidateSelScenes = new Set();
  * @param {jQuery} $pane - the library pane (for re-render after consolidation)
  */
 function openConsolidateModal($pane, scopeFolderId = null) {
+    const assertChat = captureChatGuard();
     consolidateSelEntries.clear();
     consolidateSelScenes.clear();
 
@@ -1565,15 +1631,7 @@ function openConsolidateModal($pane, scopeFolderId = null) {
     // (products of a PRIOR consolidation — foldable into a higher-level arc).
     // EXCLUDES "consolidated" (already-demoted). Newest first.
     let entries = getAllEntries()
-        .filter(e => (e.status === "active" || e.status === "consolidation") && !e.excludeFromConsolidation)
-        // Exclude entries already used as a consolidation source. Starred sources
-        // keep "active" status (never demoted) so they'd otherwise reappear here
-        // every time — this marker keeps them out once consolidated.
-        .filter(e => !e.consolidatedSourceOf)
-        // World memories: only EVENTS (setting-altering, narrative) are worth
-        // consolidating. Static world FACTS are reference material with no arc to
-        // synthesize, so they're excluded from consolidation entirely.
-        .filter(e => e.category !== "world" || e.worldEvent === true)
+        .filter(isEligibleConsolidationSource)
         .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 
     // Folder-scoped consolidation: restrict to memories in this folder (or, for a
@@ -1601,6 +1659,7 @@ function openConsolidateModal($pane, scopeFolderId = null) {
     // (World/Plot/Character); custom-folder memories use the root custom folder's
     // own name so each custom folder becomes its own named section.
     function categoryOf(e) {
+        if (e.category === "world") return "World";
         const f = getAllFolders().find(ff => ff.id === e.folderId);
         if (f) {
             const root = getRootFolder(f);
@@ -1665,7 +1724,7 @@ function openConsolidateModal($pane, scopeFolderId = null) {
     };
 
     const entryRows = [
-        ...fixedOrder.map(g => renderGroup(g, g, CATEGORY_EMOJI[g])),
+        ...fixedOrder.map(g => renderGroup(g, g === "World" ? "World events" : g, CATEGORY_EMOJI[g])),
         ...customKeys.map(k => renderGroup(k, customMeta[k].name, customMeta[k].icon)),
     ].join("");
 
@@ -1701,7 +1760,7 @@ function openConsolidateModal($pane, scopeFolderId = null) {
             <div class="ml-modal ml-modal-consolidate">
                 <div>
                     <div class="ml-modal-title">${titleText}</div>
-                    <div class="ml-modal-sub">${subText}</div>
+                    <div class="ml-modal-sub">${subText} Only checked memories are consolidated. Selected scenes provide context; they do not silently select their memories. Static world facts are excluded.</div>
                 </div>
 
                 <div class="ml-consld-cols">
@@ -1732,8 +1791,8 @@ function openConsolidateModal($pane, scopeFolderId = null) {
         const $c = $modal.find("#ml-consld-count");
         $c.text(n === 0
             ? "Nothing selected"
-            : `${consolidateSelEntries.size} ${consolidateSelEntries.size === 1 ? "memory" : "memories"} · ${consolidateSelScenes.size} ${consolidateSelScenes.size === 1 ? "scene" : "scenes"} selected`);
-        $modal.find("#ml-consld-confirm").prop("disabled", n < 2);
+            : `${consolidateSelEntries.size} ${consolidateSelEntries.size === 1 ? "memory" : "memories"} · ${consolidateSelScenes.size} ${consolidateSelScenes.size === 1 ? "scene" : "scenes"} selected · ${entries.filter(e => consolidateSelEntries.has(e.id) && e.category === "world").length} world events`);
+        $modal.find("#ml-consld-confirm").prop("disabled", consolidateSelEntries.size < 2);
     }
 
     $modal.on("change", ".ml-consld-entry", function () {
@@ -1784,22 +1843,23 @@ function openConsolidateModal($pane, scopeFolderId = null) {
     $modal.find("#ml-consld-confirm").on("click", async function () {
         const entryIds = [...consolidateSelEntries];
         const sceneIds = [...consolidateSelScenes];
-        // Scenes also contribute their own member memories as entry sources, so a
-        // scene-heavy selection still surfaces the underlying memories. Dedup
-        // against explicitly-picked memories.
-        const sceneMemberIds = getAllEntries()
-            .filter(e => sceneIds.includes(e.sceneId))
-            .map(e => e.id);
-        const mergedEntryIds = [...new Set([...entryIds, ...sceneMemberIds])];
-        if (mergedEntryIds.length + sceneIds.length < 2) {
-            toastr?.warning?.("Select at least 2 sources to consolidate.");
+        try { assertChat(); } catch (error) { toastr?.warning?.(error.message, "Memory Loom"); return; }
+        const mergedEntryIds = entryIds;
+        if (mergedEntryIds.length < 2) {
+            toastr?.warning?.("Select at least 2 memories; scenes provide additional context.");
             return;
         }
         $(this).prop("disabled", true).text("Consolidating…");
-        const { runConsolidation } = await import("../llm/consolidationOrchestrator.js");
-        await runConsolidation({ entryIds: mergedEntryIds, sceneIds, mode: "mixed" });
-        closeConsolidateModal();
-        renderLibraryTab($pane);
+        try {
+            const { runConsolidation } = await import("../llm/consolidationOrchestrator.js");
+            assertChat();
+            const result = await runConsolidation({ entryIds: mergedEntryIds, sceneIds, mode: "mixed" });
+            assertChat();
+            if (!result) return;
+            closeConsolidateModal();
+            renderLibraryTab($pane);
+        } catch (error) { toastr?.error?.(error.message, "Memory Loom"); }
+        finally { $(this).prop("disabled", false).text("Consolidate selection"); }
     });
 
     // Append the modal INSIDE the Memory Loom popout if it's open, so it renders
@@ -1843,7 +1903,7 @@ function renderNewEntryModal($pane) {
                             <label class="ml-form-label">Date / Time</label>
                             <i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="ml-ne-datetime" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer;transition:all var(--animation-duration-2x,0.3s) ease-in-out"></i>
                         </div>
-                        <input class="ml-form-input" type="text" id="ml-ne-datetime" placeholder="e.g. Victorian Era · 1888 · dusk">
+                        <input class="ml-form-input" type="text" id="ml-ne-datetime" placeholder="e.g. Heian Era · ~1104 CE · dusk">
                     </div>
                 </div>
                 <div class="ml-form-group">
@@ -2064,7 +2124,7 @@ function renderNewFolderModal($pane) {
                 </div>
                 <div class="ml-form-group">
                     <label class="ml-form-label">Folder name</label>
-                    <input class="ml-form-input" type="text" id="ml-nf-name" placeholder="e.g. Victorian Era, Side Characters, Arcs…">
+                    <input class="ml-form-input" type="text" id="ml-nf-name" placeholder="e.g. Heian Era, Side Characters, Arcs…">
                 </div>
                 <div class="ml-form-group">
                     <label class="ml-form-label">Folder level</label>
@@ -2430,6 +2490,30 @@ export function closeModal(id) {
 // ─── Crop Helpers ─────────────────────────────────────────
 
 /**
+ * Remove a saved folder banner image after confirmation.
+ * Uses the existing folder image data operation so both the display flag and
+ * inline image data are cleared atomically from the current chat state.
+ *
+ * @param {object} folder
+ */
+async function removeFolderImageFlow(folder) {
+    if (!folder?.id) return;
+
+    const ok = await popup(`Remove the image from "${folder.name}"?`);
+    if (!ok) return;
+
+    const updated = removeFolderImage(folder.id);
+    if (!updated) {
+        toastr?.error?.("Could not remove folder image.");
+        return;
+    }
+
+    toastr?.success?.("Folder image removed.");
+    const $pane = $("#ml-p-library");
+    if ($pane.length) renderLibraryTab($pane);
+}
+
+/**
  * Open the crop dialog by triggering the hidden file input.
  */
 export function openCrop() {
@@ -2500,10 +2584,13 @@ function escapeHtml(str) {
     return div.innerHTML;
 }
 async function popup(msg) {
+    const assertChat = captureChatGuard();
     try {
         const ctx = window.SillyTavern?.getContext();
         if (ctx?.callGenericPopup) {
-            return await ctx.callGenericPopup(msg, ctx.POPUP_TYPE?.CONFIRM || "confirm", "");
+            const result = await ctx.callGenericPopup(msg, ctx.POPUP_TYPE?.CONFIRM || "confirm", "");
+            try { assertChat(); } catch { return false; }
+            return result;
         }
     } catch (e) {}
     return confirm(msg);
@@ -2597,4 +2684,3 @@ function syncContainersToVisibleEntries($container, forceOpen) {
         }
     });
 }
-

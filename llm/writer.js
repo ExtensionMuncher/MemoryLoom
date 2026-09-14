@@ -1,3 +1,4 @@
+import { captureChatGuard } from "../lib/chatGuard.js";
 /**
  * llm/writer.js — Memory Writer LLM
  *
@@ -16,16 +17,15 @@ import { makeRequest } from "./connections.js";
 import { getSetting } from "../settings.js";
 import { chat, name1 } from "../../../../../script.js";
 import { getContext } from "../../../../extensions.js";
-import { getScene, getPreviousSceneSummaries, updateSceneSummary } from "../data/scenes.js";
+import { getScene, getPreviousSceneSummaries, updateSceneSummary, updateSceneGeneration } from "../data/scenes.js";
 import { getPendingEntries, savePendingEntries } from "../data/storage.js";
 import { getAllEntries } from "../data/entries.js";
 
 
 import { resolveCanonicalCharacter } from "../data/folders.js";
+import { isNarrativeMessage } from "../lib/chatMessages.js";
 /**
- * Max tokens for writer/summary responses. Must be large enough to hold a
- * thinking model's reasoning AND its final answer — reasoning counts against
- * the same budget, and when it runs out the answer comes back empty or cut off.
+ * Max output tokens for writer/summary responses.
  */
 function getMaxResponseTokens() {
     const v = Number(getSetting("connections.maxResponseTokens", 8000));
@@ -43,6 +43,7 @@ function getMaxResponseTokens() {
  * @returns {Promise<string|null>} The generated summary, or null on failure
  */
 export async function generateSceneSummary(sceneId) {
+    const assertChat = captureChatGuard();
     const profileName = getSetting("connections.sceneSummaryLLM", "") || getSetting("connections.memoryWriterLLM", "");
     if (!profileName) {
         console.warn("[ML] Memory Writer LLM not configured");
@@ -65,10 +66,11 @@ export async function generateSceneSummary(sceneId) {
     const userPrompt = buildSceneSummaryUserPrompt(sceneMessages, previousSummaries);
 
     console.log(`[ML] Writer: generating scene summary for ${sceneId}...`);
-    // Thinking models burn output budget on reasoning BEFORE the answer — the cap
-    // must hold reasoning + answer combined. Configurable in Settings > Connections.
-    const summary = await makeRequest(profileName, systemPrompt, userPrompt, getMaxResponseTokens(), 0.7);
+    const summary = await makeRequest(profileName, systemPrompt, userPrompt, getMaxResponseTokens(), 0.7, {
+        requestLabel: "the scene summary",
+    });
 
+    assertChat();
     if (summary) {
         updateSceneSummary(sceneId, summary);
         console.log(`[ML] Writer: scene summary generated (${summary.length} chars)`);
@@ -85,6 +87,7 @@ export async function generateSceneSummary(sceneId) {
  * @returns {Promise<object[]|null>} Array of pending entry objects, or null on failure
  */
 export async function generateMemoryEntries(sceneId) {
+    const assertChat = captureChatGuard();
     const profileName = getSetting("connections.memoryWriterLLM", "");
     if (!profileName) return null;
 
@@ -98,14 +101,46 @@ export async function generateMemoryEntries(sceneId) {
     const userPrompt = buildMemoryEntryUserPrompt(scene.llmSummary, sceneMessages, previousSummaries);
 
     console.log(`[ML] Writer: generating memory entries for ${sceneId}...`);
-    const response = await makeRequest(profileName, systemPrompt, userPrompt, getMaxResponseTokens(), 0.75);
+    let response = await makeRequest(profileName, systemPrompt, userPrompt, getMaxResponseTokens(), 0.85, {
+        requestLabel: "character memory generation",
+    });
 
+    assertChat();
     if (!response) {
         console.warn("[ML] Writer: no response from LLM");
         return null;
     }
 
-    const entries = parseWriterResponse(response, sceneId);
+    let entries = parseWriterResponse(response, sceneId);
+
+    // Prompting alone is not reliable across writer models. If the draft contains
+    // a long verbatim run from the current scene or its generated reference note,
+    // give the model one targeted rewrite pass before it reaches Pending Memories.
+    if (entries?.length && hasDirectSourceCopy(entries, scene.llmSummary, sceneMessages)) {
+        console.warn(`[ML] Writer: detected source-copy pattern for ${sceneId}; requesting one rewrite pass.`);
+        await new Promise(resolve => setTimeout(resolve, 2500));
+        assertChat();
+
+        const repairPrompt = buildAntiCopyRepairPrompt(response, sceneMessages, previousSummaries);
+        const repaired = await makeRequest(profileName, systemPrompt, repairPrompt, getMaxResponseTokens(), 0.9, {
+            requestLabel: "memory anti-copy rewrite",
+        });
+
+        assertChat();
+        if (repaired) {
+            const repairedEntries = parseWriterResponse(repaired, sceneId);
+            if (repairedEntries?.length) {
+                response = repaired;
+                entries = repairedEntries;
+                if (hasDirectSourceCopy(entries, scene.llmSummary, sceneMessages)) {
+                    console.warn(`[ML] Writer: rewrite still contains substantial source overlap for ${sceneId}; leaving it for user review.`);
+                } else {
+                    console.log(`[ML] Writer: anti-copy rewrite passed for ${sceneId}.`);
+                }
+            }
+        }
+    }
+
     if (entries && entries.length > 0) {
         // Append to existing pending entries (don't overwrite during batch scan)
         const existing = getPendingEntries() || [];
@@ -126,49 +161,183 @@ export async function generateMemoryEntries(sceneId) {
  * @param {string} sceneId
  * @returns {Promise<object[]|null>}
  */
-export async function runWriterFlow(sceneId) {
+const writerFlowsInFlight = new Map();
+
+function hasSceneEntries(sceneId, category) {
+    const pending = getPendingEntries() || [];
+    const all = [...(getAllEntries() || []), ...(Array.isArray(pending) ? pending : Object.values(pending))];
+    return all.some(entry => entry?.sceneId === sceneId &&
+        (category === "world" ? entry.category === "world" : entry.category !== "world"));
+}
+
+function writerFailure(sceneId, stage, message, entries = [], worldEntries = []) {
+    const scene = getScene(sceneId);
+    const generation = scene?.generation || {};
+    const partial = generation.summary === "complete" || generation.memories === "complete" || generation.world === "complete";
+    updateSceneGeneration(sceneId, {
+        status: partial ? "partial" : "failed",
+        [stage]: "failed",
+        error: message,
+    });
+    return { ok: false, partial, stage, error: message, entries, worldEntries, sceneId };
+}
+
+async function executeWriterFlow(sceneId, options = {}) {
+    const assertChat = captureChatGuard();
     // Capture chat at start — if the user switches chats while the LLM is generating,
     // abort before writing, or we'd save this chat's results into the other chat's data.
     const flowChatId = getContext().chatId;
 
-    const summary = await generateSceneSummary(sceneId);
+    let scene = getScene(sceneId);
+    if (!scene) return { ok: false, partial: false, stage: "scene", error: "Scene not found.", entries: [], worldEntries: [], sceneId };
+
+    const retry = options.retry === true;
+    updateSceneGeneration(sceneId, { status: "running", error: "" });
+    let generation = getScene(sceneId)?.generation || {};
+    let madeRequest = false;
+    let entries = [];
+    let worldEntries = [];
+
+    const summaryAlreadyComplete = !!scene.llmSummary && (generation.summary === "complete" || retry);
+    let summary = scene.llmSummary || "";
+    if (!summaryAlreadyComplete) {
+        updateSceneGeneration(sceneId, { summary: "running" });
+        summary = await generateSceneSummary(sceneId);
+        madeRequest = true;
+    }
+    assertChat();
     if (getContext().chatId !== flowChatId) {
         console.warn("[ML] Writer flow aborted — chat changed during generation.");
-        return null;
+        return { ok: false, partial: false, stage: "cancelled", error: "Chat changed during generation.", entries, worldEntries, sceneId };
     }
     if (!summary) {
-        toastr?.error?.("Failed to generate scene summary. Check LLM connection.");
-        return null;
+        return writerFailure(sceneId, "summary", "Scene summary generation failed.", entries, worldEntries);
     }
+    updateSceneGeneration(sceneId, { summary: "complete" });
 
     // Space the two calls out — token-per-minute throttles (GLM Cloud) trip on
     // back-to-back large requests even when the request count is low.
-    await new Promise(r => setTimeout(r, 2500));
+    if (madeRequest) await new Promise(r => setTimeout(r, 2500));
 
-    const entries = await generateMemoryEntries(sceneId);
+    assertChat();
+    scene = getScene(sceneId);
+    generation = scene?.generation || {};
+    const memoriesAlreadyComplete = generation.memories === "complete" || (retry && hasSceneEntries(sceneId, "character"));
+    if (!memoriesAlreadyComplete) {
+        updateSceneGeneration(sceneId, { memories: "running" });
+        entries = await generateMemoryEntries(sceneId);
+        madeRequest = true;
+    }
     if (getContext().chatId !== flowChatId) {
         console.warn("[ML] Writer flow aborted — chat changed during generation.");
-        return null;
+        return { ok: false, partial: true, stage: "cancelled", error: "Chat changed during generation.", entries, worldEntries, sceneId };
     }
-    if (!entries) {
-        toastr?.error?.("Failed to generate memory entries. Check LLM connection.");
-        return null;
+    if (entries === null) {
+        return writerFailure(sceneId, "memories", "Character memory generation failed.", [], worldEntries);
     }
+    updateSceneGeneration(sceneId, { memories: "complete" });
 
     // World memories — separate, stricter pass. Usually produces nothing.
     // Spaced out like the other calls for rate-limit safety.
     if (getSetting("worldMemory.enabled", true)) {
-        await new Promise(r => setTimeout(r, 2500));
+        if (madeRequest) await new Promise(r => setTimeout(r, 2500));
         try {
             const { generateWorldMemories } = await import("./worldWriter.js");
-            const world = await generateWorldMemories(sceneId);
-            if (world && world.length > 0) {
-                toastr?.info?.(`${world.length} world ${world.length === 1 ? "memory" : "memories"} detected — pending review.`, "Memory Loom");
+            assertChat();
+            generation = getScene(sceneId)?.generation || {};
+            const worldAlreadyComplete = generation.world === "complete" || (retry && hasSceneEntries(sceneId, "world"));
+            if (!worldAlreadyComplete) {
+                updateSceneGeneration(sceneId, { world: "running" });
+                worldEntries = await generateWorldMemories(sceneId);
+                if (worldEntries === null) {
+                    return writerFailure(sceneId, "world", "World memory generation failed.", entries, []);
+                }
             }
-        } catch (e) { console.error("[ML] World memory generation failed:", e); }
+            updateSceneGeneration(sceneId, { world: "complete" });
+        } catch (e) {
+            if (e?.name === "MLStaleChatError") throw e;
+            console.error("[ML] World memory generation failed:", e);
+            return writerFailure(sceneId, "world", "World memory generation failed.", entries, []);
+        }
+    } else {
+        updateSceneGeneration(sceneId, { world: "skipped" });
     }
 
-    return entries;
+    updateSceneGeneration(sceneId, { status: "complete", error: "" });
+    return { ok: true, partial: false, stage: "complete", entries, worldEntries, sceneId };
+}
+
+/**
+ * Full scene-close writer flow. Concurrent retries for the same scene share one
+ * promise so a double click cannot issue duplicate LLM calls or pending cards.
+ */
+export function runWriterFlow(sceneId, options = {}) {
+    const flowKey = `${getContext()?.chatId || "no-chat"}::${sceneId}`;
+    if (writerFlowsInFlight.has(flowKey)) return writerFlowsInFlight.get(flowKey);
+    const task = executeWriterFlow(sceneId, options).catch((error) => {
+        if (error?.name === "MLStaleChatError") throw error;
+        console.error(`[ML] Writer flow failed for ${sceneId}:`, error);
+        const generation = getScene(sceneId)?.generation || {};
+        const stage = ["summary", "memories", "world"].find(key => generation[key] === "running") || "writer";
+        return writerFailure(sceneId, stage, error?.message || "Memory generation failed.");
+    }).finally(() => {
+        if (writerFlowsInFlight.get(flowKey) === task) writerFlowsInFlight.delete(flowKey);
+    });
+    writerFlowsInFlight.set(flowKey, task);
+    return task;
+}
+
+// ─── Memory quality guard ─────────────────────────────────
+
+function normalizeOverlapTokens(text) {
+    return String(text || "")
+        .toLowerCase()
+        .replace(/[“”"'’`*_~()[\]{}<>]/g, " ")
+        .replace(/[^\p{L}\p{N}-]+/gu, " ")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+}
+
+function containsSharedTokenRun(source, candidate, runLength = 14) {
+    const src = normalizeOverlapTokens(source);
+    const cand = normalizeOverlapTokens(candidate);
+    if (src.length < runLength || cand.length < runLength) return false;
+
+    const sourceRuns = new Set();
+    for (let i = 0; i <= src.length - runLength; i++) {
+        sourceRuns.add(src.slice(i, i + runLength).join(" "));
+    }
+    for (let i = 0; i <= cand.length - runLength; i++) {
+        if (sourceRuns.has(cand.slice(i, i + runLength).join(" "))) return true;
+    }
+    return false;
+}
+
+export function hasDirectSourceCopy(entries, sceneSummary, sceneMessages) {
+    for (const entry of (entries || [])) {
+        const content = String(entry?.content || "");
+        if (!content) continue;
+        // The generated summary is short and synthetic, so a 12-word run is
+        // suspicious. Raw scenes get a slightly looser 14-word threshold so
+        // names and a single memorable phrase do not create false positives.
+        if (containsSharedTokenRun(sceneSummary, content, 12)) return true;
+        if (containsSharedTokenRun(sceneMessages, content, 14)) return true;
+    }
+    return false;
+}
+
+function buildAntiCopyRepairPrompt(draft, messages, previousSummaries) {
+    let prompt = `QUALITY REPAIR REQUIRED. Your previous draft failed because it reproduced source wording and/or followed the source scene like a recap. Rewrite FROM SCRATCH.\n\nABSOLUTE REPAIR RULES:\n- Do not reuse long phrases, sentence structures, or narration from the source.\n- Do not preserve the source scene's chronological sequence.\n- Keep only 1-3 concrete remembered anchors; compress or omit the rest of the external action.\n- Move inward: emphasize what the Primary Character privately made of the moment, including associations, contradictions, judgments, desire, resentment, fear, tenderness, denial, fixation, or uncertainty.\n- A subjective interpretation may be wrong; frame it as the Primary Character's belief rather than objective truth.\n- The result must read like remembered psychological significance, not a polished recap.\n\nFAILED DRAFT (do not copy its prose):\n${draft}\n\nSOURCE SCENE (facts only; do not copy wording):\n${messages}\n`;
+    if (previousSummaries?.length) {
+        const recent = previousSummaries.slice(-3);
+        prompt += "\nOLDER CONTINUITY CONTEXT (background only; do not copy its prose):\n";
+        recent.forEach((item, i) => {
+            prompt += `Earlier ${i + 1}: ${String(item).substring(0, 220)}\n`;
+        });
+    }
+    prompt += "\nNow output the rewritten Core Memory using the exact required field format.";
+    return prompt;
 }
 
 // ─── Regeneration ─────────────────────────────────────────
@@ -187,7 +356,9 @@ export async function regenerateEntry(entry, guidance = "") {
     const systemPrompt = resolveMemoryEntryPrompt();
     const userPrompt = buildRegenerationPrompt(entry, guidance);
 
-    const response = await makeRequest(profileName, systemPrompt, userPrompt, getMaxResponseTokens(), 0.8);
+    const response = await makeRequest(profileName, systemPrompt, userPrompt, getMaxResponseTokens(), 0.8, {
+        requestLabel: "memory regeneration",
+    });
     if (!response) return null;
 
     const entries = parseWriterResponse(response, entry.sceneId);
@@ -196,20 +367,27 @@ export async function regenerateEntry(entry, guidance = "") {
 
 // ─── Prompt Builders ──────────────────────────────────────
 
-function buildInterpretationGroundingRules() {
-    return `INTERPRETATION GROUNDING — ABSOLUTE RULES:
+function buildSceneGroundingRules() {
+    return `SCENE REFERENCE GROUNDING — ABSOLUTE RULES:
+- This pass is a factual continuity note, not a Core Memory and not an interpretation exercise.
 - Treat explicit narration, dialogue, and stated motives as higher-confidence evidence than dramatic tone, genre convention, or the apparent effectiveness of an action.
-- Do NOT upgrade fear, desperation, panic, confusion, impulsiveness, self-preservation, dissociation, or reactive behavior into confidence, courage, strategy, dominance, manipulation, competence, or calculated control unless the source text explicitly establishes that interpretation.
-- Planning one part of a situation does not make every later reaction planned. Preserve the boundary between deliberate setup and improvised survival.
-- Do not make a character more composed, sinister, romantic, insightful, strategic, or “badass” than the source supports.
-- Preserve uncertainty and mixed motives when the source is uncertain. Never convert an inference into a confirmed inner truth.
-- SUBJECTIVE MISINTERPRETATION IS ALLOWED: an NPC may misunderstand another character, assign the wrong motive, or form a distorted conclusion when that belief is plausible from what the NPC actually perceived. Preserve that as the NPC's belief, suspicion, fear, assumption, or interpretation. Do NOT silently correct the NPC into omniscience.
-- Keep subjective belief separate from objective scene fact. Write \"the character became convinced every step had been planned\" rather than \"every step had been planned\" when the source establishes only that character's conclusion. Explicit narration or the other character's stated motive still governs what actually happened.
-- When concrete behavior conflicts with an interpretive flourish, anchor objective claims to the concrete behavior and the character's explicitly stated experience.`;
+- Preserve the difference between what objectively happened and what a character merely believed, feared, suspected, or inferred.
+- Do not invent motives, hidden competence, strategy, romance, composure, or emotional certainty that the source does not establish.
+- Preserve uncertainty and mixed motives when the scene is uncertain.`;
+}
+
+function buildMemoryGroundingRules() {
+    return `CORE MEMORY GROUNDING — SUBJECTIVITY WITHOUT OMNISCIENCE:
+- A Core Memory is SUBJECTIVE by design. The Primary Character may interpret, misinterpret, romanticize, resent, fear, idealize, distrust, project onto, or assign meaning to what they experienced. Those private conclusions are often the point of the memory.
+- Keep subjective belief separate from objective fact. If the Primary Character thinks another person planned something, write that they suspected, believed, or became convinced of it unless the source actually confirms the plan.
+- Never state another character's unstated inner feelings, motives, or realizations as objective truth. The Primary Character may infer them from behavior and may be wrong.
+- Explicit narration and stated motives still govern objective scene facts. Do not rewrite panic as tactical brilliance, desperation as dominance, confusion as insight, or reactive survival as calculated control unless the source supports it.
+- Do NOT flatten the Primary Character's own psychology in the name of caution. Their remembered shame, desire, jealousy, tenderness, anger, fascination, dread, rationalization, denial, associations, and private contradictions are valid material when supported by their viewpoint, behavior, established characterization, or a plausible subjective reading of what they perceived.
+- Preserve uncertainty when uncertainty itself matters: "he couldn't decide whether..." is better than falsely resolving the character's conflict.`;
 }
 
 function buildDefaultSceneSummaryPrompt() {
-    return `[MLv4] Write a factual scene reference note. Start with:
+    return `[MLv5] Write a factual scene reference note. Start with:
 
 Title: [3-6 word evocative title]
 
@@ -217,7 +395,22 @@ Then 2-3 paragraphs reporting what happened, in the exact order it occurred. Inc
 }
 
 function buildDefaultMemoryEntryPrompt() {
-    return `[MLv4] Pause and review the scene. Create a Core Memory using this exact format. Memories belong ONLY to NPCs. {{user}} is the human player: NEVER write an entry whose Primary Character is {{user}}, and never write an unattributed entry or one labelled "Unknown" as a workaround. If a moment matters only to {{user}} with no NPC present, skip it entirely — it is not a Core Memory, and you must output nothing for it rather than inventing a placeholder or explanatory Primary Character. This restriction applies ONLY to the Primary Character field — to who OWNS the memory. Within the Content, Before, After, and Delta, write about {{user}} freely, naturally, and BY NAME, exactly as you would any other character. Never avoid, soften, or talk around {{user}}'s name — a memory about an NPC's bond with {{user}} should name {{user}} as plainly as it names anyone else:
+    return `[MLv5] CORE MEMORY WRITER — THIS IS NOT A SCENE SUMMARY.
+
+Pause and review the scene. Create a Core Memory from what the Primary Character would actually RETAIN: the emotionally defining beat, the details that snagged in their attention, the private interpretation they carried away, and the way the moment changed or complicated how they understood someone, themselves, or the situation.
+
+TRANSFORMATION REQUIREMENT — ABSOLUTE:
+- Do NOT retell the scene from beginning to end. Do NOT walk through every action in chronological order.
+- Do NOT copy or lightly rewrite source narration, scene-summary prose, or surrounding prose. Never reproduce narration verbatim.
+- Dialogue may be quoted only when the exact wording itself is memorable, and then use at most ONE brief line. Otherwise paraphrase it through the Primary Character's recollection.
+- Select only 1-3 concrete anchors from the event (a gesture, image, sensation, object, line, silence, expression, etc.). Use those anchors as the doorway into the Primary Character's internal meaning-making.
+- The majority of Content should be transformed memory: sensory association, emotional precision, private judgment, rationalization, contradiction, desire, resentment, fear, tenderness, suspicion, embarrassment, fixation, or a changed understanding. It should sound like a person remembering what MATTERED, not a recorder logging what HAPPENED.
+- If the Content could substitute for a scene recap, synopsis, or transcript, it has failed. Rewrite it around significance rather than chronology.
+- Use rich, specific, sensory and emotionally precise prose. Psychological significance is the priority; factual scene details are supporting evidence.
+
+Memories belong ONLY to NPCs. {{user}} is the human player: NEVER write an entry whose Primary Character is {{user}}, and never write an unattributed entry or one labelled "Unknown" as a workaround. If a moment matters only to {{user}} with no NPC present, skip it entirely. This restriction applies ONLY to who OWNS the memory. Within Content, Before, After, and Delta, write about {{user}} freely, naturally, and BY NAME exactly as you would any other character.
+
+Use this exact format:
 
 **Title**:
 **Date/Time**:
@@ -231,20 +424,30 @@ function buildDefaultMemoryEntryPrompt() {
 **After**:
 **Delta**:
 
-Every field must be filled in — including Before, After, and Delta on every entry — with ONE exception: Key Character. Primary Character is the full name of the NPC this memory belongs to — never blank, never "Unknown", never {{user}}. If no present NPC can own the memory, do not write the entry at all. Key Character lists OTHER characters who are ACTIVELY present and participating in the moment (including the human player's character by name). It is the only optional field: if the memory is a private moment — the Primary Character alone with their thoughts, reflecting, observing, or acting unwitnessed — leave Key Character empty. Being the SUBJECT of the Primary Character's reflection does not make someone a Key Character: a character who is asleep, absent, or merely being thought about is not a participant in the memory. In the Content, use a character's FULL name at most once — the first time they appear, and only if it reads naturally for the viewpoint character (e.g. a first meeting). After that first mention, use their given name or a pronoun. Never repeat a full name in entry after entry or sentence after sentence; it reads robotic. For the player character especially, a single natural full-name introduction is plenty, then just the given name.
+Every field must be filled in except Key Character. Primary Character is the full name of the NPC this memory belongs to — never blank, never "Unknown", never {{user}}. If no present NPC can own the memory, do not write the entry. Key Character lists OTHER characters who are actively present and participating in the remembered moment. A person merely being thought about is not a Key Character. In Content, use a character's full name at most once, when it reads naturally; afterward use their given name or pronouns so the prose does not become robotic.
 
-Write in THIRD PERSON LIMITED, past tense — never first person (no I/me/my) and never second person (no you/your) anywhere, including Before, After, and Delta. The narration is limited to the Primary Character's knowledge: never state what the human player's character feels or realizes — the Primary Character can only observe what they outwardly say and do.
+Write in THIRD PERSON LIMITED, past tense — never first person and never second person. The narration is limited to the Primary Character's knowledge and subjectivity.
 
-End the Content with what this moment became for the character — the dynamic it established, the private reminder it left, the desire or unease it planted, the view it changed. The final sentence should carry the lasting consequence, the way a person privately understands why a memory stuck with them. Without this, it is a summary, not a memory.
+CONTENT SHAPE:
+- Open near the remembered pressure point, not with setup copied from the scene.
+- Let concrete details appear only where the Primary Character would attach meaning to them.
+- Move inward quickly. The entry should reveal why THIS detail or exchange lodged in THIS character.
+- End with the private consequence: the dynamic it established, the desire or unease it planted, the belief it changed, the role the character realized they were taking on, or the contradiction they could no longer ignore.
 
-This is a multi-character roleplay with no narrator — characters come and go, so the character in the chat title may be absent here. Choose a Primary Character who is actually present in the scene.
+BEFORE / AFTER / DELTA:
+- These are psychological-state fields, NOT miniature plot summaries.
+- Before: the relevant belief, expectation, emotional posture, or relationship assumption immediately before the defining moment.
+- After: what the character now believes, fears, wants, notices, or can no longer dismiss.
+- Delta: name the actual internal shift in concise language. Do not repeat the scene chronology.
 
-A scene may yield more than one Core Memory, if narratively necessary:
-- Several characters sharing a pivotal moment can each walk away with their own memory of it — same event, different perspective, different takeaway.
-- A SINGLE character can form multiple Core Memories from one scene when they experience more than one defining moment within it. Do not merge distinct defining moments into one entry — give each its own.
-Write one complete entry per memory. Every entry must fill in ALL fields, including Before, After, and Delta — no entry may omit them. Separate entries with a line containing only: ---
+This is a multi-character roleplay with no narrator. Choose a Primary Character who is actually present in the scene.
 
-Just as a scene can yield several memories, it can also yield none. If no meaningful Core Memory exists for any present character, reply with only: [NO MEMORY]`;
+A scene may yield more than one Core Memory when genuinely necessary:
+- Different present characters can retain the same event differently.
+- One character can form multiple memories only when the scene contains distinct defining moments that should not be merged.
+Separate complete entries with a line containing only: ---
+
+If no meaningful Core Memory exists for any present character, reply with only: [NO MEMORY]`;
 }
 
 function buildSceneSummaryUserPrompt(messages, previousSummaries) {
@@ -263,16 +466,18 @@ function buildSceneSummaryUserPrompt(messages, previousSummaries) {
 }
 
 
-function buildMemoryEntryUserPrompt(sceneSummary, messages, previousSummaries) {
-    let prompt = "Scene summary:\n" + (sceneSummary || "N/A") + "\n\n";
-    prompt += "Scene messages:\n" + messages + "\n\n";
+function buildMemoryEntryUserPrompt(_sceneSummary, messages, previousSummaries) {
+    // Do not feed the freshly generated chronological scene summary back into
+    // the memory writer. Models were treating it as ready-made prose to remix.
+    // The raw scene is evidence; older summaries are continuity context only.
+    let prompt = "SOURCE SCENE — EVIDENCE ONLY. Transform it into remembered significance; do not copy its narration or retell it chronologically:\n\n" + messages + "\n\n";
     if (previousSummaries.length > 0) {
-        prompt += "Previous scene summaries:\n";
-        previousSummaries.forEach((s, i) => {
-            prompt += `Scene ${i + 1}: ${s.substring(0, 200)}...\n`;
+        prompt += "OLDER SCENE CONTINUITY (background only; do not copy its wording):\n";
+        previousSummaries.slice(-3).forEach((item, i) => {
+            prompt += `Earlier ${i + 1}: ${String(item).substring(0, 200)}...\n`;
         });
     }
-    prompt += "\nReview the scene above and create the Core Memory.";
+    prompt += "\nCreate the Core Memory now. Do not summarize the scene; select the pressure point and transform it through the Primary Character's subjectivity.";
 
     // Title-diversity guard: if recent memory titles cluster around a repeated
     // opening (e.g. many "The Weight of…"), tell the model to avoid it. Gated by
@@ -286,21 +491,26 @@ function buildMemoryEntryUserPrompt(sceneSummary, messages, previousSummaries) {
 
     const banned = getBannedPrimaries();
     if (banned.length > 0) {
-        prompt += ` FINAL RULE, overriding everything else: never create a memory whose Primary Character is ${banned.join(" or ")}. This governs ONLY the Primary Character field — inside a memory's Content, refer to them freely and by full name like any other character; never avoid or dance around their names. They are valid Key Characters. If a defining moment belongs solely to them — with no NPC present — that is not a memory: SKIP it and output nothing for it. Do NOT write an entry with an empty, placeholder, "Unknown", or explanatory Primary Character (for example, never write something like "(No NPC present...)" in the name field). The Primary Character field must contain a real NPC name or the entry must not exist.`;
+        prompt += ` FINAL RULE, overriding everything else: never create a memory whose Primary Character is ${banned.join(" or ")}. This governs ONLY the Primary Character field — inside a memory's Content, refer to them freely and by full name like any other character; never avoid or dance around their names. They are valid Key Characters. If a defining moment belongs solely to them — with no NPC present — that is not a memory: SKIP it and output nothing for it. Do NOT write an entry with an empty, placeholder, "Unknown", or explanatory Primary Character. The Primary Character field must contain a real NPC name or the entry must not exist.`;
     }
     return prompt;
 }
 
 export function resolveMemoryEntryPrompt() {
-    const saved = getSetting("memoryWriting.memoryEntryPrompt", "");
-    const prompt = (saved && saved.includes("[MLv4]")) ? saved : buildDefaultMemoryEntryPrompt();
-    return substituteUserMacro(`${prompt}\n\n${buildInterpretationGroundingRules()}`);
+    const saved = String(getSetting("memoryWriting.memoryEntryPrompt", "") || "").trim();
+    // A custom prompt is a real override. Do not append hidden house rules to it.
+    if (saved) return substituteUserMacro(saved);
+    return substituteUserMacro(`${buildDefaultMemoryEntryPrompt()}
+
+${buildMemoryGroundingRules()}`);
 }
 
 export function resolveSceneSummaryPrompt() {
-    const saved = getSetting("memoryWriting.sceneSummaryPrompt", "");
-    const prompt = (saved && saved.includes("[MLv4]")) ? saved : buildDefaultSceneSummaryPrompt();
-    return substituteUserMacro(`${prompt}\n\n${buildInterpretationGroundingRules()}`);
+    const saved = String(getSetting("memoryWriting.sceneSummaryPrompt", "") || "").trim();
+    if (saved) return substituteUserMacro(saved);
+    return substituteUserMacro(`${buildDefaultSceneSummaryPrompt()}
+
+${buildSceneGroundingRules()}`);
 }
 
 // The {{user}} macro is only substituted by ST inside the chat pipeline — raw API
@@ -329,12 +539,14 @@ function buildRegenerationPrompt(entry, guidance) {
 /**
  * Sanitize a raw Key Character value. Models love to dodge "leave it blank" by
  * writing an explanatory sentence into the field — e.g.
- * "(None—Rin is alone in her chambers, reflecting on secondhand information)".
+ * "(None—Alex is alone in their room, reflecting on secondhand information)".
  * That is noise the user then has to delete by hand. This drops any token that
  * is a "none"-style placeholder or reads like prose rather than a name, and
  * returns a clean array (often empty, which is valid for Key Characters).
  */
 function sanitizeKeyCharacters(list) {
+    if (typeof list === "string") list = list.split(/\s*,\s*|\s+and\s+/i);
+    if (!Array.isArray(list)) list = [];
     const out = [];
     for (let raw of (list || [])) {
         let n = String(raw || "").replace(/\*+/g, "").trim();
@@ -348,6 +560,11 @@ function sanitizeKeyCharacters(list) {
         out.push(resolveCanonicalCharacter(n));
     }
     return out;
+}
+
+function normalizeStringList(value) {
+    const values = Array.isArray(value) ? value : String(value || "").split(/\s*,\s*/);
+    return values.map(item => String(item || "").trim()).filter(Boolean);
 }
 
 /**
@@ -380,10 +597,11 @@ function normalizePrimaries(raw) {
  */
 export function getSceneMessages(scene, includeHidden = false) {
     if (!chat || !Array.isArray(chat)) return "";
-    let msgs = chat.slice(scene.messageStart, (scene.messageEnd || chat.length) + 1);
-    // Scans that explicitly want EVERYTHING in range (world scan) pass
-    // includeHidden=true so hidden-message markers are ignored, as intended.
-    if (!includeHidden) msgs = msgs.filter(msg => !(msg.is_system && msg.extra?.hidden));
+    const end = scene.messageEnd ?? (chat.length - 1);
+    let msgs = chat.slice(scene.messageStart, end + 1);
+    // Utility/tool/tracker/summary records are never narrative evidence, even
+    // for world scans. includeHidden is retained for API compatibility only.
+    msgs = msgs.filter(isNarrativeMessage);
 
     // Total budget so one request can never explode past provider token limits.
     // Normal scenes (under ~12k chars total) pass through with full prose.
@@ -409,8 +627,8 @@ export function getSceneMessages(scene, includeHidden = false) {
 // Hard backstop: discard any entry that cannot be attributed to a real NPC.
 // Catches blank primaries, "Unknown"/"None"/"N/A" placeholders, the literal
 // {{user}} macro, the player persona's full name, AND any single token of the
-// persona name (so "Doe" alone is caught when the persona is "Jane
-// Doe"). The prompt tells the model not to write these; this guarantees
+// persona name (so "Alex" alone is caught when the persona is "Morgan
+// Alex"). The prompt tells the model not to write these; this guarantees
 // none survive even when the model ignores that.
 /**
  * Returns title openings (first 2 words) that are over-represented in the
@@ -459,7 +677,7 @@ function isPlayerOrUnknownEntry(primary) {
     if (["unknown", "none", "n/a", "na", "{{user}}", "user", "the human player", "player"].includes(p)) return true;
     // Prose-evasion guard: models try to dodge the ban by writing an explanatory
     // sentence INTO the name field, e.g. "(No NPC present—this moment belongs
-    // solely to Jane Doe)". Any primary that talks about absence of an
+    // solely to Morgan Alex)". Any primary that talks about absence of an
     // NPC, or reads like a sentence rather than a name, is rejected outright.
     if (/\bno\s+(npc|character|one)\b|belongs\s+solely|only\s+(the\s+)?(user|player)|solely\s+to\b/i.test(p)) return true;
     if (p.length > 40 || /[.!?;]|—|--/.test(p)) return true; // names aren't sentences
@@ -496,7 +714,7 @@ function parseWriterResponse(response, sceneId) {
     // If the FIRST entry header appears deep into the text, everything before it is
     // reasoning preamble — cut it. Using the first occurrence preserves ALL entries
     // (lastIndexOf previously discarded every entry except the final one).
-    const firstTitle = response.search(/\*\*\s*Title\s*\*\*\s*:/i);
+    const firstTitle = response.search(/(?:\*\*|__)?\s*Title\s*(?:(?:\*\*|__)\s*:|:\s*(?:\*\*|__)?)/i);
     if (firstTitle > 200) {
         response = response.slice(firstTitle);
     }
@@ -508,19 +726,20 @@ function parseWriterResponse(response, sceneId) {
     // We must NOT trip on the phrase appearing deep inside a real entry, and we must
     // not trip when a real **Title**/**Content** entry is present.
     const cleaned = response.trim().replace(/[\[\]*_`#]/g, "").toLowerCase().trim();
-    const hasRealEntry = /\*\*\s*(title|content|primary)\s*\*\*\s*:/i.test(response);
+    const hasRealEntry = /(?:\*\*|__)?\s*(title|content|primary character)\s*(?:(?:\*\*|__)\s*:|:\s*(?:\*\*|__)?)/i.test(response);
     const noMemExact = cleaned === "no memory" || cleaned === "no memory needed" ||
         cleaned === "none" || cleaned === "no core memory" || cleaned === "no entry";
     const noMemLeading = /^(no memory|no core memory|no entry)\b/.test(cleaned) && cleaned.length < 120;
     if (!hasRealEntry && (noMemExact || noMemLeading)) {
         console.log("[ML] Writer: model returned [NO MEMORY] for " + sceneId + " — no entry created");
-        return null;
+        return [];
     }
     try {
         // Only treat as JSON if the response actually STARTS with a JSON array
         // (after optional code fence). Otherwise a stray "[NPC]" or "[NO MEMORY]"
         // token inside prose would be mis-detected as JSON and throw.
         const fenced = response.replace(/^```(?:json)?\s*/i, "").trim();
+        if (/^\[\s*\]\s*(?:```)?$/.test(fenced)) return [];
         const looksLikeJson = fenced.startsWith("[{") || /^\[\s*\{/.test(fenced);
         const jsonMatch = looksLikeJson ? fenced.match(/\[[\s\S]*\]/) : null;
         if (!jsonMatch) {
@@ -535,7 +754,7 @@ function parseWriterResponse(response, sceneId) {
         }
 
         // Normalize each entry and attach sceneId
-        return entries.map(e => ({
+        const normalized = entries.map(e => ({
             title: e.title || e.Title || "Untitled",
             datetime: e.datetime || e.date || e.Date || "",
             content: e.content || e.body || e.prose || e.entry || e.memory_entry || e.Memory || e.memory || e.text || "",
@@ -543,32 +762,33 @@ function parseWriterResponse(response, sceneId) {
             primaryCharacters: e.primaryCharacters || e.primary_characters || (e.primaryCharacter ? [e.primaryCharacter] : []),
             keyCharacters: e.keyCharacters || e.key_characters || [],
             category: e.category || "character",
-            tags: e.tags || [],
+            tags: normalizeStringList(e.tags),
             status: "active",
             delta: {
                 before_state: e.delta?.before_state || e.before_state || "",
                 after_state: e.delta?.after_state || e.after_state || "",
                 delta: e.delta?.delta || e.delta_summary || "",
-                delta_type: e.delta?.delta_type || e.delta_type || [],
+                delta_type: normalizeStringList(e.delta?.delta_type || e.delta_type),
                 low_delta_flag: e.delta?.low_delta_flag || e.low_delta_flag || false,
             },
             source: "llm_generated",
             sceneId: sceneId,
         })).map(e => {
             // Split joint primaries, resolve canonical names, drop banned/unknown
-            // names individually ("Jane Doe" → "Doe Jane")
+            // names individually ("Alex Morgan" → "Morgan Alex")
             const primaries = normalizePrimaries(e.primaryCharacter || e.primaryCharacters);
             e.primaryCharacter = primaries.length === 1 ? primaries[0] : "";
             e.primaryCharacters = primaries;
             e.keyCharacters = sanitizeKeyCharacters(e.keyCharacters || e.key_characters || []);
             return e;
         }).filter(e => {
-            if (e.primaryCharacters.length === 0) {
-                console.warn(`[ML] Writer: discarded entry attributed to player/unknown: "${(e.title || "Untitled")}"`);
+            if (e.primaryCharacters.length === 0 || !String(e.content || "").trim()) {
+                console.warn(`[ML] Writer: discarded incomplete or player/unknown entry: "${(e.title || "Untitled")}"`);
                 return false;
             }
             return true;
         });
+        return normalized.length > 0 ? normalized : null;
     } catch (err) {
         console.warn("[ML] Writer: JSON parse failed:", err.message);
     }
@@ -597,8 +817,9 @@ function parseMarkdownMemory(text, sceneId) {
         
         for (var j = 0; j < lines.length; j++) {
             var line = lines[j].trim();
-            // Check for field headers: **FieldName**: value
-            var headerMatch = line.match(/^\*\*([^*]+)\*\*\s*:\s*(.*)/);
+            // Tolerate **Title**:, **Title:**, __Title__:, and plain Title:.
+            // Restrict labels so a colon in prose does not end Content early.
+            var headerMatch = line.match(/^\s*(?:\*\*|__)?\s*(Title|Date(?:\/Time)?|Content|Primary Character|Key Characters?|Before|After|Delta|Delta Type)\s*(?:(?:\*\*|__)\s*:\s*|:\s*(?:\*\*|__)?\s*)(.*)$/i);
             if (headerMatch) {
                 var fieldName = headerMatch[1].trim().toLowerCase();
                 var fieldVal = headerMatch[2].trim();
@@ -620,7 +841,7 @@ function parseMarkdownMemory(text, sceneId) {
         keyChar = keyChar.replace(/\*+/g, "").trim();
         title = title.replace(/\*+/g, "").trim();
         
-        if (!primary && !narrative) continue;
+        if (!narrative) continue;
         // Hard-discard player / unknown / unattributed entries. The old check only
         // caught an EXACT persona-name match — blank and "Unknown" primaries (the
         // breakthrough player-memories) sailed straight through it.
@@ -637,7 +858,7 @@ function parseMarkdownMemory(text, sceneId) {
         var beforeState = "", afterState = "", deltaLabel = "";
         for (var dj = 0; dj < lines.length; dj++) {
             var dline = lines[dj].trim();
-            var dMatch = dline.match(/^\*\*([^*]+)\*\*\s*:\s*(.*)/);
+            var dMatch = dline.match(/^\s*(?:\*\*|__)?\s*(Before|After|Delta|Delta Type)\s*(?:(?:\*\*|__)\s*:\s*|:\s*(?:\*\*|__)?\s*)(.*)$/i);
             if (dMatch) {
                 var dName = dMatch[1].trim().toLowerCase();
                 if (dName === "before") beforeState = dMatch[2].trim();
@@ -669,4 +890,3 @@ function parseMarkdownMemory(text, sceneId) {
     if (results.length > 0) console.log("[ML] Writer: parsed " + results.length + " entries from markdown");
     return results.length > 0 ? results : null;
 }
-

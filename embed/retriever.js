@@ -1,3 +1,4 @@
+import { captureChatGuard } from "../lib/chatGuard.js";
 /**
  * embed/retriever.js — Memory retrieval pipeline
  *
@@ -19,6 +20,7 @@ import { getEntries, getStickinessMap, saveStickinessMap, getCooldownsMap, saveC
 import { getCollectionId } from "./embedder.js";
 import { dlog, publishRetrievalTrace } from "../lib/debug.js";
 import { rerankCandidates } from "../llm/reranker.js";
+import { narrativeMessages } from "../lib/chatMessages.js";
 
 
 /** Build the provider settings object used for vector queries — shared with the recall tool. */
@@ -40,6 +42,7 @@ export function buildVectorSettings() {
 }
 
 export async function runRetrievalPipeline(sidecarResult) {
+    const assertChat = captureChatGuard();
     const collectionId = getCollectionId();
     const queryText = buildQueryText(sidecarResult);
     const threshold = Number(getSetting("vectorization.similarityThreshold", 0.75));
@@ -137,6 +140,8 @@ export async function runRetrievalPipeline(sidecarResult) {
     dlog(`Retriever query: "${queryText}" (collection ${collectionId}, topK ${topK}, threshold ${threshold})`);
     const rawResults = await queryCollection(collectionId, queryText, topK, threshold, mlSettings);
 
+    assertChat();
+
     // IMPORTANT: Passive recall must not die just because vector search returns
     // no hits above threshold. Direct event/title references like "Yūji's first
     // kill" should still be able to surface "The First Kill" through lexical
@@ -172,6 +177,7 @@ export async function runRetrievalPipeline(sidecarResult) {
     // default because it adds one extra LLM call only when there are more
     // candidates than injection slots. Uses the Keyword sidecar profile.
     filtered = await rerankCandidates(filtered, sidecarResult, queryText, maxEntries, trace.reranker);
+    assertChat();
     filtered.forEach((candidate, index) => {
         const record = ensureRecord(candidate);
         if (!record) return;
@@ -312,7 +318,7 @@ function buildQueryText(sidecarResult) {
 function getRawRecentMessagesQuery() {
     if (!chat || !Array.isArray(chat)) return "";
     const depth = Math.max(1, Number(getSetting("vectorization.raw.scanDepth", 10)) || 10);
-    const recent = chat.slice(-depth);
+    const recent = narrativeMessages(chat).slice(-depth);
     return recent.map(msg => {
         const speaker = msg.is_user ? (name1 || "User") : (msg.name || "Character");
         const text = String(msg.mes || "").replace(/<[^>]+>/g, " ").slice(0, 1200);
@@ -341,7 +347,7 @@ function buildLexicalTerms(sidecarResult, queryText) {
         terms.add(base.replace(/^memory of /, "").trim());
         terms.add(base.replace(/^memory about /, "").trim());
         const words = base.split(" ").filter(w => w.length > 2);
-        // Preserve useful title-like tails, e.g. "memory of janes first kill" → "first kill".
+        // Preserve useful title-like tails, e.g. "memory of yujis first kill" → "first kill".
         for (let n = 2; n <= Math.min(4, words.length); n++) {
             terms.add(words.slice(-n).join(" "));
         }
@@ -471,6 +477,14 @@ function applyFilters(candidates, recordById = new Map()) {
             record.cooldownRemaining = cooldownRemaining;
         }
 
+        if (entry.status === "archived" || entry.status === "superseded") {
+            if (record) {
+                record.decision = "Filtered";
+                record.reason = `Memory status is ${entry.status}; it is excluded from passive retrieval.`;
+            }
+            continue;
+        }
+
         if (stickyRemaining > 0) {
             const adjustedScore = Math.max(score, 0.9);
             if (record) {
@@ -479,7 +493,7 @@ function applyFilters(candidates, recordById = new Map()) {
                 record.decision = "Eligible";
                 record.reason = `Stickiness is active for ${stickyRemaining} more message${stickyRemaining === 1 ? "" : "s"}; similarity was raised to at least 0.900.`;
             }
-            filtered.push({ ...candidate, score: adjustedScore });
+            filtered.push({ ...candidate, score: adjustedScore, sticky: true });
             continue;
         }
 
@@ -502,24 +516,17 @@ function applyFilters(candidates, recordById = new Map()) {
             continue;
         }
 
-        if (entry.status === "archived" || entry.status === "superseded") {
-            if (record) {
-                record.decision = "Filtered";
-                record.reason = `Memory status is ${entry.status}; it is excluded from passive retrieval.`;
-            }
-            continue;
-        }
-
-        // Core/important memories bypass decay AND consolidation suppression — the
-        // user has flagged them as pivotal (e.g. childhood memories) and they
-        // must not be pushed down the priority order over time.
-        if (entry.important) {
+        // Active core/important memories bypass decay and consolidation
+        // suppression. A starred source that the user explicitly suppresses is
+        // marked consolidated, which intentionally overrides the star so it can
+        // be retired without deleting it or removing its consolidation history.
+        if (entry.important && entry.status !== "consolidated") {
             const adjustedScore = Math.max(score, 0.95);
             if (record) {
                 record.adjustedScore = adjustedScore;
                 record.flags.push("important");
                 record.decision = "Eligible";
-                record.reason = "Starred/important memory; priority was raised to at least 0.950 and decay/suppression were bypassed.";
+                record.reason = "Active starred/important memory; priority was raised to at least 0.950 and decay/suppression were bypassed.";
             }
             filtered.push({ ...candidate, score: adjustedScore });
             continue;
@@ -590,8 +597,12 @@ function calculateDecay(entry, score, settings) {
 
 
 export function recordInjection(entryId, stickiness = 0) {
+    if ((getCooldownsMap()[entryId] || 0) > 0) return;
     const effective = stickiness > 0 ? stickiness : getSetting("vectorization.defaultStickiness", 0);
-    if (effective <= 0) return;
+    if (effective <= 0) {
+        startCooldown(entryId, getEntry(entryId)?.cooldown || 0);
+        return;
+    }
     const map = getStickinessMap();
     // Lorebook-style stickiness: set the counter ONCE, when an entry first
     // injects. If it's already in the sticky map it's mid-countdown — do NOT
@@ -615,6 +626,11 @@ export function tickCounters() {
     const stickyMap = getStickinessMap();
     const cooldownMap = getCooldownsMap();
     let stickyChanged = false, cooldownChanged = false;
+    for (const id of Object.keys(cooldownMap)) {
+        cooldownMap[id]--;
+        if (cooldownMap[id] <= 0) delete cooldownMap[id];
+        cooldownChanged = true;
+    }
     for (const id of Object.keys(stickyMap)) {
         stickyMap[id]--;
         if (stickyMap[id] <= 0) {
@@ -624,11 +640,6 @@ export function tickCounters() {
             delete stickyMap[id];
         }
         stickyChanged = true;
-    }
-    for (const id of Object.keys(cooldownMap)) {
-        cooldownMap[id]--;
-        if (cooldownMap[id] <= 0) delete cooldownMap[id];
-        cooldownChanged = true;
     }
     if (stickyChanged) saveStickinessMap(stickyMap);
     if (cooldownChanged) saveCooldownsMap(cooldownMap);

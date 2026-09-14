@@ -69,6 +69,14 @@ export function createScene(messageStart) {
         messageStart: messageStart,
         messageEnd: null,
         llmSummary: "",
+        generation: {
+            status: "idle",
+            summary: "pending",
+            memories: "pending",
+            world: "pending",
+            error: "",
+            updatedAt: Date.now(),
+        },
         consolidatedInto: null,
         createdAt: Date.now(),
     };
@@ -224,8 +232,10 @@ export function updateSceneSummary(sceneId, summary) {
  */
 export function getPreviousSceneSummaries(excludeSceneId = null) {
     const scenes = getScenes();
+    const current = excludeSceneId ? scenes.find(s => s.id === excludeSceneId) : null;
     return scenes
-        .filter(s => s.status === "closed" && s.llmSummary && s.id !== excludeSceneId)
+        .filter(s => s.status === "closed" && s.llmSummary && s.id !== excludeSceneId &&
+            (!current || s.messageStart < current.messageStart))
         .sort((a, b) => a.messageStart - b.messageStart)
         .map(s => s.llmSummary);
 }
@@ -304,6 +314,39 @@ export function markSceneConsolidated(sceneId, consolidationId) {
     if (!scene) return null;
 
     scene.consolidatedInto = consolidationId;
+    saveScenes(scenes);
+    return scene;
+}
+
+/**
+ * Persist scene-close writer progress so a failed stage can be retried without
+ * rerunning successful stages or duplicating pending memories.
+ */
+export function updateSceneGeneration(sceneId, patch = {}) {
+    const scenes = getScenes();
+    const scene = scenes.find(s => s.id === sceneId);
+    if (!scene) return null;
+
+    scene.generation = {
+        status: "idle",
+        summary: scene.llmSummary ? "complete" : "pending",
+        memories: "pending",
+        world: "pending",
+        error: "",
+        ...(scene.generation || {}),
+        ...patch,
+        updatedAt: Date.now(),
+    };
+    saveScenes(scenes);
+    return scene;
+}
+
+/** Restore a scene from the consolidated archive. */
+export function unmarkSceneConsolidated(sceneId) {
+    const scenes = getScenes();
+    const scene = scenes.find(s => s.id === sceneId);
+    if (!scene) return null;
+    scene.consolidatedInto = null;
     saveScenes(scenes);
     return scene;
 }

@@ -18,7 +18,7 @@
  */
 
 
-import { getFolders, saveFolders } from "./storage.js";
+import { getFolders, saveFolders, getEntries } from "./storage.js";
 
 // ─── Constants ────────────────────────────────────────────
 
@@ -227,7 +227,7 @@ export function hasCharacterSubfolder(charName) {
 /**
  * Set the alias list for a character folder.
  * Aliases are alternate names/nicknames the writer LLM might use for the same
- * character ("Jane", "Janey", "JD"). All of them resolve to
+ * character ("Alex", "Red", "Captain"). All of them resolve to
  * this folder's canonical character name, so memories never land in a
  * duplicate folder spawned by a name variant.
  */
@@ -242,7 +242,7 @@ export function setFolderAliases(folderId, aliases) {
  * Resolve any name variant to the canonical character name of an existing
  * character folder. Three matching layers, all case-insensitive:
  *   1. Exact match on a folder's character name
- *   2. Token-set match — "Doe Jane" and "Jane Doe" are the same
+ *   2. Token-set match — "Alex Morgan" and "Morgan Alex" are the same
  *      words in a different order, so they resolve to the same folder
  *      automatically, no alias needed
  *   3. Alias match — user-defined nicknames stored on the folder
@@ -298,6 +298,40 @@ export function decrementEntryCount(folderId) {
         folder.entryCount = Math.max(0, (folder.entryCount || 0) - 1);
         saveFolders(folders);
     }
+}
+
+/**
+ * Rebuild cached folder counts from the authoritative entry map.
+ * Older imports and interrupted multi-step operations can leave entryCount
+ * stale even though every entry's folderId remains correct.
+ *
+ * @returns {{changed:boolean,repaired:number}}
+ */
+export function reconcileFolderEntryCounts() {
+    const folders = getFolders();
+    const entries = Object.values(getEntries() || {});
+    const counts = new Map(folders.map(folder => [folder.id, 0]));
+
+    for (const entry of entries) {
+        if (entry?.folderId && counts.has(entry.folderId)) {
+            counts.set(entry.folderId, counts.get(entry.folderId) + 1);
+        }
+    }
+
+    let repaired = 0;
+    for (const folder of folders) {
+        const actual = counts.get(folder.id) || 0;
+        if (Number(folder.entryCount) !== actual) {
+            folder.entryCount = actual;
+            repaired++;
+        }
+    }
+
+    if (repaired) {
+        saveFolders(folders);
+        console.log(`[ML] Reconciled cached entry counts for ${repaired} ${repaired === 1 ? "folder" : "folders"}.`);
+    }
+    return { changed: repaired > 0, repaired };
 }
 
 // ─── Image Management ─────────────────────────────────────

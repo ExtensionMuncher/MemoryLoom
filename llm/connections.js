@@ -112,9 +112,13 @@ export function resolveProfile(profileKey) {
 
 // ─── Internal Generation Flag ─────────────────────────────
 
-let _mlInternalGen = false;
-export function setMLInternalGen(val) { _mlInternalGen = val; }
-export function isMLInternalGen() { return _mlInternalGen; }
+let _mlInternalGenCount = 0;
+export function setMLInternalGen(val) {
+    _mlInternalGenCount = val
+        ? _mlInternalGenCount + 1
+        : Math.max(0, _mlInternalGenCount - 1);
+}
+export function isMLInternalGen() { return _mlInternalGenCount > 0; }
 
 function withTimeout(promise, timeoutMs, label = "LLM request") {
     const ms = Number(timeoutMs) || 0;
@@ -124,6 +128,84 @@ function withTimeout(promise, timeoutMs, label = "LLM request") {
         timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
     });
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function hasOwn(object, key) {
+    return !!object && Object.prototype.hasOwnProperty.call(object, key);
+}
+
+/**
+ * Resolve a per-profile boolean while remaining compatible with the broken
+ * v0.1.7 settings UI, which stored map entries under the display name even
+ * though the request path looked them up by UUID.
+ */
+function getProfileToggle(map, profile, legacyValue) {
+    if (map && typeof map === "object") {
+        if (hasOwn(map, profile.id)) return !!map[profile.id];
+        if (hasOwn(map, profile.name)) return !!map[profile.name];
+        if (Object.keys(map).length > 0) return false;
+    }
+    return !!legacyValue;
+}
+
+function flattenResponseText(value) {
+    if (typeof value === "string") return value;
+    if (Array.isArray(value)) {
+        return value.map(flattenResponseText).filter(Boolean).join("");
+    }
+    if (value && typeof value === "object") {
+        if (typeof value.text === "string") return value.text;
+        if (typeof value.content === "string" || Array.isArray(value.content)) {
+            return flattenResponseText(value.content);
+        }
+    }
+    return "";
+}
+
+function extractResponseParts(response) {
+    if (typeof response === "string") return { content: response, reasoning: "" };
+    if (!response || typeof response !== "object") return { content: "", reasoning: "" };
+
+    // Current SillyTavern Connection Manager returns ExtractedData directly.
+    // The remaining paths preserve compatibility with older/raw adapters.
+    const contentCandidates = [
+        response.content,
+        response.text,
+        response.response,
+        response.generated_text,
+        response.message?.content,
+        response.data?.content,
+        response.data?.text,
+        response.data?.response,
+        response.result?.content,
+        response.result?.text,
+        response.choices?.[0]?.message?.content,
+        response.choices?.[0]?.text,
+        response.data?.choices?.[0]?.message?.content,
+        response.data?.choices?.[0]?.text,
+    ];
+    const reasoningCandidates = [
+        response.reasoning,
+        response.reasoning_content,
+        response.message?.reasoning,
+        response.message?.reasoning_content,
+        response.data?.reasoning,
+        response.data?.reasoning_content,
+        response.result?.reasoning,
+        response.result?.reasoning_content,
+        response.choices?.[0]?.message?.reasoning,
+        response.choices?.[0]?.message?.reasoning_content,
+        response.data?.choices?.[0]?.message?.reasoning,
+        response.data?.choices?.[0]?.message?.reasoning_content,
+    ];
+    const firstText = (values) => {
+        for (const value of values) {
+            const text = flattenResponseText(value);
+            if (text.trim()) return text;
+        }
+        return "";
+    };
+    return { content: firstText(contentCandidates), reasoning: firstText(reasoningCandidates) };
 }
 
 // ─── Core Request ─────────────────────────────────────────
@@ -172,12 +254,8 @@ export async function makeRequest(profileKey, systemPrompt, userPrompt, maxToken
         const noThinkHardMap = getSetting("connections.noThinkHardProfiles", null);
         const legacySoft = getSetting("connections.noThink", false);
         const legacyHard = getSetting("connections.noThinkHard", false);
-        const softOn = (noThinkMap && typeof noThinkMap === "object")
-            ? !!noThinkMap[profile.id]
-            : legacySoft;
-        const hardOn = (noThinkHardMap && typeof noThinkHardMap === "object")
-            ? !!noThinkHardMap[profile.id]
-            : legacyHard;
+        const softOn = getProfileToggle(noThinkMap, profile, legacySoft) || options.preferNoThink === true;
+        const hardOn = getProfileToggle(noThinkHardMap, profile, legacyHard);
 
         const requestPromise = rateLimiter.executeWithRetry(profile.id, async () => {
             const messages = [];
@@ -211,51 +289,40 @@ export async function makeRequest(profileKey, systemPrompt, userPrompt, maxToken
                 profile.id,
                 messages,
                 maxTokens,
-                // includePreset pulled in the connection profile's full prompt list — which
-                // includes the character card — bloating every request and leaking context
-                // we explicitly removed. Send only our own messages.
-                { includePreset: false, includeInstruct: false, stream: false },
+                // Keep the generation preset disabled: it can pull the profile's full
+                // prompt list (including the character card) into this isolated helper
+                // request. Keep instruct formatting ENABLED, however. On ST text-
+                // completion profiles (Ollama, llama.cpp, etc.) Connection Manager uses
+                // the profile's instruct template to turn our system/user messages into a
+                // valid chat prompt with an assistant-generation prefix. Disabling it
+                // reduced the request to raw concatenated prose and could yield empty or
+                // reasoning-only answers from chat-tuned local models.
+                { includePreset: false, includeInstruct: true, stream: false },
                 overridePayload,
             );
         }, { maxRetries: options.maxRetries });
 
         const response = await withTimeout(requestPromise, options.timeoutMs, `ML request for "${profile.name}"`);
 
-        if (typeof response === 'string') return response;
-        if (response && typeof response === 'object') {
-            if (response.choices?.[0]?.message?.content !== undefined) {
-                const choice    = response.choices[0];
-                const content   = choice.message.content;
-                const reasoning = choice.message.reasoning;
-                // NEVER fall back to reasoning as if it were the answer. Thinking
-                // models (e.g. Gemma via Ollama) put their scratchpad in `reasoning`
-                // and the real answer in `content`. If content is empty, the model
-                // spent its entire token budget thinking and got cut off — returning
-                // the reasoning here is what produced "summaries" full of
-                // "Wait, let me check the prompt again".
-                if (!content && reasoning) {
-                    const cutOff = choice.finish_reason === 'length';
-                    const why = cutOff
-                        ? 'it spent the entire token budget on reasoning and was cut off before answering'
-                        : 'it returned only reasoning with an empty answer';
-                    console.error(`[ML] "${profile.name}" is a thinking model and ${why}. ` +
-                        'Use a non-thinking model for this role, or raise the token limit.');
-                    if (!options?.suppressToasts) toastr?.error?.(`"${profile.name}" returned only reasoning, no answer — likely a thinking model. Try a non-thinking model for this role.`);
-                    return null;
-                }
-                return content || '';
+        const { content, reasoning } = extractResponseParts(response);
+        if (content.trim()) return content;
+
+        const task = options?.requestLabel ? ` for ${options.requestLabel}` : "";
+        if (reasoning.trim()) {
+            // Connection Manager's ExtractedData deliberately omits finish_reason,
+            // so we cannot truthfully claim that the token limit was exhausted.
+            // Keep private reasoning out of saved memories and report only what is
+            // known: the provider supplied no visible answer.
+            console.error(`[ML] "${profile.name}" returned reasoning but no visible answer${task}. ` +
+                `Reasoning suppression: soft=${softOn}, hard=${hardOn}.`);
+            if (!options?.suppressToasts) {
+                toastr?.error?.(`"${profile.name}" returned reasoning but no final answer${task}. Memory Loom did not save the private reasoning.`);
             }
-            if (response.content !== undefined) {
-                if (!response.content && response.reasoning) {
-                    console.error(`[ML] "${profile.name}" returned only reasoning with an empty answer. Use a non-thinking model or raise the token limit.`);
-                    if (!options?.suppressToasts) toastr?.error?.(`"${profile.name}" returned only reasoning, no answer.`);
-                    return null;
-                }
-                return response.content || '';
-            }
-            if (response.response) return response.response;
+            return null;
         }
-        console.warn('[ML] Unexpected response format:', response);
+
+        console.warn(`[ML] Empty or unexpected response${task}:`, response);
+        if (!options?.suppressToasts) toastr?.error?.(`"${profile.name}" returned no answer${task}.`);
         return null;
 
     } catch (err) {

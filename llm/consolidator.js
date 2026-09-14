@@ -8,9 +8,9 @@
  *   - Consolidation output must NOT contain open_threads, future_questions,
  *     or suggested_next_steps. Unresolved context must be expressed as
  *     present state only.
- *   - Example of what NOT to do: "Will Mira forgive Elena?"
- *   - Example of correct approach: "Mira has not forgiven Elena and
- *     remains guarded around her."
+ *   - Example of what NOT to do: "Will Alex forgive Morgan?"
+ *   - Example of correct approach: "Alex has not forgiven Morgan and
+ *     remains guarded around them."
  *   - Consolidation does not delete source memories — it reduces their
  *     injection priority, not removes them.
  */
@@ -118,6 +118,13 @@ Output ONLY a JSON object, no markdown fences:
   "title": "An evocative 3-6 word title specific to ${charName}'s arc — NOT a generic arc name",
   "content": "The consolidated memory, narrated in THIRD PERSON about ${charName}.",
   "datetime": "The time period this covers.",
+  "delta": {
+    "before_state": "One concise sentence describing ${charName}'s relevant state, belief, or stance before this arc.",
+    "after_state": "One concise sentence describing ${charName}'s state, belief, or stance after this arc.",
+    "delta": "One concise sentence naming the cumulative shift this arc produced in ${charName}.",
+    "delta_type": ["zero or more short lowercase_snake_case change categories"],
+    "low_delta_flag": false
+  },
   "tags": ["3-6 lowercase_snake_case tags SPECIFIC to ${charName}'s experience in this arc — what THEY went through, felt, or became. Do NOT use generic arc-wide tags that don't apply to ${charName} personally."]
 }`;
 
@@ -126,6 +133,13 @@ Output ONLY a JSON object, no markdown fences:
         user += `--- Memory ${i + 1}: ${e.title} ---\n`;
         if (e.datetime) user += `When: ${e.datetime}\n`;
         user += `${e.content}\n\n`;
+        if (e.delta && (e.delta.before_state || e.delta.after_state || e.delta.delta)) {
+            user += `Recorded change:\n`;
+            if (e.delta.before_state) user += `- Before: ${e.delta.before_state}\n`;
+            if (e.delta.after_state) user += `- After: ${e.delta.after_state}\n`;
+            if (e.delta.delta) user += `- Delta: ${e.delta.delta}\n`;
+            user += "\n";
+        }
     });
     if (draft && draft.summary) {
         user += `BROADER ARC CONTEXT (for reference only — write about ${charName} specifically):\n${draft.summary}\n\n`;
@@ -145,10 +159,15 @@ Output ONLY a JSON object, no markdown fences:
         if (looksFirstPerson(contentText)) {
             console.warn(`[ML] Consolidation for ${charName} came back in first person — POV ban ignored by the model. Consider regenerating; flagged in title.`);
         }
+        const delta = normalizeDelta(parsed.delta || parsed);
+        if (!delta) {
+            console.warn(`[ML] Consolidation for ${charName} omitted a complete delta — retrying the delta only.`);
+        }
         return {
             title: String(parsed.title || "").trim() || `${charName}'s arc`,
             content: contentText,
             datetime: String(parsed.datetime || "").trim() || (draft?.timeRange || ""),
+            delta: delta || await generateConsolidatedMemoryDelta(charName, contentText, relevantEntries),
             tags: Array.isArray(parsed.tags)
                 ? parsed.tags.map(t => String(t).trim().toLowerCase().replace(/\s+/g, "_")).filter(Boolean).slice(0, 6)
                 : [],
@@ -157,6 +176,56 @@ Output ONLY a JSON object, no markdown fences:
         console.warn(`[ML] Per-character consolidation parse failed for ${charName}:`, err.message);
         return null;
     }
+}
+
+/** Generate only the missing delta when the main synthesis response omitted it. */
+async function generateConsolidatedMemoryDelta(charName, content, relevantEntries) {
+    const profileName = getSetting("connections.consolidationLLM", "");
+    if (!profileName) return null;
+    const system = `Analyze one consolidated roleplay memory centered on ${charName}. Output ONLY JSON:\n{
+  "before_state": "One concise sentence describing ${charName} before the covered arc.",
+  "after_state": "One concise sentence describing ${charName} after the covered arc.",
+  "delta": "One concise sentence naming the cumulative change in ${charName}.",
+  "delta_type": ["zero or more lowercase_snake_case categories"],
+  "low_delta_flag": false
+}\nBase the answer strictly on the supplied memory and source changes. Preserve uncertainty and subjective beliefs; do not upgrade inference into fact. All three text fields are required, even when the change is subtle.`;
+    let user = `CHARACTER: ${charName}\n\nCONSOLIDATED MEMORY:\n${content}\n\nSOURCE CHANGES:\n`;
+    for (const entry of relevantEntries || []) {
+        const d = entry.delta || {};
+        if (d.before_state) user += `Before: ${d.before_state}\n`;
+        if (d.after_state) user += `After: ${d.after_state}\n`;
+        if (d.delta) user += `Delta: ${d.delta}\n`;
+    }
+    try {
+        const response = await makeRequest(profileName, system, user, getConsolidationTokens(), 0.4);
+        const raw = String(response || "").replace(/```json\s*|```/g, "").trim();
+        const start = raw.indexOf("{");
+        const end = raw.lastIndexOf("}");
+        if (start === -1 || end === -1) return null;
+        return normalizeDelta(JSON.parse(raw.slice(start, end + 1)));
+    } catch (err) {
+        console.warn(`[ML] Consolidation delta retry failed for ${charName}:`, err.message);
+        return null;
+    }
+}
+
+function normalizeDelta(value) {
+    if (!value || typeof value !== "object") return null;
+    const before = String(value.before_state || "").trim();
+    const after = String(value.after_state || "").trim();
+    const change = String(value.delta || value.delta_summary || "").trim();
+    // A partial block is not considered complete: incomplete synthesis deltas
+    // would merely recreate the need for Debug Backfill.
+    if (!before || !after || !change) return null;
+    return {
+        before_state: before,
+        after_state: after,
+        delta: change,
+        delta_type: Array.isArray(value.delta_type)
+            ? value.delta_type.map(t => String(t).trim().toLowerCase().replace(/\s+/g, "_")).filter(Boolean)
+            : [],
+        low_delta_flag: !!value.low_delta_flag,
+    };
 }
 
 // ─── Prompt Builders ──────────────────────────────────────
@@ -176,10 +245,10 @@ RULES:
 9. If source memories disagree in interpretation, prioritize concrete actions, explicit narration/dialogue, and the least speculative reading for OBJECTIVE claims rather than escalating the more dramatic version.
 
 Example of WRONG output:
-  "Will Mira forgive Elena for the betrayal?"
+  "Will Alex forgive Morgan for the betrayal?"
 
 Example of CORRECT output:
-  "Mira has not forgiven Elena for the betrayal and remains guarded around her."
+  "Alex has not forgiven Morgan for the betrayal and remains guarded around them."
 
 Output as JSON with these fields:
 {

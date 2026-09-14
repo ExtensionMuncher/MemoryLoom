@@ -185,7 +185,7 @@ export function renderHomeHeader($pane) {
  */
 export function renderSidecarControl($pane) {
     const paused = isSidecarPaused();
-    const statusText = paused ? "Paused · injections suspended" : "Running · every message";
+    const statusText = paused ? "Paused · retrieval suspended" : "Automatic memory retrieval";
     const buttonText = paused ? "Resume" : "Pause";
 
     // Remove existing to prevent duplicates

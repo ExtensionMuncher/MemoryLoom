@@ -1,3 +1,4 @@
+import { captureChatGuard } from "../lib/chatGuard.js";
 /**
  * ui/settings.js — Settings tab renderer
  *
@@ -21,6 +22,7 @@ import { getAllEntries } from "../data/entries.js";
 import { reEmbedEntry } from "../embed/embedder.js";
 import { getContext } from "../../../../extensions.js";
 import { getLastRetrievalTrace, clearLastRetrievalTrace } from "../lib/debug.js";
+import { isNarrativeMessage } from "../lib/chatMessages.js";
 
 // ─── Main Render ──────────────────────────────────────────
 
@@ -66,29 +68,6 @@ function renderDebug($pane) {
         toastr?.info?.(`Debug logging ${on ? "enabled" : "disabled"}.`, "Memory Loom");
     });
 
-    // ── Last passive-retrieval explanation ───────────────
-    // This is session-only diagnostic state. It does not add prompt tokens,
-    // persist in the chat, or trigger any additional vector/LLM calls.
-    const $traceBlock = $(`
-        <div class="ml-retrieval-trace-block">
-            <div class="ml-retrieval-trace-header">
-                <div style="min-width:0">
-                    <div class="ml-setting-label">Last passive retrieval</div>
-                    <div class="ml-setting-sub">Explains vector/lexical matches, filters, reranking, cooldowns, and final injection decisions · session-only · no extra model calls</div>
-                </div>
-                <button class="ml-btn" id="ml-clear-retrieval-trace">Clear</button>
-            </div>
-            <div id="ml-retrieval-trace-view"></div>
-        </div>
-    `);
-    $body.append($traceBlock);
-    const $traceView = $traceBlock.find("#ml-retrieval-trace-view");
-    renderRetrievalTrace($traceView, getLastRetrievalTrace());
-    $traceBlock.find("#ml-clear-retrieval-trace").on("click", () => clearLastRetrievalTrace());
-    $(document).on("ml:retrieval-trace-updated.ml-settings", (event) => {
-        renderRetrievalTrace($traceView, event.originalEvent?.detail ?? null);
-    });
-
     // ── Re-embed all memories ────────────────────────────
     $body.append(`
         <div class="ml-setting-row">
@@ -100,6 +79,7 @@ function renderDebug($pane) {
         </div>
     `);
     $body.find("#ml-reembed-all-btn").on("click", async function () {
+        const assertChat = captureChatGuard();
         const $btn = $(this);
         const entries = getAllEntries();
         const total = entries.length;
@@ -107,7 +87,8 @@ function renderDebug($pane) {
         $btn.prop("disabled", true).text("Embedding…");
         let ok = 0, fail = 0;
         for (let i = 0; i < entries.length; i++) {
-            try { await reEmbedEntry(entries[i]); ok++; }
+            try { assertChat(); } catch { break; }
+            try { if (await reEmbedEntry(entries[i])) ok++; else fail++; }
             catch (err) { fail++; console.warn("[ML] Re-embed failed for", entries[i].id, err); }
             $btn.text(`Embedding… ${i + 1}/${total}`);
         }
@@ -178,10 +159,22 @@ function renderDebug($pane) {
                 setProcessingStatus(msg);
             });
             if (result.total > 0) {
-                toastr?.success?.(
-                    `Auto-tagged memories: ${result.tagged}/${result.total}${result.failed ? ` · ${result.failed} failed` : ""}.`,
-                    "Memory Loom", { timeOut: 6000 }
-                );
+                if (result.failed > 0) {
+                    const allFailedNames = result.failedEntries || [];
+                    const failedNames = allFailedNames.slice(0, 4);
+                    const names = failedNames.length
+                        ? ` Failed: ${failedNames.join("; ")}${allFailedNames.length > failedNames.length ? "; …" : ""}`
+                        : "";
+                    toastr?.warning?.(
+                        `Auto-tagged memories: ${result.tagged}/${result.total} · ${result.failed} still need tags.${names}`,
+                        "Memory Loom", { timeOut: 9000 }
+                    );
+                } else {
+                    toastr?.success?.(
+                        `Auto-tagged memories: ${result.tagged}/${result.total}.`,
+                        "Memory Loom", { timeOut: 6000 }
+                    );
+                }
                 const { renderLibraryTab } = await import("./library.js");
                 const $lib = $("#ml-p-library"); if ($lib.length) renderLibraryTab($lib);
             }
@@ -200,7 +193,7 @@ function renderDebug($pane) {
         <div class="ml-setting-row">
             <div style="flex:1;min-width:0">
                 <div class="ml-setting-label">Scan chat for world memories</div>
-                <div class="ml-setting-sub">Full world-only batch scan over the raw chat · choose full chat or a message range · ignores hidden-message markers · always runs even when auto world-generation is off (toggle in Scanning)</div>
+                <div class="ml-setting-sub">Full world-only batch scan over narrative messages · excludes tool, tracker, utility, and summary records · choose full chat or a message range · always runs even when auto world-generation is off (toggle in Scanning)</div>
             </div>
             <button class="ml-btn" id="ml-world-scan-btn">Scan world</button>
         </div>
@@ -215,7 +208,7 @@ function renderDebug($pane) {
         const html = `
             <div style="text-align:left">
                 <h3 style="margin-top:0">Scan for world memories</h3>
-                <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#888;margin:6px 0 12px;line-height:1.6">Reads the raw chat (${total} messages, numbered #0–#${total - 1} to match ST), creates scene chunks, and runs the strict world-memory pass. Hidden-message markers are ignored — everything in range is read.</div>
+                <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#888;margin:6px 0 12px;line-height:1.6">Reads narrative messages in the selected ST range (${total} total message slots, numbered #0–#${total - 1}), creates scene chunks, and runs the strict world-memory pass. Tool output, extension trackers, utility records, summaries, and hidden/system messages are excluded.</div>
                 <label class="checkbox_label" style="display:flex;gap:8px;align-items:center;margin:6px 0">
                     <input type="radio" name="ml-world-range" value="all" checked> Scan everything
                 </label>
@@ -277,6 +270,37 @@ function renderDebug($pane) {
         resetSettingsToDefaults();
         toastr?.success?.("Settings reset to defaults.", "Memory Loom");
         renderSettingsTab($pane);
+    });
+
+    // ── Last passive retrieval ──────────────────────────
+    // This report is session-only. Keep it last and collapsed by default so it
+    // does not crowd the controls used for ordinary debugging.
+    const $traceBlock = $(`
+        <details class="ml-retrieval-trace-block ml-retrieval-trace-details">
+            <summary>
+                <div style="min-width:0">
+                    <div class="ml-setting-label">Last passive retrieval</div>
+                    <div class="ml-setting-sub">Explains vector/lexical matches, filters, reranking, cooldowns, and final injection decisions · session-only · no extra model calls</div>
+                </div>
+                <span class="ml-retrieval-trace-chevron" aria-hidden="true">▾</span>
+            </summary>
+            <div class="ml-retrieval-trace-header">
+                <span class="ml-setting-sub">Most recent report</span>
+                <button class="ml-btn" id="ml-clear-retrieval-trace">Clear</button>
+            </div>
+            <div id="ml-retrieval-trace-view"></div>
+        </details>
+    `);
+    $body.append($traceBlock);
+    const $traceView = $traceBlock.find("#ml-retrieval-trace-view");
+    renderRetrievalTrace($traceView, getLastRetrievalTrace());
+    $traceBlock.find("#ml-clear-retrieval-trace").on("click", event => {
+        event.preventDefault();
+        event.stopPropagation();
+        clearLastRetrievalTrace();
+    });
+    $(document).on("ml:retrieval-trace-updated.ml-settings", (event) => {
+        renderRetrievalTrace($traceView, event.originalEvent?.detail ?? null);
     });
 
     $pane.append($section);
@@ -443,7 +467,7 @@ function renderConnections($pane) {
 
     const profiles = getConnectionProfiles();
     const profileOptions = profiles.map(p =>
-        `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`
+        `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`
     ).join("");
 
     function selectFor(key) {
@@ -470,8 +494,33 @@ function renderConnections($pane) {
     function readMap(mapKey) { const m = getSetting(`connections.${mapKey}`, null); return (m && typeof m === "object") ? m : {}; }
     function writeMap(mapKey, profileId, val) {
         const m = readMap(mapKey);
-        if (val) m[profileId] = true; else delete m[profileId];
+        // Keep an explicit false value. Deleting the only key would make the
+        // request layer fall back to an older blanket no-think boolean, so the
+        // user could visibly uncheck a profile and still send suppression flags.
+        m[profileId] = !!val;
         setSetting(`connections.${mapKey}`, m);
+    }
+
+    function canonicalProfileId(profileKey) {
+        if (!profileKey) return "";
+        const profile = profiles.find(p => p.id === profileKey || p.name === profileKey);
+        return profile?.id || "";
+    }
+
+    // v0.1.7 rendered dropdown values and no-think map keys as display names,
+    // while the request path expected UUIDs. Migrate both forms as soon as the
+    // settings panel is rendered, without losing an existing toggle.
+    for (const mapKey of ["noThinkProfiles", "noThinkHardProfiles"]) {
+        const map = readMap(mapKey);
+        let changed = false;
+        for (const profile of profiles) {
+            if (Object.prototype.hasOwnProperty.call(map, profile.name)) {
+                if (!Object.prototype.hasOwnProperty.call(map, profile.id)) map[profile.id] = !!map[profile.name];
+                if (profile.name !== profile.id) delete map[profile.name];
+                changed = true;
+            }
+        }
+        if (changed) setSetting(`connections.${mapKey}`, map);
     }
 
     // Set current values and wire change handlers.
@@ -479,8 +528,12 @@ function renderConnections($pane) {
     // selectors ($(...)) would find nothing. $body.find() works on detached elements.
     ["memoryWriterLLM", "sceneSummaryLLM", "consolidationLLM", "sidecarLLM"].forEach(key => {
         const current = getSetting(`connections.${key}`, "");
+        const currentId = canonicalProfileId(current);
         const $select = $body.find(`#ml-setting-${key}`);
-        $select.val(current);
+        $select.val(currentId);
+        if (current && currentId && current !== currentId) {
+            setSetting(`connections.${key}`, currentId);
+        }
         $select.on("change", function () {
             const newId = $(this).val();
             setSetting(`connections.${key}`, newId);
@@ -506,7 +559,7 @@ function renderConnections($pane) {
     $body.append(`<div style="font-size:11px;color:#888;margin:4px 0 8px;line-height:1.4">Soft appends <code>/no_think</code> (safe, ignored if unsupported). Hard also sends API params (<code>think</code>/<code>enable_thinking=false</code>) — turn off if your backend errors.</div>`);
 
     Object.keys(roleLabels).forEach(roleKey => {
-        const profileId = getSetting(`connections.${roleKey}`, "");
+        const profileId = canonicalProfileId(getSetting(`connections.${roleKey}`, ""));
         const softMap = readMap("noThinkProfiles");
         const hardMap = readMap("noThinkHardProfiles");
         const disabled = profileId ? "" : "disabled";
@@ -519,10 +572,10 @@ function renderConnections($pane) {
             </div>
         `);
         $row.find(".ml-nt-soft").on("change", function () {
-            const pid = $(this).data("pid"); if (pid) writeMap("noThinkProfiles", pid, this.checked);
+            const pid = $(this).attr("data-pid"); if (pid) writeMap("noThinkProfiles", pid, this.checked);
         });
         $row.find(".ml-nt-hard").on("change", function () {
-            const pid = $(this).data("pid"); if (pid) writeMap("noThinkHardProfiles", pid, this.checked);
+            const pid = $(this).attr("data-pid"); if (pid) writeMap("noThinkHardProfiles", pid, this.checked);
         });
         $body.append($row);
     });
@@ -551,11 +604,12 @@ function renderScanning($pane) {
 
     $body.find("#ml-setting-scanFrequency").on("change", function () {
         setSetting("scanFrequency", parseInt($(this).val()));
+        $(document).trigger("ml:refresh-sidecar-cadence");
     });
 
-    // Max response tokens — must hold a thinking model's reasoning + answer
+    // Max response tokens for each writer/summary/world call.
     const maxTok = getSetting("connections.maxResponseTokens", 8000);
-    $body.append(settingRow("Max response tokens", "Budget per writer/summary call. Thinking models spend this on reasoning FIRST — raise it if answers come back empty or cut off",
+    $body.append(settingRow("Max response tokens", "Output budget per writer, summary, or world-memory call",
         `<input type="number" class="ml-setting-select" id="ml-setting-maxResponseTokens" value="${Number(maxTok) || 8000}" min="500" max="32000" step="500" style="width:90px;text-align:center">`
     ));
     $body.find("#ml-setting-maxResponseTokens").on("change", function () {
@@ -1331,6 +1385,7 @@ function renderData($pane) {
         chatData.pendingEntries = null;
         chatData.openSceneId = null;
         chatData.messageCounter = 0;
+        chatData.sidecarPauseCadence = null;
         chatData.stickiness = {};
         chatData.cooldowns = {};
         const { saveEntries, saveFolders, saveScenes, saveConsolidations, savePendingEntries, saveOpenSceneId } = await import("../data/storage.js");
@@ -1441,6 +1496,8 @@ function renderData($pane) {
             const { importAllData } = await import("../settings.js");
             const ok = await importAllData(text, { settingsMode, dataMode });
             if (ok) {
+                const { reconcileFolderEntryCounts } = await import("../data/folders.js");
+                reconcileFolderEntryCounts();
                 toastr?.success?.("Data imported.", "Memory Loom");
                 try {
                     const { renderLibraryTab } = await import("./library.js");
@@ -1489,6 +1546,7 @@ async function mlPopupConfirm(html) {
  * re-render after every chunk so new material appears as it's created.
  */
 async function runBatchScan($btn, rangeStart, rangeEnd, idleLabel, worldOnly = false) {
+    const assertChat = captureChatGuard();
     $btn.prop("disabled", true).text("Scanning...");
     const { showPanelLoading, hidePanelLoading, setProcessingStatus } = await import("./panel.js");
     try {
@@ -1569,16 +1627,19 @@ async function runBatchScan($btn, rangeStart, rangeEnd, idleLabel, worldOnly = f
                     if (existing) {
                         closed = existing;
                         // ensure it has a summary for reconciliation
-                        if (!existing.llmSummary) await generateSceneSummary(existing.id);
+                        if (!existing.llmSummary) { assertChat(); if (!await generateSceneSummary(existing.id)) throw new Error("Scene summary failed"); assertChat(); }
                     } else {
-                        const scene = createScene(chunk.start);
+                        assertChat();
+                    const scene = createScene(chunk.start);
                         if (!scene) continue;
                         closed = closeScene(scene.id, chunk.end);
                         if (!closed) continue;
                         recordLastClosedScene(closed.id);
-                        await generateSceneSummary(closed.id);
+                        if (!await generateSceneSummary(closed.id)) throw new Error("Scene summary failed");
+                    assertChat();
                     }
                 } else {
+                    assertChat();
                     const scene = createScene(chunk.start);
                     if (!scene) continue;
                     closed = closeScene(scene.id, chunk.end);
@@ -1586,12 +1647,16 @@ async function runBatchScan($btn, rangeStart, rangeEnd, idleLabel, worldOnly = f
                     recordLastClosedScene(closed.id);
                     // Always generate a scene summary — world reconciliation needs it,
                     // and it's cheap context for everything downstream.
-                    await generateSceneSummary(closed.id);
+                    if (!await generateSceneSummary(closed.id)) throw new Error("Scene summary failed");
+                    assertChat();
                 }
 
                 let chunkCount = 0;
                 if (!worldOnly) {
+                    assertChat();
                     const entries = await generateMemoryEntries(closed.id);
+                    assertChat();
+                    if (!entries) throw new Error("Memory generation failed");
                     if (entries?.length) chunkCount += entries.length;
                     // pause between the two LLM calls within a chunk
                     await new Promise(r => setTimeout(r, 2000));
@@ -1603,7 +1668,10 @@ async function runBatchScan($btn, rangeStart, rangeEnd, idleLabel, worldOnly = f
                 // prior scene summaries and known world facts.
                 const doWorld = worldOnly || getSetting("worldMemory.enabled", true);
                 if (doWorld) {
+                    assertChat();
                     const world = await generateWorldMemories(closed.id, worldOnly /* force */);
+                    assertChat();
+                    if (!world) throw new Error("World generation failed");
                     if (world?.length) chunkCount += world.length;
                 }
 
@@ -1619,6 +1687,7 @@ async function runBatchScan($btn, rangeStart, rangeEnd, idleLabel, worldOnly = f
                 refreshPanes();
             } catch (chunkErr) {
                 console.error(`[ML] Scan chunk ${chunk.start}–${chunk.end} failed:`, chunkErr);
+                throw chunkErr;
             }
             // Pause between chunks — each chunk fires multiple LLM calls with large
             // payloads, and providers like GLM Cloud rate-limit aggressively on bursts.
@@ -1677,18 +1746,22 @@ function chunkMessagesForScan(chat, userName, rangeStart = 0, rangeEnd = null) {
     ];
 
     function msgText(msg) {
+        if (!isNarrativeMessage(msg)) return "";
         const name = msg.name || (msg.is_user ? (userName || "User") : "Character");
         return `[${name}]: ${msg.mes || ""}`;
     }
 
+    const narrativeIndices = chat.map((m, i) => isNarrativeMessage(m) ? i : -1).filter(i => i >= 0);
+    if (!narrativeIndices.length) return [];
+
     // If the whole chat fits in one chunk, just return it as-is
     const totalChars = chat.reduce((s, m) => s + msgText(m).length, 0);
     if (totalChars <= MAX_CHUNK_CHARS) {
-        return [{ start: 0, end: chat.length - 1 }];
+        return [{ start: narrativeIndices[0], end: narrativeIndices[narrativeIndices.length - 1] }];
     }
 
     const chunks = [];
-    let chunkStart = 0;
+    let chunkStart = narrativeIndices[0];
 
     while (chunkStart < chat.length) {
         let runningChars = 0;
@@ -1696,6 +1769,7 @@ function chunkMessagesForScan(chat, userName, rangeStart = 0, rangeEnd = null) {
         let endIdx = chunkStart;
 
         for (let i = chunkStart; i < chat.length; i++) {
+            if (!isNarrativeMessage(chat[i])) continue;
             const chars = msgText(chat[i]).length;
             if (runningChars + chars > MAX_CHUNK_CHARS && endIdx > chunkStart) {
                 const splitAt = lastBreak > chunkStart ? lastBreak : i;
@@ -1713,6 +1787,7 @@ function chunkMessagesForScan(chat, userName, rangeStart = 0, rangeEnd = null) {
         if (endIdx > chunkStart) {
             chunks.push({ start: chunkStart, end: endIdx - 1 });
             chunkStart = endIdx;
+            while (chunkStart < chat.length && !isNarrativeMessage(chat[chunkStart])) chunkStart++;
         }
     }
 

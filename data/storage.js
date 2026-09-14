@@ -12,6 +12,7 @@
  */
 
 import { chat_metadata, saveSettingsDebounced, saveChatDebounced, name1 } from "../../../../../script.js";
+import { getContext } from "../../../../extensions.js";
 import { extension_settings } from "../../../../../scripts/extensions.js";
 
 // ─── Constants ────────────────────────────────────────────
@@ -26,7 +27,7 @@ const NAMESPACE = "ml";
  * name) as the reliable signal — it's empty string when no chat is open.
  */
 function saveChat() {
-    if (name1) {
+    if (getContext()?.chatId) {
         saveChatDebounced();
     }
 }
@@ -111,7 +112,9 @@ function ensureChatNamespace() {
             scenes: [],            // All scene records
             consolidations: {},    // All consolidation entries, keyed by consolidation ID
             pendingEntries: null,  // Pending review entries from the memory writer (null = none)
-            messageCounter: 0,     // How many messages have passed (for scan frequency)
+            messageCounter: 0,     // Live narrative-message count at the last sidecar scan/baseline
+            sidecarPauseCadence: null, // Frozen {liveCount, baseline} while the sidecar is paused
+            lastSidecarRun: null,   // Latest diagnostic run summary (no prompt content)
             openSceneId: null,     // ID of the currently open scene (null = none open)
             stickiness: {},        // Tracks which entries are currently "sticky" { entryId: messagesRemaining }
             cooldowns: {},         // Tracks cooldown timers { entryId: messagesRemaining }
@@ -253,20 +256,30 @@ export function saveConsolidations(consolidations) {
 
 /**
  * Get pending review entries (shown on the Home tab).
- * @returns {object|null} Pending entries object or null
+ * @returns {object[]|null} Pending entries array or null
  */
 export function getPendingEntries() {
     ensureChatNamespace();
-    return chat_metadata[NAMESPACE].pendingEntries;
+    const pending = chat_metadata[NAMESPACE].pendingEntries;
+    if (!pending) return null;
+    // Older exports and early builds stored pending cards in an object map.
+    // Canonicalize at the storage boundary so every runtime workflow (writer,
+    // world writer, undo, and review UI) receives the same iterable shape.
+    return (Array.isArray(pending) ? pending : Object.values(pending)).filter(Boolean);
 }
 
 /**
  * Save pending review entries.
- * @param {object|null} pending
+ * @param {object[]|Record<string, object>|null} pending
  */
 export function savePendingEntries(pending) {
     ensureChatNamespace();
-    chat_metadata[NAMESPACE].pendingEntries = pending;
+    if (!pending) {
+        chat_metadata[NAMESPACE].pendingEntries = null;
+    } else {
+        const list = (Array.isArray(pending) ? pending : Object.values(pending)).filter(Boolean);
+        chat_metadata[NAMESPACE].pendingEntries = list.length ? list : null;
+    }
     saveChat();
 }
 
@@ -366,12 +379,62 @@ export function syncMessageCounterToLiveCount(liveMessageCount) {
 }
 
 /**
+ * Get the persisted sidecar pause snapshot for this chat.
+ * The snapshot stores the live narrative-message count and cadence baseline at
+ * the instant pause began so resume can preserve exact progress.
+ * @returns {{liveCount:number, baseline:number}|null}
+ */
+export function getSidecarPauseCadence() {
+    ensureChatNamespace();
+    const state = chat_metadata[NAMESPACE].sidecarPauseCadence;
+    if (!state || typeof state !== "object" || Array.isArray(state)) return null;
+
+    const liveCount = Number(state.liveCount);
+    const baseline = Number(state.baseline);
+    if (!Number.isFinite(liveCount) || !Number.isFinite(baseline)) return null;
+
+    const safeLiveCount = Math.max(0, Math.floor(liveCount));
+    const safeBaseline = Math.max(0, Math.min(Math.floor(baseline), safeLiveCount));
+    return { liveCount: safeLiveCount, baseline: safeBaseline };
+}
+
+/**
+ * Persist the exact cadence position at the moment of pause.
+ * @param {number} liveMessageCount
+ * @param {number} baseline
+ * @returns {{liveCount:number, baseline:number}}
+ */
+export function saveSidecarPauseCadence(liveMessageCount, baseline) {
+    ensureChatNamespace();
+    const parsedLive = Number(liveMessageCount);
+    const parsedBaseline = Number(baseline);
+    const safeLiveCount = Number.isFinite(parsedLive) ? Math.max(0, Math.floor(parsedLive)) : 0;
+    const safeBaseline = Number.isFinite(parsedBaseline)
+        ? Math.max(0, Math.min(Math.floor(parsedBaseline), safeLiveCount))
+        : 0;
+    const state = { liveCount: safeLiveCount, baseline: safeBaseline };
+    chat_metadata[NAMESPACE].sidecarPauseCadence = state;
+    saveChat();
+    return state;
+}
+
+/** Clear the persisted pause snapshot after cadence has been restored. */
+export function clearSidecarPauseCadence() {
+    ensureChatNamespace();
+    if (chat_metadata[NAMESPACE].sidecarPauseCadence !== null) {
+        chat_metadata[NAMESPACE].sidecarPauseCadence = null;
+        saveChat();
+    }
+}
+
+/**
  * Reset the message counter to zero.
  * Called when the user changes scan frequency or on chat switch.
  */
 export function resetMessageCounter() {
     ensureChatNamespace();
     chat_metadata[NAMESPACE].messageCounter = 0;
+    chat_metadata[NAMESPACE].sidecarPauseCadence = null;
     saveChat();
 }
 
@@ -444,8 +507,14 @@ export function getDefaultSettings() {
         // ST connection profiles to use for each ML role.
         connections: {
             memoryWriterLLM: "",       // Generates entries on scene close
+            sceneSummaryLLM: "",       // Optional separate scene-summary profile
             consolidationLLM: "",      // Generates arc/sub-arc consolidation summaries
             sidecarLLM: "",            // Extracts themes from context every N messages
+            maxResponseTokens: 8000,    // Shared writer/summary/world output budget
+            noThink: false,             // Legacy blanket fallback
+            noThinkHard: false,         // Legacy blanket hard fallback
+            noThinkProfiles: {},        // Per-profile soft suppression, keyed by UUID
+            noThinkHardProfiles: {},    // Per-profile hard suppression, keyed by UUID
         },
 
         // ── Embedding Settings ────────────────────────────
@@ -531,4 +600,19 @@ export function getDefaultSettings() {
             exemptPinned: true,        // Pinned memories always inject at full priority
         },
     };
+}
+
+/** Group synchronous data mutations; roll back in-memory state if any step fails.
+ * Saves use the host debounce, so only the completed state is left queued.
+ */
+export function runChatTransaction(commit) {
+    const data = getChatData();
+    const before = structuredClone(data);
+    try { return commit(); }
+    catch (error) {
+        for (const key of Object.keys(data)) delete data[key];
+        Object.assign(data, before);
+        saveChat();
+        throw error;
+    }
 }

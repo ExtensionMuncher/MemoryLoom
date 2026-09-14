@@ -1,3 +1,4 @@
+import { captureChatGuard } from "../lib/chatGuard.js";
 /**
  * llm/worldWriter.js — World memory generation
  *
@@ -46,7 +47,7 @@ A world memory must be a fact about the SETTING that would still be worth knowin
 POV: third-person omniscient. Refer to everyone, including the player character, by name and he/she/they. Never "I/me/my/we/us". The player character MAY appear if a genuine world fact centers on them, but their personal situation is almost never world lore (see rejections below).
 
 WHAT ACTUALLY QUALIFIES (be selective, but DO record these when present):
-- The nature of a major faction/organization AS AN INSTITUTION: what the Ravenshade Syndicate IS, its place in the city's power structure, how the yakuza world operates. NOT its current operations or roster.
+- The nature of a major faction/organization AS AN INSTITUTION: what the Kagutsuchi-gumi IS, its place in the city's power structure, how the yakuza world operates. NOT its current operations or roster.
 - How the world's systems work: its rules, its supernatural/technological laws, its social order.
 - The character of a significant, enduring LOCATION as a place in the world. NOT what happened there in a scene.
 
@@ -82,13 +83,13 @@ Examples that DO NOT qualify (interpersonal or plot-local, NOT world events — 
 The test for a world event: "Would this be recorded in THIS world's history, affecting people who weren't even in this scene, at this world's scale?" If it's really about what happened between specific people, it is NOT a world event. Most scenes contain NO world event. That is expected and correct.
 
 REJECT THESE — they are NOT world memories (these are your most common mistakes):
-✗ A specific named underling and their role. "Takeshi is a lieutenant with a scar who works from a garage in Nakano" → CHARACTER DATA. A roster of who's in an organization is not worldbuilding. REJECT.
-✗ Anything about surveillance/tracking/orders concerning a specific person (especially the player character). "A network is tracking Mira," "the clan issued orders about Mira," "her conversations are being logged" → these are PLOT EVENTS about a character, not world structure. REJECT, no matter how many vehicles are described.
-✗ A specific person's reputation, presence, abilities, habits, or psychology. "Kellan commands territorial presence," "Kellan is triggered by vanilla," "Kellan's courtship style" → CHARACTER MEMORIES wearing a costume. REJECT.
-✗ A personal arrangement, deal, or relationship between specific characters. "Kellan has a pact with Mira for sketches" → a plot/relationship beat. REJECT.
-✗ Weather, the atmosphere of a street on one day, the season. "Autumn in the capital, 14°C," "the market street smells of chestnuts" → transient scene texture. REJECT.
-✗ The internal operations, software version, or service protocols of one mundane business. "Kinokuniya's inventory system v4.2.17," "Kinokuniya's tiered customer service" → REJECT.
-✗ A specific friend group, their chat name, their members. "The Disaster Committee group chat" → CHARACTER ROSTER. REJECT.
+✗ A specific named underling and their role. "Morgan is a lieutenant with a scar who works from a garage downtown" → CHARACTER DATA. A roster of who's in an organization is not worldbuilding. REJECT.
+✗ Anything about surveillance/tracking/orders concerning a specific person (especially the player character). "A network is tracking Alex," "the council issued orders about Alex," "their conversations are being logged" → these are PLOT EVENTS about a character, not world structure. REJECT, no matter how many vehicles are described.
+✗ A specific person's reputation, presence, abilities, habits, or psychology. "Morgan commands territorial presence," "Morgan is triggered by a scent," "Morgan's courtship style" → CHARACTER MEMORIES wearing a costume. REJECT.
+✗ A personal arrangement, deal, or relationship between specific characters. "Morgan has a private pact with Alex for sketches" → a plot/relationship beat. REJECT.
+✗ Weather, the atmosphere of a street on one day, the season. "Autumn downtown, 14°C," "the market street smells of chestnuts" → transient scene texture. REJECT.
+✗ The internal operations, software version, or service protocols of one mundane business. "A bookstore's inventory system v4.2.17," "a shop's tiered customer service" → REJECT.
+✗ A specific friend group, their chat name, their members. "The Weekend Crew group chat" → CHARACTER ROSTER. REJECT.
 
 THE TEST, applied honestly: "Is this a fact about the fictional WORLD that belongs in a setting encyclopedia — or is it (a) about a specific person, (b) something happening in the plot, or (c) a passing scene detail?" Only the encyclopedia case qualifies. When unsure, REJECT — a missed fact costs nothing; this list of garbage is what we are eliminating.
 
@@ -183,9 +184,10 @@ Record what genuinely qualifies. Only if the scene establishes nothing new at th
 
 /** Parse world-memory and world-update blocks out of the LLM response. */
 function parseWorldResponse(response, sceneId) {
-    if (!response) return [];
+    if (!response) return null;
     const hasBlocks = /#\s*WORLD\s+(MEMORY|UPDATE|EVENT)/i.test(response);
     if (!hasBlocks && /\[NO WORLD MEMORY\]/i.test(response)) return [];
+    if (!hasBlocks) return null;
     const out = [];
 
     // Tolerant field matcher: accepts **Label**:, **Label:**, *Label:*, "Label:"
@@ -208,7 +210,7 @@ function parseWorldResponse(response, sceneId) {
         const datetime = fieldFrom(block, "Date/?Time|Date|Time");
         const type = fieldFrom(block, "Type");
         const content = contentFrom(block);
-        if (!content && !title) continue;
+        if (!content) continue;
 
         const isEvent = (kind === "EVENT") || (type && type.toLowerCase() === "event");
 
@@ -236,14 +238,18 @@ function parseWorldResponse(response, sceneId) {
             const rawLine = (block.match(/Target[*_:\s]*([^\n]*)/i) || [])[1] || "";
             const idMatch = rawLine.match(/ml_entry_[A-Za-z0-9_]+/);
             const targetId = idMatch ? idMatch[0] : "";
-            if (targetId) {
+            const validTarget = targetId && getAllEntries().some(entry => entry.id === targetId && entry.category === "world");
+            if (validTarget) {
                 base.updateTargetId = targetId;   // marks this as a revision
                 base.source = "scene_world_update";
+            } else {
+                console.warn(`[ML] World memory: discarded UPDATE with missing or unknown target "${targetId || "blank"}".`);
+                continue;
             }
         }
         out.push(base);
     }
-    return out;
+    return out.length > 0 ? out : null;
 }
 
 /**
@@ -252,6 +258,7 @@ function parseWorldResponse(response, sceneId) {
  * @returns {Promise<object[]|null>}
  */
 export async function generateWorldMemories(sceneId, force = false) {
+    const assertChat = captureChatGuard();
     // `force` is set by the explicit "Scan world" button so it runs regardless
     // of the auto-generation toggle. The toggle only governs AUTOMATIC passes
     // (scene close, batch scans).
@@ -273,11 +280,18 @@ export async function generateWorldMemories(sceneId, force = false) {
     const user = buildWorldUserPrompt(scene.llmSummary, sceneMessages, previousSummaries, knownFacts, getWorldScale());
 
     dlog(`World memory: scanning scene ${sceneId} against ${knownFacts.length} known world facts…`);
-    const response = await makeRequest(profileName, sys, user, getMaxResponseTokens(), 0.4);
+    const response = await makeRequest(profileName, sys, user, getMaxResponseTokens(), 0.4, {
+        requestLabel: "world memory generation",
+    });
+    assertChat();
     if (!response) { dlog("World memory: empty response from LLM"); return null; }
 
     dlog(`World memory: raw response (${response.length} chars):`, response.slice(0, 600));
     const entries = parseWorldResponse(response, sceneId);
+    if (entries === null) {
+        console.warn(`[ML] World memory: response could not be parsed for ${sceneId}.`);
+        return null;
+    }
     dlog(`World memory: ${entries.length} world fact(s) parsed from response`);
     if (entries.length > 0) {
         const existing = getPendingEntries() || [];

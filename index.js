@@ -1,3 +1,4 @@
+import { captureChatGuard } from "./lib/chatGuard.js";
 /**
  * index.js — Memory Loom
  */
@@ -19,10 +20,10 @@ console.log = function (...args) {
     }
     __mlOrigLog(...args);
 };
-import { getFolders, saveFolders, getEntries, getScenes, getPendingEntries, savePendingEntries, getOpenSceneId, saveOpenSceneId, setMessageCounter, syncMessageCounterToLiveCount, getStickinessMap, saveStickinessMap, getCooldownsMap, saveCooldownsMap } from "./data/storage.js";
+import { getFolders, saveFolders, getEntries, getScenes, getPendingEntries, savePendingEntries, getOpenSceneId, saveOpenSceneId, getMessageCounter, setMessageCounter, syncMessageCounterToLiveCount, getSidecarPauseCadence, saveSidecarPauseCadence, clearSidecarPauseCadence, getStickinessMap, saveStickinessMap, getCooldownsMap, saveCooldownsMap } from "./data/storage.js";
 import { createPanel, showPanelLoading, hidePanelLoading, setProcessingStatus } from "./ui/panel.js";
 import { injectSvgDefs } from "./lib/icons.js";
-import { renderHomeTab } from "./ui/home.js";
+import { renderHomeTab, refreshSidecarCadenceDisplay, setSidecarCadenceRunning } from "./ui/home.js";
 import { renderLibraryTab } from "./ui/library.js";
 import { renderSettingsTab } from "./ui/settings.js";
 import { extractKeywords } from "./llm/sidecar.js";
@@ -33,8 +34,10 @@ import { runWriterFlow } from "./llm/writer.js";
 import { maybeAutoConsolidate } from "./llm/consolidationOrchestrator.js";
 import { runRetrievalPipeline, tickCounters } from "./embed/retriever.js";
 import { updateInjection, removeInjection } from "./inject/promptInjector.js";
+import { isNarrativeMessage, narrativeMessages } from "./lib/chatMessages.js";
 import { createScene, closeScene, getOpenScene, isMessageInClosedScene, initSceneCounter, recordLastClosedScene } from "./data/scenes.js";
 import { getAllEntries, resetEntryMigrationGuards } from "./data/entries.js";
+import { reconcileFolderEntryCounts } from "./data/folders.js";
 
 let _sidecarRunning = false;
 
@@ -53,6 +56,8 @@ let mlPopoutVisible = false, $mlPopout = null;
 jQuery(async () => {
     try {
         await initSettings(); window.__ML_DEBUG = getSetting("debug.enabled", false);
+        initDefaultFolders();
+        reconcileFolderEntryCounts();
         injectSvgDefs();
         createPanel();
         renderHomeTab($("#ml-p-home"));
@@ -90,20 +95,32 @@ jQuery(async () => {
  * mode, so "why didn't the sidecar run" is answerable from the F12 console.
  */
 let _sidecarStartedAt = 0;
+let _sidecarRunId = 0;
 const SIDECAR_TIMEOUT_MS = 45000; // hard cap per run — a hung LLM call must never wedge the pipeline
 
 async function runSidecarPipeline(trigger) {
+    const assertChat = captureChatGuard();
     const liveCount = syncRuntimeMessageState(`sidecar ${trigger}`);
     const rawFreq = Number(getSetting("scanFrequency", 1));
     const freq = Number.isFinite(rawFreq) && rawFreq > 0 ? Math.floor(rawFreq) : 1;
+
+    // Pause is a true cadence freeze. Keep the original snapshot intact no
+    // matter how many narrative messages are added while paused.
+    if (isSidecarPaused()) {
+        captureSidecarPauseCadence(liveCount);
+        refreshSidecarCadenceDisplay(liveCount);
+        dlog("Sidecar skipped — paused; cadence progress frozen");
+        return;
+    }
+
     const sync = syncMessageCounterToLiveCount(liveCount);
     const lastScanCount = sync.counter;
     const messagesSinceScan = Math.max(0, liveCount - lastScanCount);
     const shouldFire = messagesSinceScan >= freq;
 
     dlog(`Sidecar trigger: ${trigger} (liveCount=${liveCount}, lastSidecarCount=${lastScanCount}, sinceLastScan=${messagesSinceScan}, runs every ${freq})`);
+    refreshSidecarCadenceDisplay(liveCount);
     if (!shouldFire) { dlog(`Sidecar skipped — ${messagesSinceScan}/${freq} message(s) since last scan (next run in ${freq - messagesSinceScan} message(s))`); return; }
-    if (isSidecarPaused()) { dlog("Sidecar skipped — paused from Home tab"); return; }
     // Empty-library guard: the sidecar exists to find stored memories that match
     // the current conversation. With zero entries in the library there is nothing
     // to match against, so every LLM call would be wasted. Skip until the library
@@ -128,18 +145,32 @@ async function runSidecarPipeline(trigger) {
     setMessageCounter(liveCount);
 
     _sidecarRunning = true;
+    setSidecarCadenceRunning(true);
     _sidecarStartedAt = Date.now();
+    const runStamp = ++_sidecarRunId;
+    let timer;
+    const assertCurrent = () => {
+        assertChat();
+        if (!isEnabled() || isSidecarPaused() || _sidecarRunId !== runStamp) throw new Error("Sidecar cancelled or superseded");
+    };
     try {
         dlog("Sidecar: calling keyword LLM…");
-        const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("sidecar timed out")), SIDECAR_TIMEOUT_MS));
+        const timeout = new Promise((_, rej) => timer = setTimeout(() => rej(new Error("sidecar timed out")), SIDECAR_TIMEOUT_MS));
         const keywords = await Promise.race([extractKeywords(), timeout]);
+        assertCurrent();
         dlog("Sidecar keywords:", JSON.stringify(keywords));
         const candidates = await Promise.race([runRetrievalPipeline(keywords), timeout]);
         dlog(`Retriever returned ${candidates.length} candidate(s):`, candidates.map(c => `"${c.entry.title}" (${(c.score ?? 0).toFixed(3)})`).join(", ") || "(none)");
-        updateInjection(candidates);
+        assertCurrent();
         tickCounters();
+        updateInjection(candidates);
     } catch (err) { console.error("[ML] Sidecar error:", err); }
-    finally { _sidecarRunning = false; }
+    finally {
+        clearTimeout(timer);
+        if (_sidecarRunId === runStamp) _sidecarRunning = false;
+        setSidecarCadenceRunning(false);
+        refreshSidecarCadenceDisplay();
+    }
 }
 
 /**
@@ -163,6 +194,7 @@ globalThis.memoryLoomGenerateInterceptor = async function (chat, contextSize, ab
     }
 };
 
+
 // ── Runtime Message State ─────────────────────────────────
 
 /**
@@ -173,10 +205,7 @@ globalThis.memoryLoomGenerateInterceptor = async function (chat, contextSize, ab
  * @returns {number}
  */
 function getLiveMessageCount(mesId = null) {
-    const chatLength = Array.isArray(chat) ? chat.length : 0;
-    const parsed = mesId !== null && mesId !== undefined ? parseInt(mesId, 10) : NaN;
-    const fromMesId = Number.isFinite(parsed) && parsed >= 0 ? parsed + 1 : 0;
-    return Math.max(chatLength, fromMesId);
+    return narrativeMessages(chat).length;
 }
 
 /**
@@ -221,6 +250,27 @@ function resetRuntimeMessageState(reason = "chat changed") {
         (sync.changed ? `, sidecar counter clamped ${sync.previous} → ${sync.counter}` : ""));
 }
 
+/** Freeze cadence progress without consuming messages that arrive while paused. */
+function captureSidecarPauseCadence(liveCount = getLiveMessageCount(), force = false) {
+    const sync = syncMessageCounterToLiveCount(liveCount);
+    const existing = getSidecarPauseCadence();
+    if (!force && existing) return existing;
+    return saveSidecarPauseCadence(liveCount, sync.counter);
+}
+
+/** Restore the exact pre-pause progress against the current live chat length. */
+function restoreSidecarPauseCadence(liveCount = getLiveMessageCount()) {
+    const snapshot = getSidecarPauseCadence();
+    if (!snapshot) return syncMessageCounterToLiveCount(liveCount).counter;
+
+    const progressAtPause = Math.max(0, snapshot.liveCount - snapshot.baseline);
+    const preservedProgress = Math.min(progressAtPause, Math.max(0, liveCount));
+    const restoredBaseline = Math.max(0, Math.floor(liveCount) - preservedProgress);
+    setMessageCounter(restoredBaseline);
+    clearSidecarPauseCadence();
+    return restoredBaseline;
+}
+
 // One delegated listener handles every scene button, no matter how many times
 // the buttons are rebuilt. Bound to document so it survives ST's frequent
 // message-row re-renders (the reason direct handlers failed on mobile). We guard
@@ -260,9 +310,29 @@ function registerSceneButtonDelegate() {
 
 function registerEventHandlers() {
     registerSceneButtonDelegate();
+
+    $(document).on("ml:sidecar-pause-changed", (_event, paused) => {
+        // Invalidate any in-flight result so a request started before pause can
+        // never inject after the user resumes quickly.
+        _sidecarRunId++;
+        _sidecarRunning = false;
+        setSidecarCadenceRunning(false);
+        const liveCount = getLiveMessageCount();
+        if (paused) {
+            const snapshot = captureSidecarPauseCadence(liveCount, true);
+            const progress = Math.max(0, snapshot.liveCount - snapshot.baseline);
+            dlog(`[ML] Sidecar paused; cadence frozen at ${progress} message(s) of progress.`);
+        } else {
+            const restoredBaseline = restoreSidecarPauseCadence(liveCount);
+            dlog(`[ML] Sidecar resumed; cadence baseline restored to ${restoredBaseline} at liveCount=${liveCount}.`);
+        }
+        refreshSidecarCadenceDisplay(liveCount);
+    });
     eventSource.on(event_types.MESSAGE_RECEIVED, async (mesId) => {
         if (!isEnabled()) return;
-        syncRuntimeMessageState("MESSAGE_RECEIVED", mesId);
+        if (chat?.[Number(mesId)] && !isNarrativeMessage(chat[Number(mesId)])) return;
+        const liveCount = syncRuntimeMessageState("MESSAGE_RECEIVED", mesId);
+        refreshSidecarCadenceDisplay(liveCount);
         if (mesId !== undefined && _processedMesIds.has(mesId)) return;
         if (mesId !== undefined) _processedMesIds.add(mesId);
         addMessageButtons(mesId);
@@ -271,16 +341,27 @@ function registerEventHandlers() {
 
     eventSource.on(event_types.MESSAGE_SENT, (mesId) => {
         if (!isEnabled()) return;
-        syncRuntimeMessageState("MESSAGE_SENT", mesId);
+        if (chat?.[Number(mesId)] && !isNarrativeMessage(chat[Number(mesId)])) return;
+        const liveCount = syncRuntimeMessageState("MESSAGE_SENT", mesId);
+        refreshSidecarCadenceDisplay(liveCount);
         if (mesId !== undefined && _processedMesIds.has(mesId)) return;
         if (mesId !== undefined) _processedMesIds.add(mesId);
         addMessageButtons(mesId);
     });
     eventSource.on(event_types.CHAT_CHANGED, () => {
+        _sidecarRunId++;
+        _sidecarRunning = false;
         clearLastRetrievalTrace();
         resetRuntimeMessageState("CHAT_CHANGED");
+        setSidecarCadenceRunning(false);
+        const liveCount = getLiveMessageCount();
+        if (isSidecarPaused()) captureSidecarPauseCadence(liveCount);
+        else if (getSidecarPauseCadence()) restoreSidecarPauseCadence(liveCount);
+        else clearSidecarPauseCadence();
+        refreshSidecarCadenceDisplay(liveCount);
         resetEntryMigrationGuards();   // re-run per-chat migrations for the new chat
         initDefaultFolders();
+        reconcileFolderEntryCounts();
         initSceneCounter();
         renderHomeTab($("#ml-p-home"));
         renderLibraryTab($("#ml-p-library"));
@@ -348,8 +429,16 @@ async function handleSceneButtonAction(action, mesId) {
         renderHomeTab($("#ml-p-home"));
         try {
             const result = await runWriterFlow(closed.id);
-            if (result && result.length > 0) toastr?.success?.(result.length + " entr" + (result.length === 1 ? "y" : "ies") + " ready for review.");
-            else toastr?.warning?.("Scene closed. Check LLM connection.");
+            if (result?.ok) {
+                const count = (result.entries?.length || 0) + (result.worldEntries?.length || 0);
+                if (count > 0) {
+                    toastr?.success?.(count + " entr" + (count === 1 ? "y" : "ies") + " ready for review.");
+                } else {
+                    toastr?.success?.("Scene scan complete — no new memories were needed.");
+                }
+            } else {
+                toastr?.warning?.(`Scene closed, but ${result?.error || "memory generation failed"} You can retry it from Memory Loom Home.`);
+            }
         } catch (e) { console.error(e); toastr?.error?.("Entry generation failed."); }
         hidePanelLoading();
         setProcessingStatus(null);

@@ -305,6 +305,26 @@
     margin-top: 3px;
 }
 
+/* Quiet persistent sidecar cadence indicator — mirrors NWST/RST */
+.ml-sidecar-cadence {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 18px;
+    margin: -7px 0 12px;
+    padding: 2px 4px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10.5px;
+    line-height: 1.35;
+    color: #888;
+    cursor: help;
+}
+.ml-sidecar-cadence-dot { font-size: 8px; color: #7f9b83; }
+.ml-sidecar-cadence[data-status="scanning"] .ml-sidecar-cadence-dot { color: #6f91b8; }
+.ml-sidecar-cadence[data-status="paused"] .ml-sidecar-cadence-dot,
+.ml-sidecar-cadence[data-status="disabled"] .ml-sidecar-cadence-dot,
+.ml-sidecar-cadence[data-status="due"] .ml-sidecar-cadence-dot { color: #a99a6c; }
+
 /* ─── Writer Active Indicator ────────────────────────────── */
 
 .ml-writer-active {
@@ -2161,6 +2181,23 @@ body.ml-disabled .ml-scene-btn {
     border-bottom: 1px solid #333;
     padding: 12px 0;
 }
+.ml-retrieval-trace-details > summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    cursor: pointer;
+    list-style: none;
+    padding: 2px 0;
+}
+.ml-retrieval-trace-details > summary::-webkit-details-marker { display: none; }
+.ml-retrieval-trace-details > .ml-retrieval-trace-header { margin-top: 12px; }
+.ml-retrieval-trace-chevron {
+    flex: 0 0 auto;
+    color: var(--SmartThemeBodyColor, #aaa);
+    transition: transform 0.16s ease;
+}
+.ml-retrieval-trace-details[open] .ml-retrieval-trace-chevron { transform: rotate(180deg); }
 .ml-retrieval-trace-header {
     display: flex;
     align-items: center;
