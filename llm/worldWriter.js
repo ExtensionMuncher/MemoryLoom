@@ -15,23 +15,24 @@ import { captureChatGuard } from "../lib/chatGuard.js";
  * section of the Home tab.
  */
 
-import { makeRequest } from "./connections.js";
+import { makeRequest, getLastRequestDiagnostic } from "./connections.js";
 import { getScene, getPreviousSceneSummaries } from "../data/scenes.js";
 import { getAllEntries } from "../data/entries.js";
 import { getPendingEntries, savePendingEntries, getWorldScale } from "../data/storage.js";
 import { getSetting } from "../settings.js";
 import { getSceneMessages } from "./writer.js";
 import { dlog } from "../lib/debug.js";
+import { isEffectivelySuppressed } from "../data/suppression.js";
 
 function getMaxResponseTokens() {
-    const v = Number(getSetting("connections.maxResponseTokens", 8000));
-    return (Number.isFinite(v) && v >= 500) ? v : 8000;
+    const v = Number(getSetting("connections.writerMaxResponseTokens", 25000));
+    return (Number.isFinite(v) && v >= 500) ? v : 25000;
 }
 
 /** Pull existing world memories so the model can reconcile against known lore. */
 function getKnownWorldFacts() {
     const all = getAllEntries()
-        .filter(e => e.category === "world")
+        .filter(e => e.category === "world" && !isEffectivelySuppressed(e))
         .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
     // Cap the list so a long backlog of known facts doesn't dominate the prompt
     // and push the model toward "everything's already known → nothing new".
@@ -92,6 +93,11 @@ REJECT THESE — they are NOT world memories (these are your most common mistake
 ✗ A specific friend group, their chat name, their members. "The Weekend Crew group chat" → CHARACTER ROSTER. REJECT.
 
 THE TEST, applied honestly: "Is this a fact about the fictional WORLD that belongs in a setting encyclopedia — or is it (a) about a specific person, (b) something happening in the plot, or (c) a passing scene detail?" Only the encyclopedia case qualifies. When unsure, REJECT — a missed fact costs nothing; this list of garbage is what we are eliminating.
+
+DECISION DISCIPLINE — IMPORTANT:
+- Make ONE qualification pass. Once a candidate is accepted or rejected, do not reopen the same decision repeatedly.
+- When uncertain, REJECT and move on instead of repeatedly reconsidering whether the same detail clears the bar.
+- Do not narrate your selection process or draft alternatives in the final answer. Reserve the completion for the final world-memory blocks.
 
 INTERPRETATION GROUNDING: When a character action is evidence for world lore, preserve the source's stated motive and level of certainty. Do not reinterpret fear, desperation, panic, confusion, self-preservation, or reactive behavior as strategy, dominance, competence, or calculated control merely because the action succeeded. A character's belief or misinterpretation is not world truth: if it matters at all, label it as that character's belief, and never upgrade it into an encyclopedia fact.
 
@@ -238,7 +244,8 @@ function parseWorldResponse(response, sceneId) {
             const rawLine = (block.match(/Target[*_:\s]*([^\n]*)/i) || [])[1] || "";
             const idMatch = rawLine.match(/ml_entry_[A-Za-z0-9_]+/);
             const targetId = idMatch ? idMatch[0] : "";
-            const validTarget = targetId && getAllEntries().some(entry => entry.id === targetId && entry.category === "world");
+            const validTarget = targetId && getAllEntries().some(entry => entry.id === targetId
+                && entry.category === "world" && !isEffectivelySuppressed(entry));
             if (validTarget) {
                 base.updateTargetId = targetId;   // marks this as a revision
                 base.source = "scene_world_update";
@@ -277,14 +284,23 @@ export async function generateWorldMemories(sceneId, force = false) {
     const knownFacts = getKnownWorldFacts();
 
     const sys = buildWorldSystemPrompt();
-    const user = buildWorldUserPrompt(scene.llmSummary, sceneMessages, previousSummaries, knownFacts, getWorldScale());
+    // The current scene summary is metadata for the user/library, not evidence for
+    // world extraction. Feeding it back here let a bad summary poison a second LLM
+    // pass. World memory generation now uses the raw source scene plus older
+    // continuity only, just like the character-memory writer.
+    const user = buildWorldUserPrompt("", sceneMessages, previousSummaries, knownFacts, getWorldScale());
 
     dlog(`World memory: scanning scene ${sceneId} against ${knownFacts.length} known world facts…`);
     const response = await makeRequest(profileName, sys, user, getMaxResponseTokens(), 0.4, {
         requestLabel: "world memory generation",
     });
+    const diagnostic = getLastRequestDiagnostic();
     assertChat();
-    if (!response) { dlog("World memory: empty response from LLM"); return null; }
+    if (!response) {
+        console.warn("[ML] World memory: no visible response from LLM", diagnostic || "");
+        dlog("World memory: empty response from LLM");
+        return null;
+    }
 
     dlog(`World memory: raw response (${response.length} chars):`, response.slice(0, 600));
     const entries = parseWorldResponse(response, sceneId);

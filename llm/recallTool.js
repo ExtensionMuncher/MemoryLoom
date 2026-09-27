@@ -30,6 +30,8 @@ import { getEntries } from "../data/storage.js";
 import { formatMemoriesAsBlocks } from "../inject/promptInjector.js";
 import { resolveCanonicalCharacter } from "../data/folders.js";
 import { dlog } from "../lib/debug.js";
+import { isEffectivelySuppressed } from "../data/suppression.js";
+import { captureChatGuard } from "../lib/chatGuard.js";
 
 const TOOL_NAME = "search_core_memories";
 
@@ -85,12 +87,13 @@ export function registerMemoryRecallTool() {
  * optional character filter, own result limit.
  */
 async function searchCoreMemories(query, characterFilter) {
+    const assertChat = captureChatGuard();
     const q = String(query || "").trim();
     if (!q) return "No search query was provided.";
 
     const limit = Math.max(1, Number(getSetting("injection.maxToolCallMemories", 5)) || 5);
     const collectionId = getCollectionId();
-    const allEntries = Object.values(getEntries() || {});
+    const allEntries = Object.values(getEntries() || {}).filter(entry => !isEffectivelySuppressed(entry));
     if (allEntries.length === 0) return "The memory archive is empty — no Core Memories exist yet.";
 
     dlog(`Recall tool: query "${q}"${characterFilter ? `, character "${characterFilter}"` : ""}, limit ${limit}`);
@@ -101,6 +104,7 @@ async function searchCoreMemories(query, characterFilter) {
     let hits = [];
     if (collectionId) {
         const raw = await queryCollection(collectionId, q, Math.max(limit * 3, 10), threshold, buildVectorSettings());
+        assertChat();
         if (raw?.hashes?.length) {
             for (let i = 0; i < raw.hashes.length; i++) {
                 const entry = allEntries.find(e => e.vectorHash === raw.hashes[i]);
@@ -134,6 +138,14 @@ async function searchCoreMemories(query, characterFilter) {
         });
         dlog(`Recall tool: ${hits.length} hit(s) after character filter "${canon}"`);
     }
+
+    // Rebind after the asynchronous vector request. A deleted or newly
+    // suppressed memory must not be returned from the captured pre-query list.
+    const liveEntries = getEntries() || {};
+    hits = hits.map(hit => {
+        const entry = liveEntries[hit.entry?.id];
+        return entry && !isEffectivelySuppressed(entry) ? { ...hit, entry } : null;
+    }).filter(Boolean);
 
     if (hits.length === 0) {
         return `No Core Memories found matching "${q}"${characterFilter ? ` for ${characterFilter}` : ""}. The memory may not exist in the archive.`;

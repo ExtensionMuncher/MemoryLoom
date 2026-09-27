@@ -57,6 +57,7 @@ function summarizeCandidate(candidate, index) {
     const flags = [];
     if (entry.status) flags.push(`status=${entry.status}`);
     if (entry.important) flags.push("important");
+    if (candidate.chainExpanded) flags.push(`chain_expanded_from=${candidate.chainSeedId || "unknown"}`);
 
     const lines = [
         `Candidate ${index + 1}`,

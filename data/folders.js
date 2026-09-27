@@ -242,7 +242,7 @@ export function setFolderAliases(folderId, aliases) {
  * Resolve any name variant to the canonical character name of an existing
  * character folder. Three matching layers, all case-insensitive:
  *   1. Exact match on a folder's character name
- *   2. Token-set match — "Alex Morgan" and "Morgan Alex" are the same
+ *   2. Token-set match — "Morgan Alex" and "Alex Morgan" are the same
  *      words in a different order, so they resolve to the same folder
  *      automatically, no alias needed
  *   3. Alias match — user-defined nicknames stored on the folder

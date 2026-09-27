@@ -1,4 +1,6 @@
 import { getChatData, persistChatData } from "./data/storage.js";
+import { notifyMemoryEligibilityChanged } from "./lib/eligibilityEvents.js";
+import { getAllEntries, resetEntryMigrationGuards } from "./data/entries.js";
 /**
  * settings.js — Settings management for Memory Loom
  *
@@ -47,6 +49,13 @@ export async function initSettings() {
     if (_sp === defaults.memoryWriting.sceneSummaryPrompt) {
         if (merged.memoryWriting) merged.memoryWriting.sceneSummaryPrompt = "";
         console.log("[ML] Cleared stale scene summary prompt");
+    }
+    // v0.1.44 removed unauthorized scene-evidence compaction completely.
+    // Strip the obsolete key from saved settings so old exports/settings cannot
+    // suggest that scene source text is still capped or sampled.
+    if (merged.memoryWriting && Object.prototype.hasOwnProperty.call(merged.memoryWriting, "sceneEvidenceMaxChars")) {
+        delete merged.memoryWriting.sceneEvidenceMaxChars;
+        console.log("[ML] Removed obsolete sceneEvidenceMaxChars setting; scene evidence is now always verbatim.");
     }
     storageSaveAllSettings(merged);
 
@@ -116,6 +125,11 @@ export function toggleEnabled(enabled) {
  */
 export function resetSettingsToDefaults() {
     const defaults = getDefaultSettings();
+    // Empty prompt fields are the marker for the current dynamic built-ins.
+    // Restoring the legacy literal here temporarily disabled newer writer
+    // instructions (including chaining/supersession) until the next reload.
+    defaults.memoryWriting.memoryEntryPrompt = "";
+    defaults.memoryWriting.sceneSummaryPrompt = "";
     storageSaveAllSettings(defaults);
     console.log("[ML] Settings reset to defaults.");
 }
@@ -150,11 +164,12 @@ export function setSidecarPaused(paused) {
 
 /**
  * Get the configured LLM connection profile names.
- * @returns {{memoryWriterLLM: string, consolidationLLM: string, sidecarLLM: string}}
+ * @returns {{memoryWriterLLM: string, sceneSummaryLLM: string, consolidationLLM: string, sidecarLLM: string}}
  */
 export function getConnectionNames() {
     return getSetting("connections", {
         memoryWriterLLM: "",
+        sceneSummaryLLM: "",
         consolidationLLM: "",
         sidecarLLM: "",
     });
@@ -209,7 +224,7 @@ export async function exportAllData(chatData) {
     const data = {
         settings: getSettings(),
         chatData: chatData,
-        version: "0.1.18",
+        version: "0.1.45",
         exportedAt: new Date().toISOString(),
     };
     return JSON.stringify(data, null, 2);
@@ -237,7 +252,7 @@ export async function importAllData(jsonString, options = {}) {
             for (const key of ["folders", "scenes"]) {
                 if (cd[key] !== undefined && (!Array.isArray(cd[key]) || cd[key].some(x => !object(x) || !x.id))) throw new Error(`Invalid ${key}`);
             }
-            for (const key of ["entries", "consolidations"]) {
+            for (const key of ["entries", "consolidations", "chains"]) {
                 if (cd[key] !== undefined && (!object(cd[key]) && !Array.isArray(cd[key]))) throw new Error(`Invalid ${key}`);
                 if (cd[key] !== undefined && Object.values(cd[key]).some(x => !object(x) || !x.id)) throw new Error(`Invalid ${key} record`);
             }
@@ -259,26 +274,61 @@ export async function importAllData(jsonString, options = {}) {
         const target = cd ? getChatData() : null;
         const next = target ? (dataMode === "replace" ? emptyChatData() : structuredClone(target)) : null;
         if (cd) {
-            for (const key of ["entries", "consolidations"]) if (cd[key] !== undefined) {
+            for (const key of ["entries", "consolidations", "chains"]) if (cd[key] !== undefined) {
                 const incoming = normalizeMap(cd[key]);
                 next[key] = dataMode === "replace" ? incoming : mergeById(next[key], incoming);
             }
             for (const key of ["folders", "scenes"]) if (cd[key] !== undefined) next[key] = dataMode === "replace" ? cd[key] : mergeArrayById(next[key], cd[key]);
             if (cd.pendingEntries !== undefined) next.pendingEntries = dataMode === "replace" ? normalizePendingEntries(cd.pendingEntries) : mergePendingEntries(next.pendingEntries, cd.pendingEntries);
+            if (cd.pendingChainProposals !== undefined) next.pendingChainProposals = Array.isArray(cd.pendingChainProposals) ? structuredClone(cd.pendingChainProposals) : [];
+            if (cd.chainBatches !== undefined) next.chainBatches = Array.isArray(cd.chainBatches) ? structuredClone(cd.chainBatches) : [];
             importChatMetaFields(cd, next, dataMode);
             if (next.openSceneId && !(next.scenes || []).some(s => s.id === next.openSceneId)) next.openSceneId = null;
+            normalizeChainAndSuppressionMetadata(next);
         }
         const settings = data.settings
             ? deepMerge(getDefaultSettings(), settingsMode === "overwrite" ? data.settings : deepMerge(data.settings, getSettings()))
             : null;
+        if (settings?.memoryWriting && Object.prototype.hasOwnProperty.call(settings.memoryWriting, "sceneEvidenceMaxChars")) {
+            delete settings.memoryWriting.sceneEvidenceMaxChars;
+        }
         // Everything above is staged; no async gap exists in the commit.
         if (settings) storageSaveAllSettings(settings);
-        if (next) { Object.assign(target, next); persistChatData(); }
+        if (next) {
+            Object.assign(target, next);
+            persistChatData();
+            resetEntryMigrationGuards();
+            getAllEntries(); // migrate legacy writer/consolidation suppression records in imported data immediately
+            notifyMemoryEligibilityChanged();
+        }
         console.log(`[ML] Import complete (settings: ${settingsMode}, data: ${dataMode})`);
         return true;
     } catch (err) {
         console.error("[ML] Failed to import data:", err);
         return false;
+    }
+}
+
+/** Validate references before an import can replace live per-chat state. */
+function normalizeChainAndSuppressionMetadata(data) {
+    const entries = data.entries || {};
+    const chains = data.chains || {};
+    const memberships = new Map(Object.keys(entries).map(id => [id, []]));
+    for (const [key, chain] of Object.entries(chains)) {
+        if (!chain || chain.id !== key || !Array.isArray(chain.memoryIds)) throw new Error("Invalid chain record");
+        const ids = [...new Set(chain.memoryIds.filter(Boolean))];
+        if (ids.length < 2 || ids.some(id => !entries[id])) throw new Error(`Chain ${key} contains dangling memory IDs`);
+        chain.memoryIds = ids;
+        for (const id of ids) memberships.get(id).push(key);
+    }
+    for (const [id, entry] of Object.entries(entries)) {
+        entry.chainIds = [...new Set(memberships.get(id) || [])];
+        if (!Array.isArray(entry.suppressions)) entry.suppressions = [];
+        for (const item of entry.suppressions) {
+            if (!item || !["consolidation", "superseded", "manual"].includes(item.reason)) throw new Error(`Memory ${id} has invalid suppression provenance`);
+            if (item.successorId && !entries[item.successorId]) throw new Error(`Memory ${id} has a dangling suppression successor`);
+            if (item.successorId === id) throw new Error(`Memory ${id} cannot supersede itself`);
+        }
     }
 }
 
@@ -357,6 +407,9 @@ function emptyChatData() {
         folders: [],
         scenes: [],
         consolidations: {},
+        chains: {},
+        pendingChainProposals: [],
+        chainBatches: [],
         pendingEntries: null,
         messageCounter: 0,
         sidecarPauseCadence: null,

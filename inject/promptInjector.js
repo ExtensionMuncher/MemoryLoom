@@ -15,12 +15,15 @@ import { getSetting } from "../settings.js";
 import { isMLInternalGen } from "../llm/connections.js";
 import { recordInjection } from "../embed/retriever.js";
 import { dlog } from "../lib/debug.js";
+import { getEntry } from "../data/entries.js";
+import { isEffectivelySuppressed } from "../data/suppression.js";
 
 // ─── Constants ────────────────────────────────────────────
 
 /** Extension prompt tag — unique identifier for ML's injection */
 const PROMPT_ID = "ml-memory-injection";
 const ROLE_SYSTEM = 0;
+let activeCandidates = [];
 
 // ST extension_prompt_types: IN_PROMPT=0 (story string / before main),
 // IN_CHAT=1 (inserted into chat at a given depth), BEFORE_PROMPT=2.
@@ -63,7 +66,12 @@ export function updateInjection(candidates) {
         return;
     }
 
-    if (!candidates || candidates.length === 0) {
+    candidates = (candidates || []).map(candidate => {
+        const entry = getEntry(candidate?.entry?.id);
+        return entry && !isEffectivelySuppressed(entry) ? { ...candidate, entry } : null;
+    }).filter(Boolean);
+
+    if (candidates.length === 0) {
         removeInjection();
         return;
     }
@@ -81,6 +89,7 @@ export function updateInjection(candidates) {
     // mechanism the built-in Vector Storage uses, so the block participates in
     // prompt assembly and is visible/inspectable in ST's prompt itinerary.
     setExtensionPrompt(PROMPT_ID, content, place.position, place.depth, false, place.role);
+    activeCandidates = candidates;
 
     // Start stickiness for each injected entry so it stays active for a few
     // messages after firing. Per-entry overrides take precedence over the
@@ -103,7 +112,26 @@ export function updateInjection(candidates) {
  * Remove the injected memory block from the system prompt.
  */
 export function removeInjection() {
+    activeCandidates = [];
     setExtensionPrompt(PROMPT_ID, "", 0, 0, false, ROLE_SYSTEM);
+}
+
+/** Rebuild the existing block after a local memory mutation, without treating
+ * unchanged entries as freshly retrieved or restarting their cooldowns. */
+export function refreshCurrentInjectionEligibility() {
+    const settings = getSetting("injection", {});
+    const candidates = activeCandidates.map(candidate => {
+        const entry = getEntry(candidate?.entry?.id);
+        return entry && !isEffectivelySuppressed(entry) ? { ...candidate, entry } : null;
+    }).filter(Boolean);
+    if (!settings.enabled || !candidates.length) {
+        removeInjection();
+        return;
+    }
+    const content = buildInjectionBlock(candidates);
+    const place = resolvePlacement(settings.placement);
+    setExtensionPrompt(PROMPT_ID, content, place.position, place.depth, false, place.role);
+    activeCandidates = candidates;
 }
 
 // ─── Injection Block Builder ──────────────────────────────

@@ -14,7 +14,7 @@
  */
 
 
-import { getScenes, saveScenes, getOpenSceneId, saveOpenSceneId, getConsolidations as getConsolidationsForScenes, getPendingEntries, savePendingEntries } from "./storage.js";
+import { getScenes, saveScenes, getOpenSceneId, saveOpenSceneId, getConsolidations as getConsolidationsForScenes, getPendingEntries, savePendingEntries, runChatTransaction } from "./storage.js";
 import { getAllEntries, deleteEntry } from "./entries.js";
 import { deleteEntryVector } from "../embed/embedder.js";
 import { getSetting, setSetting } from "../settings.js";
@@ -429,32 +429,24 @@ export function undoLastScan() {
     if (!status.available) return false;
     const sceneId = status.sceneId;
 
-    // Remove committed entries created by this scene
-    let removed = 0;
-    try {
-        const all = getAllEntries();
-        for (const e of all) {
-            if (e.sceneId === sceneId) {
-                // Remove the vector too, or undo leaves orphaned embeddings that
-                // can still be retrieved after the entry is gone.
-                deleteEntryVector(e).catch(err => console.warn("[ML] Undo: vector delete failed:", err));
-                deleteEntry(e.id);
-                removed++;
-            }
+    const removedEntries = [];
+    const result = runChatTransaction(() => {
+        for (const entry of getAllEntries()) {
+            if (entry.sceneId !== sceneId) continue;
+            removedEntries.push(entry);
+            if (!deleteEntry(entry.id)) throw new Error(`Could not remove generated memory ${entry.id}.`);
         }
-    } catch (err) { console.error("[ML] Undo: entry cleanup failed:", err); }
-
-    // Remove pending entries created by this scene (not yet committed)
-    try {
         const pending = getPendingEntries() || [];
         const keep = pending.filter(p => p.sceneId !== sceneId);
         if (keep.length !== pending.length) savePendingEntries(keep);
-    } catch (err) { console.error("[ML] Undo: pending cleanup failed:", err); }
-
-    // Finally delete the scene itself
-    const deleted = deleteScene(sceneId);
+        const deleted = deleteScene(sceneId);
+        return { deleted, removed: removedEntries.length };
+    });
+    for (const entry of removedEntries) {
+        deleteEntryVector(entry).catch(err => console.warn("[ML] Undo: vector delete failed:", err));
+    }
     _lastClosedSceneId = null;
     setSetting("scan.lastClosedSceneId", null);
-    console.log(`[ML] Undid last scan: scene ${sceneId}, removed ${removed} committed + cleared pending`);
-    return deleted || removed > 0;
+    console.log(`[ML] Undid last scan: scene ${sceneId}, removed ${result.removed} committed + cleared pending`);
+    return result.deleted || result.removed > 0;
 }

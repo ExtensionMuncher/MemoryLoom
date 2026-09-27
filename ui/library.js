@@ -1,4 +1,4 @@
-import { canToggleSourceSuppression, isEligibleConsolidationSource, isSourceSuppressed, setSourceReleased } from '../data/consolidationSources.js';
+import { isEligibleConsolidationSource } from '../data/consolidationSources.js';
 import { captureChatGuard } from "../lib/chatGuard.js";
 /**
  * ui/library.js — Library tab renderer
@@ -21,9 +21,11 @@ import { iconSvg } from "../lib/icons.js";
 import { getAllEntries, getEntriesByFolder, getEntry, updateEntry, deleteEntry, moveEntryToFolder, ENTRY_STATUSES } from "../data/entries.js";
 import { reEmbedEntry, deleteEntryVector, embedEntry } from "../embed/embedder.js";
 import { getAllFolders, getTopLevelFolders, getSubfolders, getFolder, getFolderIcon, getFolderButtons, isCharacterSubfolder, isGroupFolder, initDefaultFolders, setFolderAliases, deleteFolder, removeFolderImage } from "../data/folders.js";
-import { getAllScenes, getScene, deleteScene, updateSceneSummary, markSceneConsolidated } from "../data/scenes.js";
-import { getScenes, saveScenes } from "../data/storage.js";
+import { getAllScenes, getScene, deleteScene, updateSceneSummary, updateSceneGeneration, markSceneConsolidated } from "../data/scenes.js";
+import { getScenes, saveScenes, runChatTransaction } from "../data/storage.js";
 import { getConsolidation, getAllConsolidations, updateConsolidation } from "../data/consolidations.js";
+import { addSuppression, getEffectiveSuppressions, getSuppressionSuccessors, isEffectivelySuppressed, releaseSuppression } from "../data/suppression.js";
+import { getAllChains, getChain, getOrderedChainEntries, getEntryPrimaryCharacterKeys, getChainCharacterOptions, sortMemoryIds, createChain, updateChain, deleteChain, removeMemoryFromChain } from "../data/chains.js";
 
 // ─── Main Render ──────────────────────────────────────────
 
@@ -88,6 +90,7 @@ export function renderLibraryTab($pane) {
 
     // ── Modals (hidden by default) ──────────────────────
     renderNewEntryModal($pane);
+    renderChainManagerModal($pane);
     renderNewFolderModal($pane);
     renderCropModal($pane);
 }
@@ -115,6 +118,10 @@ function renderLibraryHeader($pane) {
                     ${iconSvg("ico-folder-plus", 12, 12, "#ccc")}
                     New folder
                 </button>
+                <button class="ml-btn" id="ml-chain-manager-btn" title="Create or edit character-specific developmental chains">
+                    ${iconSvg("ico-edit", 12, 12, "#ccc")}
+                    Create/Edit Chains
+                </button>
             </div>
             <button class="ml-btn" id="ml-consolidate-btn" title="Consolidate selected memories and scenes into an arc">
                 ${iconSvg("ico-book", 12, 12, "#ccc")}
@@ -135,6 +142,10 @@ function renderLibraryHeader($pane) {
 
     // Wire action buttons
     $header.find("#ml-new-entry-btn").on("click", () => openModal("ml-new-entry-modal"));
+    $header.find("#ml-chain-manager-btn").on("click", () => {
+        openModal("ml-chain-manager-modal");
+        $(document).trigger("ml:chain-manager-opened");
+    });
     $header.find("#ml-new-folder-btn").on("click", () => {
         // reset to a clean Primary state each open, and refresh parent options
         // so any folders created this session are available as parents
@@ -246,11 +257,14 @@ function renderMemoriesView($pane) {
             } else ok = confirm(`Delete ${ids.length} memories?`);
         } catch (e) {}
         if (!ok) return;
-        let n = 0;
-        for (const id of ids) {
-            const e = getEntry(id);
-            if (e) { deleteEntryVector(e).catch(err => console.warn("[ML] Vector delete failed:", err)); deleteEntry(id); n++; }
-        }
+        const removedEntries = ids.map(getEntry).filter(Boolean);
+        runChatTransaction(() => {
+            for (const entry of removedEntries) {
+                if (!deleteEntry(entry.id)) throw new Error(`Could not delete memory ${entry.id}.`);
+            }
+        });
+        for (const entry of removedEntries) deleteEntryVector(entry).catch(err => console.warn("[ML] Vector delete failed:", err));
+        const n = removedEntries.length;
         bulkSelected.clear();
         toastr?.success?.(`Deleted ${n} ${n === 1 ? "memory" : "memories"}.`);
         renderLibraryTab($("#ml-p-library"));
@@ -561,19 +575,29 @@ async function confirmDeleteSubfolder(folder) {
     }
     if (!ok) return;
 
-    if (entries.length > 0 && mode === "move") {
-        if (!target) { toastr?.warning?.("No destination folder chosen — nothing was deleted."); return; }
-        let moved = 0;
-        for (const e of entries) { if (moveEntryToFolder(e.id, target)) moved++; }
+    if (entries.length > 0 && mode === "move" && !target) { toastr?.warning?.("No destination folder chosen — nothing was deleted."); return; }
+    let moved = 0;
+    let deleted = false;
+    try {
+        runChatTransaction(() => {
+            if (mode === "move") {
+                for (const entry of entries) if (moveEntryToFolder(entry.id, target)) moved++;
+            } else {
+                for (const entry of entries) if (!deleteEntry(entry.id)) throw new Error(`Could not delete memory ${entry.id}.`);
+            }
+            deleted = deleteFolder(folder.id);
+            if (!deleted) throw new Error("That folder is protected and cannot be deleted.");
+        });
+    } catch (error) {
+        toastr?.warning?.(error.message || `Folder "${folder.name}" could not be deleted.`);
+        return;
+    }
+    if (mode === "move" && entries.length) {
         toastr?.info?.(`Moved ${moved} ${moved === 1 ? "memory" : "memories"} to ${getFolder(target)?.name || "folder"}.`);
-    } else if (entries.length > 0) {
-        for (const e of entries) {
-            deleteEntryVector(e).catch(err => console.warn("[ML] Vector delete failed:", err));
-            deleteEntry(e.id);
-        }
+    } else if (entries.length) {
+        for (const entry of entries) deleteEntryVector(entry).catch(err => console.warn("[ML] Vector delete failed:", err));
         toastr?.info?.(`Deleted ${entries.length} ${entries.length === 1 ? "memory" : "memories"}.`);
     }
-    const deleted = deleteFolder(folder.id);
     if (deleted) toastr?.success?.(`Folder "${folder.name}" deleted.`);
     else toastr?.warning?.(`"${folder.name}" is a protected folder and cannot be deleted.`);
     renderLibraryTab($("#ml-p-library"));
@@ -991,6 +1015,16 @@ function buildDeltaDisplay(entry) {
 function renderMemoryEntry(entry) {
     const assertChat = captureChatGuard();
     const statusBadge = getStatusBadge(entry.status);
+    const suppressionRecords = getEffectiveSuppressions(entry);
+    const suppressed = isEffectivelySuppressed(entry);
+    const suppressionBadge = suppressed
+        ? '<span class="ml-status-badge ml-status-suppressed" title="Excluded from ordinary retrieval by suppression">suppressed</span>'
+        : "";
+    const badgesHtml = statusBadge || suppressionBadge
+        ? `<div class="ml-mem-entry-badges">${statusBadge}${suppressionBadge}</div>`
+        : "";
+    const successors = getSuppressionSuccessors(entry);
+    const chainIds = Array.isArray(entry.chainIds) ? entry.chainIds.filter(id => getChain(id)) : [];
 
     // Build tags HTML
     const tagsHtml = (entry.tags || []).map(t =>
@@ -1020,7 +1054,7 @@ function renderMemoryEntry(entry) {
                     <input type="checkbox" class="ml-bulk-check" data-entry-id="${entry.id}" title="Select for bulk move" ${bulkSelected.has(entry.id) ? "checked" : ""} style="margin-top:2px;flex-shrink:0">
                     <div class="ml-mem-entry-title">${entry.important ? '<span class="ml-star" title="Core memory">★</span> ' : ''}${entry.excludeFromConsolidation ? '<span class="ml-excl-mark" title="Excluded from consolidation">⊘</span> ' : ''}${escapeHtml(entry.title)}</div>
                 </div>
-                ${statusBadge}
+                ${badgesHtml}
             </div>
             <div class="ml-mem-entry-date">${escapeHtml(entry.datetime)}<span class="ml-token-count" title="Estimated injection tokens">~${estimateTokens(entry)} tok</span></div>
             <div class="ml-mem-entry-preview">${escapeHtml(truncateText(entry.content, 200))}</div>
@@ -1038,7 +1072,10 @@ function renderMemoryEntry(entry) {
             </div>
             ${buildDeltaDisplay(entry)}` : ""}
             <div class="ml-btn-row">
-                ${canToggleSourceSuppression(entry) ? `<button class="ml-btn ml-source-release-btn">${isSourceSuppressed(entry) ? "Unsuppress" : "Suppress"}</button>` : ""}
+                ${entry.status !== "archived" ? `<button class="ml-btn ml-source-release-btn ml-suppression-toggle-btn">${suppressed ? "Release" : "Suppress"}</button>` : ""}
+                ${suppressed ? `<button class="ml-btn ml-suppression-reason-btn">View Suppression Reason</button>` : ""}
+                ${successors.length ? `<button class="ml-btn ml-suppression-successor-btn">View Successor</button>` : ""}
+                ${chainIds.length ? `<button class="ml-btn ml-show-chain-btn">Show Chain</button><button class="ml-btn ml-remove-chain-btn">Remove From Chain</button>` : ""}
                 <button class="ml-btn ml-edit-entry-btn" data-entry-id="${entry.id}">Edit</button>
                 ${entry.category === "character" && hasDelta(entry) ? '<button class="ml-btn ml-impact-btn" data-entry-id="' + entry.id + '">Show Impact</button>' : ''}
                 <button class="ml-btn ml-important-entry-btn" data-entry-id="${entry.id}">${entry.important ? "★ Core" : "☆ Mark core"}</button>
@@ -1077,13 +1114,54 @@ function renderMemoryEntry(entry) {
             assertChat();
             const current = getEntry(entry.id);
             if (current !== entry) throw new Error("Memory changed. Reopen it before editing.");
-            const released = isSourceSuppressed(current);
-            setSourceReleased(entry.id, released);
-            toastr?.success?.(released
-                ? "Memory restored to normal retrieval priority. Consolidation membership retained."
-                : "Memory retired to consolidated-source priority. Consolidation membership retained.");
+            const releasing = isEffectivelySuppressed(current);
+            runChatTransaction(() => {
+                if (releasing) {
+                    const record = getEffectiveSuppressions(current).find(item => !item.locked);
+                    if (record) releaseSuppression(entry.id, record.id);
+                    else throw new Error("No releasable suppression reason was found.");
+                } else addSuppression(entry.id, { reason: "manual", by: "user" });
+            });
+            const updated = getEntry(entry.id);
+            const stillSuppressed = isEffectivelySuppressed(updated);
+            toastr?.success?.(releasing
+                ? (stillSuppressed ? "One reason was released, but another valid suppression still applies." : "Memory released to ordinary retrieval.")
+                : "Memory suppressed from ordinary retrieval.");
             renderLibraryTab($("#ml-p-library"));
         } catch (error) { toastr?.warning?.(error.message, "Memory Loom"); }
+    });
+
+    $entry.find(".ml-suppression-reason-btn").on("click", event => {
+        event.stopPropagation();
+        const reasons = getEffectiveSuppressions(getEntry(entry.id)).map(item => {
+            const when = item.timestamp ? new Date(item.timestamp).toLocaleString() : "unknown time";
+            return `${item.reason} · ${item.by || "unknown"} · ${when}`;
+        });
+        window.alert(reasons.join("\n") || "No effective suppression reason.");
+    });
+    $entry.find(".ml-suppression-successor-btn").on("click", event => {
+        event.stopPropagation();
+        const list = getSuppressionSuccessors(getEntry(entry.id)).map(item => `${item.datetime || "Undated"} — ${item.title}`);
+        window.alert(list.join("\n") || "No successor memory remains available.");
+    });
+    $entry.find(".ml-show-chain-btn").on("click", event => {
+        event.stopPropagation();
+        const current = getEntry(entry.id);
+        const sections = (current.chainIds || []).map(id => {
+            const chain = getChain(id);
+            if (!chain) return "";
+            return `${chain.label}\n${getOrderedChainEntries(chain).map((item, index) => `${index + 1}. ${item.datetime || "Undated"} — ${item.title}`).join("\n")}`;
+        }).filter(Boolean);
+        window.alert(sections.join("\n\n") || "This memory is not in a valid chain.");
+    });
+    $entry.find(".ml-remove-chain-btn").on("click", event => {
+        event.stopPropagation();
+        const current = getEntry(entry.id), valid = (current.chainIds || []).map(getChain).filter(Boolean);
+        const selected = valid.length === 1 ? valid[0] : valid.find(chain => chain.id === window.prompt(`Enter the chain ID to remove:\n${valid.map(chain => `${chain.id} — ${chain.label}`).join("\n")}`));
+        if (!selected) return;
+        runChatTransaction(() => removeMemoryFromChain(selected.id, entry.id));
+        toastr?.success?.("Memory removed from chain. The memory itself was retained.", "Memory Loom");
+        renderLibraryTab($("#ml-p-library"));
     });
 
     // Edit button
@@ -1151,8 +1229,10 @@ function renderMemoryEntry(entry) {
         e.stopPropagation();
         const ok = await popup(`Delete "${entry.title}"?`);
         if (ok) {
+            runChatTransaction(() => {
+                if (!deleteEntry(entry.id)) throw new Error("Memory no longer exists.");
+            });
             deleteEntryVector(entry).catch(err => console.warn("[ML] Vector delete failed:", err));
-            deleteEntry(entry.id);
             // Re-render the Library tab
             const $pane = $("#ml-p-library");
             if ($pane.length) renderLibraryTab($pane);
@@ -1234,7 +1314,7 @@ function toggleEntryEdit(entryId) {
         </div>
         <label class="ml-important-row" style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer">
             <input type="checkbox" id="ml-edit-important-${entryId}" ${entry.important ? "checked" : ""}>
-            <span style="font-size:12px;color:#ddd">Mark as core/important memory <span style="color:#888;font-size:11px">(exempt from priority decay &amp; consolidation suppression)</span></span>
+            <span style="font-size:12px;color:#ddd">Mark as core/important memory <span style="color:#888;font-size:11px">(exempt from automatic priority decay; still manually suppressible)</span></span>
         </label>
         <label class="ml-important-row" style="display:flex;align-items:center;gap:8px;margin-top:6px;cursor:pointer">
             <input type="checkbox" id="ml-edit-exclude-${entryId}" ${entry.excludeFromConsolidation ? "checked" : ""}>
@@ -1554,6 +1634,7 @@ function renderSceneEntry(scene, sceneIndex) {
                 <textarea id="ml-scene-summary-${scene.id}" rows="5" style="margin-bottom:10px">${escapeHtml(scene.llmSummary || "")}</textarea>
                 <div class="ml-btn-row">
                     <button class="ml-btn ml-save-scene-btn" data-scene-id="${scene.id}">Save summary</button>
+                    <button class="ml-btn ml-regenerate-scene-summary-btn" data-scene-id="${scene.id}" title="Regenerate only this scene summary from the original scene messages; existing memories are left unchanged">Regenerate summary</button>
                     <button class="ml-btn-danger ml-delete-scene-btn" data-scene-id="${scene.id}">Delete scene</button>
                 </div>
             </div>
@@ -1589,6 +1670,42 @@ function renderSceneEntry(scene, sceneIndex) {
         const sc = scenes.find(s => s.id === scene.id);
         if (sc) { sc.sceneTitle = title || null; saveScenes(scenes); }
         toastr?.success?.("Scene summary saved.");
+    });
+
+    // Regenerate only the factual scene summary from the original scene evidence.
+    // This deliberately does NOT rerun character/world memories, so correcting a
+    // bad summary does not burn writer tokens or duplicate pending entries.
+    $scene.find(".ml-regenerate-scene-summary-btn").on("click", async (e) => {
+        e.stopPropagation();
+        const ok = await popup("Regenerate this scene summary from the original scene messages? Existing character/world memories will not be regenerated or changed.");
+        if (!ok) return;
+
+        const $btn = $(e.currentTarget);
+        const oldText = $btn.text();
+        $btn.prop("disabled", true).text("Regenerating…");
+        updateSceneGeneration(scene.id, { summary: "running", error: "" });
+        try {
+            const { generateSceneSummary } = await import("../llm/writer.js");
+            const summary = await generateSceneSummary(scene.id);
+            if (!summary) {
+                updateSceneGeneration(scene.id, { summary: "failed", error: "Scene summary regeneration failed." });
+                toastr?.error?.("Scene summary regeneration failed.");
+                return;
+            }
+            updateSceneGeneration(scene.id, { summary: "complete", error: "" });
+            const refreshed = getScene(scene.id);
+            $(`#ml-scene-summary-${scene.id}`).val(refreshed?.llmSummary || summary);
+            if (refreshed && !refreshed.sceneTitle) {
+                $(`#ml-scene-title-${scene.id}`).val(extractSceneTitle(refreshed.llmSummary));
+            }
+            toastr?.success?.("Scene summary regenerated from source messages.");
+        } catch (err) {
+            console.error("[ML] Scene summary regeneration failed:", err);
+            updateSceneGeneration(scene.id, { summary: "failed", error: err?.message || "Scene summary regeneration failed." });
+            toastr?.error?.(`Scene summary regeneration failed: ${err?.message || "Unknown error"}`);
+        } finally {
+            $btn.prop("disabled", false).text(oldText);
+        }
     });
 
     // Delete scene
@@ -1849,11 +1966,19 @@ function openConsolidateModal($pane, scopeFolderId = null) {
             toastr?.warning?.("Select at least 2 memories; scenes provide additional context.");
             return;
         }
+        const selectedSet = new Set(mergedEntryIds);
+        const developmentalChains = [...new Set(mergedEntryIds.flatMap(id => getEntry(id)?.chainIds || []))]
+            .map(getChain).filter(chain => chain && (chain.memoryIds || []).filter(id => selectedSet.has(id)).length >= 2);
+        if (developmentalChains.length) {
+            const names = developmentalChains.map(chain => escapeHtml(chain.label)).join(", ");
+            const proceed = await popup(`This selection contains distinct stages already linked by <b>${names}</b>. Memory Loom prefers keeping developmental stages as a chain instead of flattening them through consolidation.<br><br>Consolidate anyway?`);
+            if (!proceed) return;
+        }
         $(this).prop("disabled", true).text("Consolidating…");
         try {
             const { runConsolidation } = await import("../llm/consolidationOrchestrator.js");
             assertChat();
-            const result = await runConsolidation({ entryIds: mergedEntryIds, sceneIds, mode: "mixed" });
+            const result = await runConsolidation({ entryIds: mergedEntryIds, sceneIds, mode: "mixed", allowChained: developmentalChains.length > 0 });
             assertChat();
             if (!result) return;
             closeConsolidateModal();
@@ -1882,6 +2007,289 @@ function closeConsolidateModal() {
  *
  * @param {jQuery} $pane
  */
+
+function renderChainManagerModal($pane) {
+    let activeChainId = null;
+    let selectedMemoryIds = new Set();
+
+    const $modal = $(`
+        <div class="ml-modal-overlay" id="ml-chain-manager-modal">
+            <div class="ml-modal ml-modal-chain-manager">
+                <div class="ml-chain-manager-head">
+                    <div class="ml-chain-manager-heading-copy">
+                        <div class="ml-modal-title">Create / Edit Chains</div>
+                        <div class="ml-modal-sub">Character-specific developmental threads. Manual chains use the same retrieval rules as automatic chains.</div>
+                    </div>
+                    <div class="ml-chain-manager-head-actions">
+                        <button class="ml-btn" id="ml-chain-manager-new">${iconSvg("ico-plus", 12, 12, "#ccc")} New chain</button>
+                        <button class="ml-btn" id="ml-chain-manager-close">Close</button>
+                    </div>
+                </div>
+                <div class="ml-chain-manager-grid">
+                    <div class="ml-chain-manager-list-pane">
+                        <div class="ml-form-label">Existing chains</div>
+                        <div id="ml-chain-manager-list" class="ml-chain-manager-list"></div>
+                    </div>
+                    <div class="ml-chain-manager-editor-pane">
+                        <div id="ml-chain-manager-empty" class="ml-chain-manager-empty">Choose an existing chain to edit, or create a new one.</div>
+                        <div id="ml-chain-manager-editor" style="display:none">
+                            <div class="ml-form-row">
+                                <div class="ml-form-group">
+                                    <label class="ml-form-label">Primary Character</label>
+                                    <select class="ml-form-select" id="ml-chain-manager-owner"></select>
+                                    <div class="ml-form-hint">Only memories actually owned by this Primary Character can be selected. Key Characters never qualify.</div>
+                                </div>
+                                <div class="ml-form-group">
+                                    <label class="ml-form-label">Chain title</label>
+                                    <input class="ml-form-input" id="ml-chain-manager-title" type="text" placeholder="e.g. Learning what protection requires">
+                                </div>
+                            </div>
+                            <div class="ml-form-group">
+                                <div class="ml-field-hdr">
+                                    <label class="ml-form-label">Description</label>
+                                    <i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="ml-chain-manager-description" title="Expand the editor" aria-label="Expand chain description editor"></i>
+                                </div>
+                                <textarea class="ml-form-textarea ml-chain-manager-description" id="ml-chain-manager-description" rows="3" placeholder="What precise developmental thread connects these memories?"></textarea>
+                            </div>
+                            <div class="ml-chain-manager-memory-head">
+                                <div>
+                                    <div class="ml-form-label">Memories in this chain</div>
+                                    <div class="ml-form-hint"><span id="ml-chain-manager-count">0</span> selected · minimum 2 · final order is chronological</div>
+                                </div>
+                                <input class="ml-form-input ml-chain-manager-search" id="ml-chain-manager-search" type="text" placeholder="Filter this character's memories…">
+                            </div>
+                            <div id="ml-chain-manager-memories" class="ml-chain-manager-memories"></div>
+                            <div class="ml-btn-row ml-chain-manager-actions">
+                                <button class="ml-btn-confirm" id="ml-chain-manager-save">Save chain</button>
+                                <button class="ml-btn-danger" id="ml-chain-manager-delete" style="display:none">Delete chain</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `);
+
+    function sourceLabel(source) {
+        if (source === "manual") return "Manual";
+        if (source === "historical_scan") return "Historical scan";
+        if (source === "organic") return "Organic";
+        return "Existing";
+    }
+
+    function availableOwners() {
+        return getChainCharacterOptions();
+    }
+
+    function eligibleEntries(ownerKey) {
+        if (!ownerKey) return [];
+        const ids = getAllEntries()
+            .filter(entry => entry?.category === "character" && getEntryPrimaryCharacterKeys(entry).has(ownerKey))
+            .map(entry => entry.id);
+        return sortMemoryIds(ids).map(getEntry).filter(Boolean);
+    }
+
+    function renderOwnerOptions(preferredKey = "", preferredName = "") {
+        const options = availableOwners();
+        const $owner = $modal.find("#ml-chain-manager-owner").empty();
+        if (!options.length) {
+            $owner.append(`<option value="">No character memories available</option>`);
+            return;
+        }
+        let hasPreferred = false;
+        for (const option of options) {
+            if (option.key === preferredKey) hasPreferred = true;
+            $owner.append(`<option value="${escapeHtml(option.key)}" data-owner-name="${escapeHtml(option.name)}">${escapeHtml(option.name)} (${option.count})</option>`);
+        }
+        if (preferredKey && !hasPreferred) {
+            $owner.prepend(`<option value="${escapeHtml(preferredKey)}" data-owner-name="${escapeHtml(preferredName || "Character")}">${escapeHtml(preferredName || "Character")}</option>`);
+        }
+        if (preferredKey) $owner.val(preferredKey);
+    }
+
+    function renderChainList() {
+        const $list = $modal.find("#ml-chain-manager-list").empty();
+        const chains = getAllChains().slice().sort((a, b) => {
+            const byOwner = String(a.primaryCharacter || "").localeCompare(String(b.primaryCharacter || ""));
+            return byOwner || String(a.label || "").localeCompare(String(b.label || ""));
+        });
+        if (!chains.length) {
+            $list.append(`<div class="ml-chain-manager-none">No chains yet.</div>`);
+            return;
+        }
+        let lastOwner = null;
+        for (const chain of chains) {
+            const owner = chain.primaryCharacter || "Unknown character";
+            if (owner !== lastOwner) {
+                $list.append(`<div class="ml-chain-manager-owner-group">${escapeHtml(owner)}</div>`);
+                lastOwner = owner;
+            }
+            const active = chain.id === activeChainId ? " active" : "";
+            $list.append(`
+                <button class="ml-chain-manager-item${active}" data-chain-id="${escapeHtml(chain.id)}">
+                    <span class="ml-chain-manager-item-title">${escapeHtml(chain.label || "Developmental thread")}</span>
+                    <span class="ml-chain-manager-item-meta">${chain.memoryIds?.length || 0} memories · ${escapeHtml(sourceLabel(chain.source))}</span>
+                </button>
+            `);
+        }
+    }
+
+    function renderMemoryChoices() {
+        const ownerKey = $modal.find("#ml-chain-manager-owner").val() || "";
+        const filter = String($modal.find("#ml-chain-manager-search").val() || "").trim().toLowerCase();
+        const entries = eligibleEntries(ownerKey);
+        const $list = $modal.find("#ml-chain-manager-memories").empty();
+        let shown = 0;
+        for (const entry of entries) {
+            const haystack = `${entry.title || ""} ${entry.datetime || ""} ${entry.content || ""}`.toLowerCase();
+            if (filter && !haystack.includes(filter)) continue;
+            shown += 1;
+            const checked = selectedMemoryIds.has(entry.id) ? "checked" : "";
+            const otherChains = (entry.chainIds || [])
+                .map(id => getChain(id))
+                .filter(chain => chain && chain.id !== activeChainId)
+                .map(chain => chain.label)
+                .filter(Boolean);
+            const membership = otherChains.length
+                ? `<div class="ml-chain-manager-membership">Already in: ${escapeHtml(otherChains.join(", "))}</div>`
+                : "";
+            const excerpt = String(entry.content || "").trim();
+            const delta = String(entry.delta?.delta || "").trim();
+            $list.append(`
+                <div class="ml-chain-manager-memory-row">
+                    <label class="ml-chain-manager-memory-select">
+                        <input type="checkbox" class="ml-chain-manager-memory-check" data-memory-id="${escapeHtml(entry.id)}" ${checked}>
+                        <span>
+                            <b>${escapeHtml(entry.title || "Untitled memory")}</b>
+                            <span class="ml-chain-manager-memory-date">${escapeHtml(entry.datetime || "Undated")}</span>
+                            ${membership}
+                        </span>
+                    </label>
+                    <details class="ml-chain-manager-memory-preview">
+                        <summary>Preview memory</summary>
+                        <div>${escapeHtml(excerpt || "No content")}</div>
+                        ${delta ? `<div class="ml-chain-manager-delta"><b>Delta:</b> ${escapeHtml(delta)}</div>` : ""}
+                    </details>
+                </div>
+            `);
+        }
+        if (!shown) $list.append(`<div class="ml-chain-manager-none">No matching memories for this Primary Character.</div>`);
+        $modal.find("#ml-chain-manager-count").text(selectedMemoryIds.size);
+    }
+
+    function clearEditor() {
+        activeChainId = null;
+        selectedMemoryIds = new Set();
+        $modal.find("#ml-chain-manager-editor").hide();
+        $modal.find("#ml-chain-manager-empty").show();
+        renderChainList();
+    }
+
+    function startNewChain() {
+        activeChainId = null;
+        selectedMemoryIds = new Set();
+        const owners = availableOwners();
+        renderOwnerOptions(owners[0]?.key || "", owners[0]?.name || "");
+        $modal.find("#ml-chain-manager-title").val("");
+        $modal.find("#ml-chain-manager-description").val("");
+        $modal.find("#ml-chain-manager-search").val("");
+        $modal.find("#ml-chain-manager-delete").hide();
+        $modal.find("#ml-chain-manager-empty").hide();
+        $modal.find("#ml-chain-manager-editor").show();
+        renderChainList();
+        renderMemoryChoices();
+    }
+
+    function editChain(chainId) {
+        const chain = getChain(chainId);
+        if (!chain) { clearEditor(); return; }
+        activeChainId = chain.id;
+        selectedMemoryIds = new Set(chain.memoryIds || []);
+        renderOwnerOptions(chain.primaryCharacterKey || "", chain.primaryCharacter || "");
+        $modal.find("#ml-chain-manager-title").val(chain.label || "");
+        $modal.find("#ml-chain-manager-description").val(chain.description || "");
+        $modal.find("#ml-chain-manager-search").val("");
+        $modal.find("#ml-chain-manager-delete").show();
+        $modal.find("#ml-chain-manager-empty").hide();
+        $modal.find("#ml-chain-manager-editor").show();
+        renderChainList();
+        renderMemoryChoices();
+    }
+
+    function refreshManager() {
+        renderChainList();
+        if (activeChainId && getChain(activeChainId)) editChain(activeChainId);
+        else if ($modal.find("#ml-chain-manager-editor").is(":visible")) renderMemoryChoices();
+    }
+
+    function closeAndRefreshLibrary() {
+        renderLibraryTab($pane);
+    }
+
+    $modal.on("click", function (event) {
+        if (event.target === this) closeAndRefreshLibrary();
+    });
+    $modal.find("#ml-chain-manager-close").on("click", closeAndRefreshLibrary);
+    $modal.find("#ml-chain-manager-new").on("click", startNewChain);
+    $modal.find("#ml-chain-manager-list").on("click", ".ml-chain-manager-item", function () {
+        editChain($(this).data("chain-id"));
+    });
+    $modal.find("#ml-chain-manager-search").on("input", renderMemoryChoices);
+    $modal.find("#ml-chain-manager-memories").on("change", ".ml-chain-manager-memory-check", function () {
+        const id = $(this).data("memory-id");
+        if (this.checked) selectedMemoryIds.add(id); else selectedMemoryIds.delete(id);
+        $modal.find("#ml-chain-manager-count").text(selectedMemoryIds.size);
+    });
+    $modal.find("#ml-chain-manager-owner").on("change", function () {
+        const ownerKey = $(this).val() || "";
+        const validIds = new Set(eligibleEntries(ownerKey).map(entry => entry.id));
+        const before = selectedMemoryIds.size;
+        selectedMemoryIds = new Set([...selectedMemoryIds].filter(id => validIds.has(id)));
+        const removed = before - selectedMemoryIds.size;
+        if (removed > 0) toastr?.info?.(`${removed} incompatible ${removed === 1 ? "memory was" : "memories were"} removed from the selection.`, "Memory Loom");
+        renderMemoryChoices();
+    });
+    $modal.find("#ml-chain-manager-save").on("click", () => {
+        const ownerKey = $modal.find("#ml-chain-manager-owner").val() || "";
+        const ownerName = $modal.find("#ml-chain-manager-owner option:selected").attr("data-owner-name") || $modal.find("#ml-chain-manager-owner option:selected").text().replace(/\s+\(\d+\)$/, "");
+        const label = String($modal.find("#ml-chain-manager-title").val() || "").trim();
+        const description = String($modal.find("#ml-chain-manager-description").val() || "").trim();
+        const memoryIds = [...selectedMemoryIds];
+        if (!ownerKey) { toastr?.warning?.("Choose a Primary Character first.", "Memory Loom"); return; }
+        if (memoryIds.length < 2) { toastr?.warning?.("Select at least two memories for the chain.", "Memory Loom"); return; }
+        try {
+            if (activeChainId) {
+                const updated = runChatTransaction(() => updateChain(activeChainId, { label, description, memoryIds, primaryCharacter: ownerName, primaryCharacterKey: ownerKey }));
+                toastr?.success?.(`Updated “${updated.label}”.`, "Memory Loom");
+                editChain(updated.id);
+            } else {
+                const created = runChatTransaction(() => createChain({ label, description, memoryIds, primaryCharacter: ownerName, primaryCharacterKey: ownerKey, source: "manual" }));
+                toastr?.success?.(`Created “${created.label}”.`, "Memory Loom");
+                editChain(created.id);
+            }
+        } catch (error) {
+            console.error("[ML] Manual chain save failed:", error);
+            toastr?.warning?.(error.message || "Could not save chain.", "Memory Loom");
+        }
+    });
+    $modal.find("#ml-chain-manager-delete").on("click", async () => {
+        const chain = activeChainId ? getChain(activeChainId) : null;
+        if (!chain) return;
+        const ok = await popup(`Delete the chain <b>${escapeHtml(chain.label || "Developmental thread")}</b>?<br><br>The memories themselves will remain intact.`);
+        if (!ok) return;
+        runChatTransaction(() => deleteChain(chain.id));
+        toastr?.success?.("Chain deleted. Memories were retained.", "Memory Loom");
+        clearEditor();
+    });
+    $(document).on("ml:chain-manager-opened" + LIB_NS, () => {
+        renderChainList();
+        if (!activeChainId) clearEditor();
+    });
+
+    renderChainList();
+    $pane.append($modal);
+}
+
 function renderNewEntryModal($pane) {
     const $modal = $(`
         <div class="ml-modal-overlay" id="ml-new-entry-modal">
