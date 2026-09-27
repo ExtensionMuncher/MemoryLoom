@@ -13,8 +13,12 @@
  */
 
 
-import { getEntries, saveEntries, getFolders, saveFolders, getConsolidations } from "./storage.js";
+import {
+    getEntries, saveEntries, getFolders, saveFolders, getConsolidations,
+    getChains, saveChains, getPendingChainProposals, savePendingChainProposals,
+} from "./storage.js";
 import { resolveCanonicalCharacter, incrementEntryCount, decrementEntryCount } from "./folders.js";
+import { notifyMemoryEligibilityChanged } from "../lib/eligibilityEvents.js";
 
 // ─── Constants ────────────────────────────────────────────
 
@@ -133,7 +137,9 @@ export function createEntry(data) {
         consolidationId: data.consolidationId || null,  // links a consolidation-produced memory back to its consolidation record
         consolidatedSourceOf: data.consolidatedSourceOf || null,
         consolidationReleased: data.consolidationReleased === true,
-        important: data.important || false,  // core/pivotal memory — exempt from decay and consolidation suppression
+        chainIds: Array.isArray(data.chainIds) ? [...new Set(data.chainIds.filter(Boolean))] : [],
+        suppressions: Array.isArray(data.suppressions) ? data.suppressions.filter(Boolean) : [],
+        important: data.important || false,  // core/pivotal memory — exempt from decay and consolidation priority demotion
         excludeFromConsolidation: data.excludeFromConsolidation || false,  // never used as a consolidation source
         source: data.source || "manual",
         createdAt: Date.now(),
@@ -167,6 +173,8 @@ export function getEntry(id) {
  * @returns {object[]}
  */
 export function getAllEntries() {
+    rollbackUnapprovedWriterSuppressions();
+    migrateLegacyConsolidationSuppressions();
     repairStuckPendingStatus();
     backfillConsolidatedSources();
     const entries = getEntries();
@@ -181,6 +189,8 @@ export function getAllEntries() {
  */
 let _pendingStatusRepaired = false;
 let _consolidatedSourcesBackfilled = false;
+let _unapprovedWriterSuppressionsRolledBack = false;
+let _legacyConsolidationSuppressionsMigrated = false;
 
 /**
  * Reset the one-time migration guards. Called on chat change so per-chat
@@ -191,6 +201,98 @@ let _consolidatedSourcesBackfilled = false;
 export function resetEntryMigrationGuards() {
     _pendingStatusRepaired = false;
     _consolidatedSourcesBackfilled = false;
+    _unapprovedWriterSuppressionsRolledBack = false;
+    _legacyConsolidationSuppressionsMigrated = false;
+}
+
+/**
+ * v0.1.35 migration: consolidation lowers retrieval priority; it does not
+ * suppress source memories. Remove old automatic consolidation suppression
+ * records. If an old record was explicitly created by the user, preserve that
+ * intent as a normal manual suppression.
+ */
+export function migrateLegacyConsolidationSuppressions() {
+    if (_legacyConsolidationSuppressionsMigrated) return 0;
+    _legacyConsolidationSuppressionsMigrated = true;
+    try {
+        const entries = getEntries();
+        let migrated = 0, changed = false;
+        for (const entry of Object.values(entries)) {
+            if (!entry) continue;
+            const stored = Array.isArray(entry.suppressions) ? entry.suppressions.filter(Boolean) : [];
+            const next = [];
+            let touched = false;
+            let hasManual = stored.some(item => item?.reason === "manual");
+            for (const item of stored) {
+                if (item?.reason !== "consolidation") { next.push(item); continue; }
+                touched = true;
+                const explicit = ["manual", "user"].includes(String(item?.by || "").toLowerCase());
+                if (explicit && !hasManual) {
+                    next.push({ ...item, reason: "manual", contextId: null });
+                    hasManual = true;
+                }
+            }
+            if (entry.status === "consolidated" && entry.important && entry.consolidatedSourceOf) {
+                entry.status = "active";
+                touched = true;
+            }
+            if (touched) {
+                entry.suppressions = next;
+                migrated++; changed = true;
+            }
+        }
+        if (changed) {
+            saveEntries(entries);
+            notifyMemoryEligibilityChanged();
+            console.warn(`[ML] Migrated ${migrated} consolidation source(s): consolidation now lowers retrieval priority instead of suppressing memories.`);
+        }
+        return migrated;
+    } catch (error) {
+        _legacyConsolidationSuppressionsMigrated = false;
+        console.warn("[ML] consolidation-suppression migration skipped:", error);
+        return 0;
+    }
+}
+
+/**
+ * v0.1.33 safety migration: <=0.1.32 treated a Memory Writer `Supersedes`
+ * suggestion as permission to mutate retrieval state when the new memory was
+ * committed. Those records were stamped `by: "memory_writer"`, which lets us
+ * distinguish them from manual suppression and from future explicitly approved
+ * writer proposals. Restore every such predecessor automatically.
+ */
+export function rollbackUnapprovedWriterSuppressions() {
+    if (_unapprovedWriterSuppressionsRolledBack) return 0;
+    _unapprovedWriterSuppressionsRolledBack = true;
+    try {
+        const entries = getEntries();
+        let restored = 0;
+        let changed = false;
+        for (const entry of Object.values(entries)) {
+            if (!entry) continue;
+            const stored = Array.isArray(entry.suppressions) ? entry.suppressions.filter(Boolean) : [];
+            const next = stored.filter(item => !(item?.reason === "superseded" && item?.by === "memory_writer"));
+            if (next.length === stored.length) continue;
+            entry.suppressions = next;
+            if (entry.status === "superseded" && !next.some(item => item?.reason === "superseded")) {
+                if (entry.consolidationId) entry.status = "consolidation";
+                else if (entry.consolidatedSourceOf && !entry.important) entry.status = "consolidated";
+                else entry.status = "active";
+            }
+            restored++;
+            changed = true;
+        }
+        if (changed) {
+            saveEntries(entries);
+            notifyMemoryEligibilityChanged();
+            console.warn(`[ML] Restored ${restored} memory/memories that were auto-suppressed by the pre-0.1.33 Memory Writer without separate approval.`);
+        }
+        return restored;
+    } catch (error) {
+        _unapprovedWriterSuppressionsRolledBack = false;
+        console.warn("[ML] automatic writer-suppression rollback skipped:", error);
+        return 0;
+    }
 }
 
 function repairStuckPendingStatus() {
@@ -289,6 +391,7 @@ export function updateEntry(id, updates) {
     }
 
     saveEntries(entries);
+    notifyMemoryEligibilityChanged();
     console.log(`[ML] Entry updated: ${id}`);
     return entry;
 }
@@ -309,7 +412,57 @@ export function deleteEntry(id) {
     }
 
     delete entries[id];
+
+    // Keep every reverse reference valid. Without this, deleting a chain node
+    // or superseding successor left metadata that our own export validator
+    // correctly rejected on the next import.
+    const chains = getChains() || {};
+    let chainsChanged = false;
+    for (const [chainId, chain] of Object.entries(chains)) {
+        if (!Array.isArray(chain?.memoryIds) || !chain.memoryIds.includes(id)) continue;
+        chain.memoryIds = chain.memoryIds.filter(memoryId => memoryId !== id);
+        chain.updatedAt = Date.now();
+        if (chain.memoryIds.length < 2) delete chains[chainId];
+        chainsChanged = true;
+    }
+    if (chainsChanged) saveChains(chains);
+
+    for (const other of Object.values(entries)) {
+        let retrievalStateChanged = false;
+        const nextChainIds = (other.chainIds || []).filter(chainId => chains[chainId]?.memoryIds?.includes(other.id));
+        if (nextChainIds.length !== (other.chainIds || []).length) {
+            other.chainIds = nextChainIds;
+        }
+        if (Array.isArray(other.suppressions)) {
+            const removed = other.suppressions.filter(item => item?.successorId === id);
+            if (removed.length) {
+                other.suppressions = other.suppressions.filter(item => item?.successorId !== id);
+                if (other.status === "superseded" && removed.some(item => item.reason === "superseded")
+                    && !other.suppressions.some(item => item?.reason === "superseded")) {
+                    const previous = removed.find(item => item?.reason === "superseded")?.previousStatus;
+                    other.status = previous && !["superseded", "archived"].includes(previous)
+                        ? previous
+                        : (other.consolidationId ? "consolidation"
+                            : (other.consolidatedSourceOf && !other.important ? "consolidated" : "active"));
+                }
+                retrievalStateChanged = true;
+            }
+        }
+        // Chain membership is structural metadata, not a new narrative fact.
+        // Only a suppression/status change should affect recency ordering.
+        if (retrievalStateChanged) other.updatedAt = Date.now();
+    }
+
+    const proposals = getPendingChainProposals() || [];
+    const cleanedProposals = proposals.map(proposal => ({
+        ...proposal,
+        memoryIds: (proposal.memoryIds || []).filter(memoryId => memoryId !== id),
+    })).filter(proposal => proposal.memoryIds.length >= 2);
+    if (JSON.stringify(cleanedProposals) !== JSON.stringify(proposals)) {
+        savePendingChainProposals(cleanedProposals);
+    }
     saveEntries(entries);
+    notifyMemoryEligibilityChanged();
     console.log(`[ML] Entry deleted: ${id}`);
     return true;
 }

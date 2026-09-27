@@ -1,4 +1,5 @@
 import { isEligibleConsolidationSource } from '../data/consolidationSources.js';
+import { getChain } from '../data/chains.js';
 import { runChatTransaction } from "../data/storage.js";
 import { captureChatGuard } from "../lib/chatGuard.js";
 /**
@@ -16,10 +17,9 @@ import { captureChatGuard } from "../lib/chatGuard.js";
  *   2. AN ARC SUMMARY — a single plot-level entry holding the whole arc's
  *      summary + plot/world impact. Filed into the Plot folder.
  *
- * The original source memories are NOT deleted — they're flagged status
- * "consolidated", which the retriever keeps but down-weights, so they remain
- * available to the recall tool and to close keyword matches at reduced
- * priority.
+ * The original source memories are NOT deleted. Non-core sources are marked
+ * consolidated and remain retrievable at reduced ranking priority; important
+ * sources keep full priority. All sources retain consolidation provenance.
  *
  * Both a MANUAL trigger (library button / bulk selection / folder) and an
  * AUTOMATIC trigger (a character folder crossing a configurable memory count)
@@ -45,7 +45,7 @@ import { getAllFolders, updateFolder, resolveCanonicalCharacter } from "../data/
  * @param {boolean}  [opts.silent]      - suppress success toast (auto-trigger)
  * @returns {Promise<object|null>} { consolidation, updatedMemories, arcSummary } or null
  */
-export async function runConsolidation({ entryIds = [], sceneIds = [], mode = "selected", silent = false }) {
+export async function runConsolidation({ entryIds = [], sceneIds = [], mode = "selected", silent = false, allowChained = false }) {
     const assertChat = captureChatGuard();
     const sourceEntries = [...new Set(entryIds)].map(getEntry).filter(Boolean);
     if (sourceEntries.length !== new Set(entryIds).size || sourceEntries.some(e => !isEligibleConsolidationSource(e)))
@@ -67,6 +67,14 @@ export async function runConsolidation({ entryIds = [], sceneIds = [], mode = "s
         if (!silent) toastr?.warning?.("Select at least 2 memories to consolidate.", "Memory Loom");
         return null;
     }
+    const selectedIds = new Set(sourceEntries.map(entry => entry.id));
+    const sharedDevelopment = [...new Set(sourceEntries.flatMap(entry => entry.chainIds || []))]
+        .map(getChain).find(chain => chain && (chain.memoryIds || []).filter(id => selectedIds.has(id)).length >= 2);
+    if (sharedDevelopment && !allowChained) {
+        const message = `Consolidation skipped: "${sharedDevelopment.label}" already preserves these memories as distinct developmental stages.`;
+        if (!silent) toastr?.warning?.(`${message} Confirm an explicit override from the Library if consolidation is still intended.`, "Memory Loom");
+        return null;
+    }
 
     dlog(`Consolidation: ${sourceEntries.length} entries, ${sourceScenes.length} scenes, mode=${mode}`);
     if (!silent) toastr?.info?.("Consolidating — this may take a moment...", "Memory Loom");
@@ -85,6 +93,7 @@ export async function runConsolidation({ entryIds = [], sceneIds = [], mode = "s
         status: e.status || "active",
         consolidatedSourceOf: e.consolidatedSourceOf || null,
         consolidationReleased: e.consolidationReleased || false,
+        suppressions: structuredClone(Array.isArray(e.suppressions) ? e.suppressions : []),
     }]));
     draft.source_scene_states = Object.fromEntries(sourceScenes.map(s => [s.id, {
         consolidatedInto: s.consolidatedInto || null,
@@ -199,7 +208,7 @@ export async function runConsolidation({ entryIds = [], sceneIds = [], mode = "s
     return { consolidation, updatedMemories, arcSummary };
 }
 
-/** Fully reverse a consolidation, including its suppression markers. */
+/** Fully reverse a consolidation, including legacy suppression markers from older builds. */
 export async function undoConsolidation(consolidationId) {
     const assertChat = captureChatGuard();
     const consolidation = getConsolidation(consolidationId);
@@ -234,12 +243,22 @@ export async function undoConsolidation(consolidationId) {
             if (entry.consolidatedSourceOf && entry.consolidatedSourceOf !== consolidationId) continue;
             const saved = savedStates[sourceId];
             const fallbackStatus = entry.consolidationId ? "consolidation" : "active";
+            const savedSuppressionIds = new Set((saved?.suppressions || []).map(item => item?.id).filter(Boolean));
+            const currentSuppressions = Array.isArray(entry.suppressions) ? entry.suppressions : [];
+            const survivingSuppressions = currentSuppressions.filter(item => {
+                if (savedSuppressionIds.has(item?.id)) return true;
+                return !(item?.reason === "consolidation" && item?.by === "consolidation"
+                    && (item?.contextId === consolidationId || !item?.contextId));
+            });
             updateEntry(sourceId, {
                 status: saved?.status || fallbackStatus,
                 // Clearing this backlink is essential: status alone does not lift
-                // the consolidation-picker suppression.
+                // the consolidation-picker provenance marker.
                 consolidatedSourceOf: saved?.consolidatedSourceOf || null,
                 consolidationReleased: saved?.consolidationReleased || false,
+                // Remove only legacy suppression created by this consolidation in older builds.
+                // Manual/supersession reasons added later remain effective.
+                suppressions: survivingSuppressions,
             });
             restoredEntries++;
         }
@@ -274,11 +293,13 @@ export async function maybeAutoConsolidate() {
     // group active entries by folder
     const byFolder = new Map();
     for (const e of getAllEntries()) {
-        if (e.status !== "active") continue;
-        if (e.consolidatedSourceOf || e.consolidationReleased) continue;
-        if (e.excludeFromConsolidation) continue;  // user opted this memory out
+        if (!isEligibleConsolidationSource(e)) continue;
         if (e.category !== "character") continue; // auto only over character folders
         if (!e.folderId) continue;
+        // Automatic consolidation must never flatten established developmental
+        // stages. Manual consolidation can still override this with an explicit
+        // confirmation from the Library.
+        if ((e.chainIds || []).some(chainId => !!getChain(chainId))) continue;
         if (!byFolder.has(e.folderId)) byFolder.set(e.folderId, []);
         byFolder.get(e.folderId).push(e);
     }

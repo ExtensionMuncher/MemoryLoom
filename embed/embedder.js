@@ -5,9 +5,9 @@ import { captureChatGuard } from "../lib/chatGuard.js";
  * Uses ST's native vector API (/api/vector/insert, /api/vector/delete)
  * to embed and store memory entries.
  *
- * getVectorsRequestBody() mirrors VectFox's core-vector-api.js exactly —
- * including URL resolution via textgenerationwebui_settings.server_urls
- * for local providers (Ollama, vLLM) so the correct endpoint is always sent.
+ * Provider request preparation mirrors SillyTavern's core Vector Storage extension,
+ * including URL resolution via textgenerationwebui_settings.server_urls and
+ * KoboldCpp's required pre-embedding handshake through /api/backends/kobold/embed.
  *
  * Collection ID: ml_memory_{chatUUID} — one collection per chat.
  */
@@ -114,9 +114,7 @@ function hashText(text) {
  * Mirrors VectFox's getVectorsRequestBody() in core-vector-api.js exactly,
  * including URL resolution via textgenerationwebui_settings.server_urls.
  *
- * @param {object} settings - { source, ollama_model, vllm_model, openrouter_model,
- *                              ollama_use_alt_endpoint, ollama_alt_endpoint_url,
- *                              vllm_use_alt_endpoint, vllm_alt_endpoint_url }
+ * @param {object} settings - provider settings resolved from Memory Loom.
  * @returns {object}
  */
 function getVectorsRequestBody(settings) {
@@ -161,8 +159,79 @@ function getVectorsRequestBody(settings) {
             body.model = settings.mistral_model;
             break;
         default:
-            // transformers and others — no extra body fields needed
+            // transformers, KoboldCpp, and others — no synchronous fields.
+            // KoboldCpp's model + vectors are prepared asynchronously below.
             break;
+    }
+    return body;
+}
+
+/**
+ * Resolve the KoboldCpp server exactly the way SillyTavern's Vector Storage
+ * extension does: explicit Memory Loom alt endpoint when enabled, otherwise
+ * the URL configured for ST's KoboldCpp Text Completion backend.
+ * @param {object} settings
+ * @returns {string}
+ */
+export function getKoboldCppServer(settings) {
+    const server = settings.koboldcpp_use_alt_endpoint
+        ? settings.koboldcpp_alt_endpoint_url
+        : textgenerationwebui_settings?.server_urls?.[textgen_types.KOBOLDCPP];
+    return String(server || '').trim();
+}
+
+/**
+ * Ask SillyTavern's own KoboldCpp bridge to generate embeddings. This mirrors
+ * public/scripts/extensions/vectors/index.js:createKoboldCppEmbeddings(), so
+ * auth/additional headers and KoboldCpp response normalization remain owned by ST.
+ * @param {string[]} items
+ * @param {object} settings
+ * @returns {Promise<{embeddings: Record<string, number[]>, model: string}>}
+ */
+export async function createKoboldCppEmbeddings(items, settings) {
+    const server = getKoboldCppServer(settings);
+    if (!server) {
+        throw new Error("KoboldCpp URL is not configured. Set it in ST Text Completion API settings or enable Memory Loom's alt endpoint.");
+    }
+
+    const response = await vectorFetch('/api/backends/kobold/embed', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ items, server }),
+    });
+    if (!response.ok) throw new Error(`Failed to get KoboldCpp embeddings (${response.status})`);
+
+    const data = await response.json();
+    if (!Array.isArray(data?.embeddings) || !data?.model || data.embeddings.length !== items.length) {
+        throw new Error('Invalid response from KoboldCpp embeddings');
+    }
+
+    const embeddings = {};
+    for (let i = 0; i < data.embeddings.length; i++) {
+        const vector = data.embeddings[i];
+        if (!Array.isArray(vector) || vector.length === 0) {
+            throw new Error('KoboldCpp returned an empty embedding. Reduce the embedded text size and try again.');
+        }
+        embeddings[items[i]] = vector;
+    }
+    return { embeddings, model: String(data.model) };
+}
+
+/**
+ * Build all provider-specific fields needed by ST's /api/vector endpoints.
+ * KoboldCpp is special: ST's vector backend expects the browser extension to
+ * precompute vectors through /api/backends/kobold/embed and include both the
+ * returned model name and an embeddings map in the vector request body.
+ * @param {object} settings
+ * @param {string[]} [items=[]]
+ * @returns {Promise<object>}
+ */
+export async function prepareVectorRequestFields(settings, items = []) {
+    const body = getVectorsRequestBody(settings);
+    if (settings.source === 'koboldcpp') {
+        const { embeddings, model } = await createKoboldCppEmbeddings(items, settings);
+        body.embeddings = embeddings;
+        body.model = model;
     }
     return body;
 }
@@ -181,6 +250,8 @@ function getEmbeddingSettings() {
         ollama_use_alt_endpoint:  getSetting("embedding.ollama_use_alt_endpoint", false),
         ollama_alt_endpoint_url:  getSetting("embedding.ollama_alt_endpoint_url", ""),
         ollama_keep:              getSetting("embedding.ollama_keep", false),
+        koboldcpp_use_alt_endpoint: getSetting("embedding.koboldcpp_use_alt_endpoint", false),
+        koboldcpp_alt_endpoint_url: getSetting("embedding.koboldcpp_alt_endpoint_url", ""),
         vllm_model:               getSetting("embedding.vllm_model", ""),
         vllm_use_alt_endpoint:    getSetting("embedding.vllm_use_alt_endpoint", false),
         vllm_alt_endpoint_url:    getSetting("embedding.vllm_alt_endpoint_url", ""),
@@ -214,7 +285,7 @@ export async function embedEntry(entry) {
 
     try {
         const body = {
-            ...getVectorsRequestBody(settings),
+            ...await prepareVectorRequestFields(settings, [text]),
             collectionId,
             items: [{ hash, text }],
             source: settings.source,
@@ -256,7 +327,7 @@ export async function deleteEntryVector(entry) {
 
     try {
         const body = {
-            ...getVectorsRequestBody(settings),
+            ...await prepareVectorRequestFields(settings, []),
             collectionId,
             hashes: [entry.vectorHash],
             source: settings.source,

@@ -33,7 +33,8 @@ import { registerMemoryRecallTool } from "./llm/recallTool.js";
 import { runWriterFlow } from "./llm/writer.js";
 import { maybeAutoConsolidate } from "./llm/consolidationOrchestrator.js";
 import { runRetrievalPipeline, tickCounters } from "./embed/retriever.js";
-import { updateInjection, removeInjection } from "./inject/promptInjector.js";
+import { updateInjection, removeInjection, refreshCurrentInjectionEligibility } from "./inject/promptInjector.js";
+import { MEMORY_ELIGIBILITY_EVENT } from "./lib/eligibilityEvents.js";
 import { isNarrativeMessage, narrativeMessages } from "./lib/chatMessages.js";
 import { createScene, closeScene, getOpenScene, isMessageInClosedScene, initSceneCounter, recordLastClosedScene } from "./data/scenes.js";
 import { getAllEntries, resetEntryMigrationGuards } from "./data/entries.js";
@@ -53,10 +54,25 @@ let _lastObservedChatLength = Array.isArray(chat) ? chat.length : 0;
 
 let mlPopoutVisible = false, $mlPopout = null;
 
+// Scene controls are a core chat affordance, so bootstrap them independently
+// of the heavier async Memory Loom panel/settings initialization below. This
+// prevents an unrelated init delay/error or another extension's late message-row
+// rewrite from leaving the entire chat without Open/Close Scene controls.
+jQuery(() => {
+    try {
+        registerSceneButtonDelegate();
+        installSceneButtonObserver();
+        scheduleSceneButtonRefresh();
+    } catch (err) {
+        console.error("[ML] Early scene-control bootstrap failed:", err);
+    }
+});
+
 jQuery(async () => {
     try {
         await initSettings(); window.__ML_DEBUG = getSetting("debug.enabled", false);
         initDefaultFolders();
+        getAllEntries(); // run per-chat safety migrations before any UI/retrieval work
         reconcileFolderEntryCounts();
         injectSvgDefs();
         createPanel();
@@ -65,13 +81,19 @@ jQuery(async () => {
         renderSettingsTab($("#ml-p-settings"));
         initSceneCounter();
         registerEventHandlers();
+        installSceneButtonObserver();
         registerMagicWandMenuEntry();
+
+        // Do not rely on APP_READY for the first scene-button injection. ML does
+        // asynchronous setup above, so SillyTavern can legitimately emit
+        // APP_READY before this listener is registered. In that race the whole
+        // existing chat used to remain without Open/Close Scene buttons until a
+        // later chat switch. Populate the live DOM immediately, then keep the
+        // APP_READY hook as an idempotent safety pass for slower host boots.
+        refreshSceneButtons();
         eventSource.once(event_types.APP_READY, () => {
             if (!isEnabled()) return;
-            $(".mes").each(function () {
-                const mesId = $(this).attr("mesid");
-                if (mesId !== undefined) addMessageButtons(parseInt(mesId, 10));
-            });
+            refreshSceneButtons();
         });
         $(document).on("ml:tab-switched", (_e, tabId) => {
             const $pane = $(`#ml-p-${tabId}`);
@@ -83,6 +105,10 @@ jQuery(async () => {
             if (enabled) { $(".ml-scene-btn").show(); $("#ml_container").css({ opacity: "", pointerEvents: "" }); }
             else { removeInjection(); $(".ml-scene-btn").hide(); $("#ml_container").css({ opacity: "0.45", pointerEvents: "none" }); }
         });
+        // A persistent extension prompt must never retain a memory after it is
+        // edited, archived, suppressed, deleted, replaced, or imported over.
+        $(document).off(`${MEMORY_ELIGIBILITY_EVENT}.ml-eligibility`)
+            .on(`${MEMORY_ELIGIBILITY_EVENT}.ml-eligibility`, refreshCurrentInjectionEligibility);
         if (!isEnabled()) removeInjection(); // clear stale injection if extension is disabled
         registerMemoryRecallTool();
     } catch (err) { console.error("[ML] Init failed:", err.message, err.stack); }
@@ -277,6 +303,65 @@ function restoreSidecarPauseCadence(liveCount = getLiveMessageCount()) {
 // against the double-fire that touch devices produce (touchend THEN click) with
 // a short timestamp lock.
 let _lastSceneTap = 0;
+let _sceneButtonObserver = null;
+let _sceneRefreshTimer = null;
+
+function scheduleSceneButtonRefresh(delay = 0) {
+    if (_sceneRefreshTimer !== null) return;
+    _sceneRefreshTimer = setTimeout(() => {
+        _sceneRefreshTimer = null;
+        try { refreshSceneButtons(); }
+        catch (err) { console.error("[ML] Scene-button refresh failed:", err); }
+    }, Math.max(0, Number(delay) || 0));
+}
+
+/**
+ * Watch the live chat DOM itself instead of trusting a particular host/extension
+ * event ordering. ST and other extensions are allowed to replace message rows or
+ * their .extraMesButtons containers after MESSAGE_*_RENDERED has already fired.
+ * When that happens, event-only injection silently disappears. The observer
+ * notices added/replaced action bars (and removal of an ML control) and repairs
+ * the affected rows on the next task.
+ */
+function installSceneButtonObserver() {
+    if (_sceneButtonObserver || typeof MutationObserver !== "function") return;
+    const root = document.getElementById("chat") || document.body;
+    if (!root) return;
+
+    _sceneButtonObserver = new MutationObserver((mutations) => {
+        let shouldRefresh = false;
+        for (const mutation of mutations) {
+            if (mutation.type !== "childList") continue;
+            const target = mutation.target?.nodeType === 1 ? mutation.target : null;
+
+            // Any replacement inside a message action container can remove an
+            // extension button without another ST render event being emitted.
+            if (target?.matches?.(".extraMesButtons, .mes_buttons")) {
+                const row = target.closest?.(".mes[mesid]");
+                if (row && !row.querySelector(".ml-scene-btn")) {
+                    shouldRefresh = true;
+                    break;
+                }
+            }
+
+            for (const node of [...mutation.addedNodes, ...mutation.removedNodes]) {
+                if (!node || node.nodeType !== 1) continue;
+                if (node.matches?.(".mes[mesid], .extraMesButtons, .ml-scene-btn") ||
+                    node.querySelector?.(".mes[mesid], .extraMesButtons, .ml-scene-btn")) {
+                    shouldRefresh = true;
+                    break;
+                }
+            }
+            if (shouldRefresh) break;
+        }
+        if (shouldRefresh) scheduleSceneButtonRefresh();
+    });
+
+    _sceneButtonObserver.observe(root, { childList: true, subtree: true });
+    console.log("[ML] Scene-button DOM observer attached");
+    scheduleSceneButtonRefresh();
+}
+
 function registerSceneButtonDelegate() {
     const run = (e) => {
         const el = e.target && e.target.closest ? e.target.closest(".ml-scene-btn") : null;
@@ -310,6 +395,24 @@ function registerSceneButtonDelegate() {
 
 function registerEventHandlers() {
     registerSceneButtonDelegate();
+
+    // SillyTavern can rebuild a message row (swipe/edit/chat render) after ML has
+    // already injected its action button. Re-attach on the host's actual render
+    // events so scene controls survive DOM replacement instead of depending on
+    // message-send/receive timing alone.
+    ["USER_MESSAGE_RENDERED", "CHARACTER_MESSAGE_RENDERED", "MESSAGE_UPDATED"].forEach((eventName) => {
+        const eventType = event_types[eventName];
+        if (!eventType) return;
+        eventSource.on(eventType, (mesId) => {
+            if (!isEnabled()) return;
+            const id = Number(mesId);
+            if (!Number.isInteger(id)) return;
+            // Rendering is complete when these events fire in ST 1.18, but defer
+            // one task as a defensive measure for extensions that append/replace
+            // message-action DOM in their own render listeners.
+            setTimeout(() => addMessageButtons(id), 0);
+        });
+    });
 
     $(document).on("ml:sidecar-pause-changed", (_event, paused) => {
         // Invalidate any in-flight result so a request started before pause can
@@ -361,16 +464,14 @@ function registerEventHandlers() {
         refreshSidecarCadenceDisplay(liveCount);
         resetEntryMigrationGuards();   // re-run per-chat migrations for the new chat
         initDefaultFolders();
+        getAllEntries();
         reconcileFolderEntryCounts();
         initSceneCounter();
         renderHomeTab($("#ml-p-home"));
         renderLibraryTab($("#ml-p-library"));
         renderSettingsTab($("#ml-p-settings"));
         if (!isEnabled()) removeInjection(); // clear stale injection on chat change if disabled
-        $(".mes").each(function () {
-            const mesId = $(this).attr("mesid");
-            if (mesId !== undefined) addMessageButtons(parseInt(mesId, 10));
-        });
+        scheduleSceneButtonRefresh();
     });
 
     // Message deletion/edit/swipe can renumber mesIds without a full extension
@@ -378,33 +479,70 @@ function registerEventHandlers() {
     ["MESSAGE_DELETED", "MESSAGE_EDITED", "MESSAGE_SWIPED", "CHAT_DELETED"].forEach((eventName) => {
         const eventType = event_types[eventName];
         if (!eventType) return;
-        eventSource.on(eventType, () => resetRuntimeMessageState(eventName));
+        eventSource.on(eventType, () => {
+            resetRuntimeMessageState(eventName);
+            scheduleSceneButtonRefresh();
+        });
     });
+}
+
+function sceneButtonState(mesId) {
+    const openScene = getOpenScene();
+    if (openScene && mesId >= openScene.messageStart && (openScene.messageEnd === null || mesId <= openScene.messageEnd)) {
+        return { iconId: "ico-feather", title: "Close scene", active: true, action: "close" };
+    }
+    if (isMessageInClosedScene(mesId)) {
+        return { iconId: "ico-book", title: "Already scanned", active: false, action: "" };
+    }
+    return { iconId: "ico-book-open", title: "Open scene", active: false, action: "open" };
 }
 
 function addMessageButtons(mesId) {
     if (!isEnabled()) return;
-    const $bar = $(`.mes[mesid="${mesId}"] .extraMesButtons`);
-    if (!$bar.length) return;
-    $bar.find(".ml-scene-btn").remove();
-    const openScene = getOpenScene();
-    let icon, title, css, action;
-    if (openScene && mesId >= openScene.messageStart && (openScene.messageEnd === null || mesId <= openScene.messageEnd)) {
-        icon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><use href="#ico-feather"/></svg>';
-        title = "Close scene"; css = "ml-scene-btn ml-scene-active"; action = "close";
-    } else if (isMessageInClosedScene(mesId)) {
-        icon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><use href="#ico-book"/></svg>';
-        title = "Already scanned"; css = "ml-scene-btn"; action = "";
-    } else {
-        icon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><use href="#ico-book-open"/></svg>';
-        title = "Open scene"; css = "ml-scene-btn"; action = "open";
+    const id = Number(mesId);
+    if (!Number.isInteger(id)) return;
+
+    const $row = $(`.mes[mesid="${id}"]`);
+    if (!$row.length) return;
+
+    // Hidden roleplay messages in ST 1.18 may carry is_system=true but are still
+    // narrative; isNarrativeMessage handles that distinction. Actual tool/system
+    // records should not expose scene controls.
+    if (chat?.[id] && !isNarrativeMessage(chat[id])) {
+        $row.find(".ml-scene-btn").remove();
+        return;
     }
-    // Data-driven button: the click is handled by ONE delegated listener on
-    // document (see registerSceneButtonDelegate). Direct per-button handlers were
-    // unreliable on mobile — ST re-renders message rows frequently, swapping the
-    // element out from under a tap before the click fired, so nothing happened.
-    const $btn = $(`<div class="${css}" title="${title}" data-ml-action="${action}" data-ml-mesid="${mesId}" role="button" tabindex="0">${icon}</div>`);
-    $bar.prepend($btn);
+
+    // Prefer ST's normal extension-action container. If another extension/core
+    // customization temporarily removes it, fall back to the main action bar so
+    // Open/Close Scene remains available instead of disappearing entirely.
+    let $bar = $row.find(".extraMesButtons").first();
+    if (!$bar.length) $bar = $row.find(".mes_buttons").first();
+    if (!$bar.length) return;
+
+    const state = sceneButtonState(id);
+    const desiredClass = `mes_button ml-scene-btn${state.active ? " ml-scene-active" : ""}`;
+    const icon = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><use href="#${state.iconId}"/></svg>`;
+
+    let $btn = $row.find(".ml-scene-btn").first();
+    $row.find(".ml-scene-btn").slice(1).remove();
+
+    // Move a fallback button into .extraMesButtons once the canonical container
+    // appears, without recreating it unnecessarily.
+    if ($btn.length && $btn.parent()[0] !== $bar[0]) $bar.prepend($btn);
+
+    if (!$btn.length) {
+        $btn = $(`<div role="button" tabindex="0"></div>`);
+        $bar.prepend($btn);
+    }
+
+    if ($btn.attr("class") !== desiredClass) $btn.attr("class", desiredClass);
+    if ($btn.attr("title") !== state.title) $btn.attr("title", state.title);
+    if ($btn.attr("data-ml-action") !== state.action) $btn.attr("data-ml-action", state.action);
+    if ($btn.attr("data-ml-mesid") !== String(id)) $btn.attr("data-ml-mesid", String(id));
+    if ($btn.attr("data-ml-icon") !== state.iconId) {
+        $btn.attr("data-ml-icon", state.iconId).html(icon);
+    }
 }
 
 // Runs the scene action for a given message. Called by the delegated listener.

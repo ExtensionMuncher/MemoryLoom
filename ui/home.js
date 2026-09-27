@@ -4,24 +4,86 @@ import { isEnabled, isSidecarPaused, setSidecarPaused, getSetting } from "../set
 import { renderHomeHeader, getProcessingStatus, showPanelLoading, hidePanelLoading, setProcessingStatus } from "./panel.js";
 import { getPendingEntries, savePendingEntries, getOpenSceneId, getScenes, runChatTransaction, getMessageCounter, getSidecarPauseCadence } from "../data/storage.js";
 import { getEntry, createEntry, deleteEntry, updateEntry } from "../data/entries.js";
+import { addMemoryToChain, applyWriterChainActions, getChain } from "../data/chains.js";
+import { addSuppression } from "../data/suppression.js";
 import { chat } from "../../../../../script.js";
 import { narrativeMessages } from "../lib/chatMessages.js";
+
+/** Validate every writer-supplied relationship before the first mutation. */
+function getPendingChainActions(entry) {
+    if (Array.isArray(entry?.chainActions)) return entry.chainActions.filter(Boolean);
+    // Backward compatibility with pending cards produced by <= 0.1.29.
+    if (entry?.chainAction && entry.chainAction.action !== "none") return [entry.chainAction];
+    return [];
+}
+
+function getProposedSupersedes(entry) {
+    return [...new Set(Array.isArray(entry?.supersedes) ? entry.supersedes.filter(Boolean) : [])];
+}
+
+function getApprovedSupersedes(entry) {
+    const proposed = new Set(getProposedSupersedes(entry));
+    return [...new Set(Array.isArray(entry?.approvedSupersedes) ? entry.approvedSupersedes.filter(id => proposed.has(id)) : [])];
+}
+
+function validatePendingRelationships(entry, supersedes) {
+    const actions = getPendingChainActions(entry);
+    const relatedIds = new Set();
+    for (const action of actions) {
+        const kind = String(action?.action || "none").toLowerCase();
+        if (kind === "append") {
+            const chain = action.chainId && getChain(action.chainId);
+            if (!chain) throw new Error("Writer referenced an invalid chain.");
+            for (const id of (chain.memoryIds || [])) relatedIds.add(id);
+        } else if (kind === "create") {
+            const ids = [...new Set(Array.isArray(action.memoryIds) ? action.memoryIds.filter(Boolean) : [])];
+            if (!ids.length || ids.some(id => !getEntry(id))) throw new Error("Writer referenced an invalid memory for a new chain.");
+            ids.forEach(id => relatedIds.add(id));
+        } else if (kind !== "none") {
+            throw new Error("Writer returned an unsupported chain action.");
+        }
+    }
+    for (const targetId of supersedes) {
+        if (!getEntry(targetId)) throw new Error(`Writer supersession target no longer exists: ${targetId}`);
+        if (relatedIds.has(targetId)) {
+            throw new Error("Writer cannot both chain and supersede the same memory. Review or regenerate this pending memory.");
+        }
+    }
+    if (entry.updateTargetId && (relatedIds.has(entry.updateTargetId) || supersedes.includes(entry.updateTargetId))) {
+        throw new Error("A replaced world-memory target cannot also be chained or superseded.");
+    }
+}
 
 /** Create one committed record inside an already-open chat transaction. */
 function createCommittedRecord(e, oldWorldTargets) {
     // Committing means the entry becomes live, so force status to "active".
     // World pending entries carry status:"pending" from the writer.
     const clean = Object.assign({}, e, { status: "active" });
-    if (clean.updateTargetId) {
-        const target = getEntry(clean.updateTargetId);
-        if (target) {
-            oldWorldTargets.push(target);
-            deleteEntry(clean.updateTargetId);
-        }
-        delete clean.updateTargetId;
-    }
+    const chainActions = getPendingChainActions(clean);
+    const supersedes = getApprovedSupersedes(clean);
+    validatePendingRelationships(clean, supersedes);
+    delete clean.chainActions;
+    delete clean.chainAction;
+    delete clean.batchChainScanId;
+    delete clean.supersedes;
+    delete clean.approvedSupersedes;
+    const updateTarget = clean.updateTargetId ? getEntry(clean.updateTargetId) : null;
+    delete clean.updateTargetId;
     const next = createEntry(clean);
     if (!next) throw new Error(`Memory entry creation returned no result for "${e?.title || "Untitled"}".`);
+    if (updateTarget) {
+        oldWorldTargets.push(updateTarget);
+        // Create/add first so a two-node chain never temporarily drops below
+        // its invariant and gets deleted while a world fact is being revised.
+        for (const chainId of (updateTarget.chainIds || [])) {
+            if (getChain(chainId)) addMemoryToChain(chainId, next.id);
+        }
+        deleteEntry(updateTarget.id);
+    }
+    applyWriterChainActions(next, chainActions);
+    for (const targetId of supersedes) {
+        addSuppression(targetId, { reason: "superseded", by: "memory_writer_approved", successorId: next.id });
+    }
     return next;
 }
 
@@ -132,6 +194,10 @@ function pendingFingerprint(entry) {
         entry.primaryCharacter || "",
         entry.primaryCharacters || [],
         entry.keyCharacters || [],
+        entry.chainActions || entry.chainAction || null,
+        entry.supersedes || [],
+        entry.approvedSupersedes || [],
+        entry.batchChainScanId || "",
     ]);
 }
 
@@ -258,6 +324,22 @@ function getSceneDisplayNum(sceneId) {
     return idx !== -1 ? String(idx + 1) : sceneId.replace("ml_scene_", "");
 }
 
+async function maybeRunPostBatchChainScan() {
+    try {
+        const { runReadyPostBatchChainScans } = await import("../llm/chainScanner.js");
+        const result = await runReadyPostBatchChainScans();
+        if (result?.ran) {
+            const count = result.proposals?.length || 0;
+            toastr?.success?.(`Batch chain reconciliation complete — ${count} proposal${count === 1 ? "" : "s"} ready for review.`, "Memory Loom", { timeOut: 5000 });
+        }
+        return result;
+    } catch (error) {
+        console.warn("[ML] Post-batch chain reconciliation deferred:", error);
+        toastr?.warning?.("Batch memories were resolved, but the final chain reconciliation did not finish. It remains queued and can retry on the next commit/discard.", "Memory Loom", { timeOut: 8000 });
+        return null;
+    }
+}
+
 export function renderHomeTab($pane) {
     const assertChat = captureChatGuard();
     $(document).off(NS); $pane.empty(); renderHomeHeader($pane);
@@ -277,10 +359,14 @@ function renderWriterStatus($pane) {
     // long operations (scene close, batch scan) are visible on Home itself
     const proc = getProcessingStatus();
     if (proc) $pane.append(`<div class="ml-writer-active" id="ml-processing-banner"><div class="ml-pulse"></div><span class="ml-proc-text">${h(proc)}</span></div>`);
+    // Only show the red attention card for an ACTUAL failed/partial generation.
+    // A scene becomes `closed` synchronously before its first async summary request
+    // starts, so `closed && !llmSummary` is a normal in-flight state, not a failure.
+    // Treating it as one caused the alarming "needs attention" banner to flash the
+    // instant a scene was closed, before Memory Loom had even asked the summary LLM.
     const failedScene = (getScenes() || [])
-        .filter(scene => (scene?.generation && (["failed", "partial"].includes(scene.generation.status) ||
-                (!proc && scene.generation.status === "running"))) ||
-            (scene?.status === "closed" && !scene.llmSummary))
+        .filter(scene => scene?.generation && (["failed", "partial"].includes(scene.generation.status) ||
+                (!proc && scene.generation.status === "running")))
         .sort((a, b) => (b.generation?.updatedAt || b.createdAt || 0) - (a.generation?.updatedAt || a.createdAt || 0))[0];
     if (failedScene) {
         const error = failedScene.generation?.error || "This scene closed before its summary and memories were generated.";
@@ -426,6 +512,7 @@ function renderPendingSection($pane) {
                 const names = affected.slice(0, 4).join("; ") + (affected.length > 4 ? "; …" : "");
                 toastr?.warning?.(`The memories were committed, but optional preparation failed for ${affected.length}: ${names}. You can Auto-Tag or Re-embed them later.`, "Memory Loom", { timeOut: 9000 });
             }
+            await maybeRunPostBatchChainScan();
         } catch (error) {
             if (committedResult) {
                 console.warn("[ML] Post-processing committed memories stopped:", error);
@@ -459,6 +546,7 @@ function renderPendingSection($pane) {
             const removed = discardPendingSnapshot(snapshot);
             renderHomeTab($pane);
             toastr?.success?.(`Discarded ${removed} pending ${removed === 1 ? "entry" : "entries"}.`, "Memory Loom");
+            await maybeRunPostBatchChainScan();
         } catch (error) {
             console.error("[ML] Discard all failed:", error);
             toastr?.error?.("Could not discard pending memories. Check the console.", "Memory Loom");
@@ -468,11 +556,52 @@ function renderPendingSection($pane) {
     });
     $pane.append($ga);
 }
+function suppressionProposalHtml(entry, i) {
+    const proposed = getProposedSupersedes(entry);
+    if (!proposed.length) return "";
+    const approved = new Set(getApprovedSupersedes(entry));
+    const rows = proposed.map(targetId => {
+        const target = getEntry(targetId);
+        if (!target) {
+            return `<div class="ml-suppression-proposal-row" data-target-id="${h(targetId)}"><div style="color:#a77;font-size:11px">Missing target: ${h(targetId)}</div></div>`;
+        }
+        const isApproved = approved.has(targetId);
+        return `<div class="ml-suppression-proposal-row" data-target-id="${h(targetId)}" style="border:1px solid #3a3a3a;border-radius:4px;padding:9px 10px;margin-top:7px;background:#1c1c1c">
+            <div style="display:flex;gap:8px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap">
+                <div style="min-width:0;flex:1"><div style="font-size:12px;color:#ddd">${h(target.title || "Untitled")}</div><div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#777">${h(target.datetime || "Undated")} · ${h(target.primaryCharacter || (target.primaryCharacters || []).join(", ") || "Unknown")}</div></div>
+                <span style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:${isApproved ? '#a8c9a2' : '#999'}">${isApproved ? 'APPROVED' : 'NOT APPROVED'}</span>
+            </div>
+            <details style="margin-top:7px"><summary style="cursor:pointer;font-size:11px;color:#aaa">Preview memory proposed for suppression</summary><div style="font-size:11px;line-height:1.55;color:#bbb;margin-top:6px;white-space:pre-wrap">${h(target.content || "")}</div>${target.delta?.delta ? `<div style="font-size:10px;color:#888;margin-top:6px"><b>Delta:</b> ${h(target.delta.delta)}</div>` : ''}</details>
+            <div class="ml-btn-row" style="margin-top:8px"><button type="button" class="ml-btn ${isApproved ? 'ml-suppression-unapprove' : 'ml-suppression-approve'}" data-target-id="${h(targetId)}">${isApproved ? 'Undo suppression approval' : 'Approve suppression'}</button></div>
+        </div>`;
+    }).join("");
+    return `<div class="ml-suppression-proposals" style="border:1px solid #5a4636;background:#241f1a;border-radius:4px;padding:10px 12px;margin-bottom:12px">
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#c9a57f;letter-spacing:.06em;text-transform:uppercase">Suppression proposal · separate approval required</div>
+        <div style="font-size:11px;color:#aaa;line-height:1.5;margin-top:4px">Committing this new memory does not suppress anything unless you explicitly approve a target below. Commit All never auto-approves these proposals.</div>
+        ${rows}
+    </div>`;
+}
+
 function renderCard(entry,i,$pane) {
     const assertChat = captureChatGuard();
     const lo = entry.delta?.low_delta_flag;
-    const $c = $(`<div class="ml-entry-card" id="ml-pc-${i}"><div class="ml-entry-card-hdr"><div style="flex:1;min-width:0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;flex-wrap:wrap"><div class="ml-entry-title" style="margin-bottom:0">${h(entry.title||"Untitled")}</div>${entry.updateTargetId?'<span class="ml-update-badge">✎ updates existing</span>':''}${lo?'<span class="ml-delta-flag">low delta</span>':''}</div><div class="ml-entry-meta">${entry.category==="world" ? (entry.updateTargetId ? "\ud83c\udf10 World update" : (entry.worldEvent ? "\ud83c\udf10 World event" : "\ud83c\udf10 World fact")) : (h(entry.primaryCharacter||(entry.primaryCharacters||[]).join(", ")||"Unknown")+" · "+h(entry.category||"character"))}${entry.sceneId?' · Scene '+getSceneDisplayNum(entry.sceneId):''}</div></div>${iconSvg("ico-chevron-down",16,16,"#666")}</div><div class="ml-entry-card-body">${entry.updateTargetId?`<div class="ml-update-note">Replaces existing entry: ${h((getEntry(entry.updateTargetId)||{}).title||entry.updateTargetId)}</div>`:''}<div class="ml-entry-prose">${h(entry.content||"")}</div><div class="ml-entry-chars">${entry.category!=="world" && entry.primaryCharacter?`<span>Primary</span> · ${h(entry.primaryCharacter)}<br>`:''}${entry.keyCharacters?.length?`<span>Key</span> · ${h(entry.keyCharacters.join(", "))}`:''}</div>${db(entry)}<div class="ml-btn-row"><button type="button" class="ml-btn-confirm ml-co" data-idx="${i}">Commit</button><button type="button" class="ml-btn ml-rt" data-idx="${i}">Regen</button><button type="button" class="ml-btn ml-ee" data-idx="${i}">Edit</button><button type="button" class="ml-btn-danger ml-do" data-idx="${i}">Discard</button></div><div class="ml-regen-box" id="ml-rg-${i}"><div class="ml-field-hdr"><div class="ml-regen-hint" style="margin-bottom:0">Optional guidance</div><i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="ml-ri-${i}" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer;transition:all var(--animation-duration-2x,0.3s) ease-in-out"></i></div><textarea id="ml-ri-${i}" rows="2" style="margin-bottom:8px" placeholder="Guidance…"></textarea><div class="ml-btn-row"><button type="button" class="ml-btn ml-rg" data-idx="${i}">Regen with prompt</button><button type="button" class="ml-btn ml-rs" data-idx="${i}">Regen from scene</button></div></div></div></div>`);
+    const $c = $(`<div class="ml-entry-card" id="ml-pc-${i}"><div class="ml-entry-card-hdr"><div style="flex:1;min-width:0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;flex-wrap:wrap"><div class="ml-entry-title" style="margin-bottom:0">${h(entry.title||"Untitled")}</div>${entry.updateTargetId?'<span class="ml-update-badge">✎ updates existing</span>':''}${lo?'<span class="ml-delta-flag">low delta</span>':''}</div><div class="ml-entry-meta">${entry.category==="world" ? (entry.updateTargetId ? "\ud83c\udf10 World update" : (entry.worldEvent ? "\ud83c\udf10 World event" : "\ud83c\udf10 World fact")) : (h(entry.primaryCharacter||(entry.primaryCharacters||[]).join(", ")||"Unknown")+" · "+h(entry.category||"character"))}${entry.sceneId?' · Scene '+getSceneDisplayNum(entry.sceneId):''}</div></div>${iconSvg("ico-chevron-down",16,16,"#666")}</div><div class="ml-entry-card-body">${entry.updateTargetId?`<div class="ml-update-note">Replaces existing entry: ${h((getEntry(entry.updateTargetId)||{}).title||entry.updateTargetId)}</div>`:''}<div class="ml-entry-prose">${h(entry.content||"")}</div><div class="ml-entry-chars">${entry.category!=="world" && entry.primaryCharacter?`<span>Primary</span> · ${h(entry.primaryCharacter)}<br>`:''}${entry.keyCharacters?.length?`<span>Key</span> · ${h(entry.keyCharacters.join(", "))}`:''}</div>${db(entry)}${suppressionProposalHtml(entry,i)}<div class="ml-btn-row"><button type="button" class="ml-btn-confirm ml-co" data-idx="${i}">Commit</button><button type="button" class="ml-btn ml-rt" data-idx="${i}">Regen</button><button type="button" class="ml-btn ml-ee" data-idx="${i}">Edit</button><button type="button" class="ml-btn-danger ml-do" data-idx="${i}">Discard</button></div><div class="ml-regen-box" id="ml-rg-${i}"><div class="ml-field-hdr"><div class="ml-regen-hint" style="margin-bottom:0">Optional guidance</div><i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="ml-ri-${i}" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer;transition:all var(--animation-duration-2x,0.3s) ease-in-out"></i></div><textarea id="ml-ri-${i}" rows="2" style="margin-bottom:8px" placeholder="Guidance…"></textarea><div class="ml-btn-row"><button type="button" class="ml-btn ml-rg" data-idx="${i}">Regen with prompt</button><button type="button" class="ml-btn ml-rs" data-idx="${i}">Regen from scene</button></div></div></div></div>`);
     $c.find(".ml-entry-card-hdr").on("click",function(){$c.toggleClass("open")});
+    $c.find(".ml-suppression-approve, .ml-suppression-unapprove").on("click", function(event) {
+        event.preventDefault(); event.stopPropagation();
+        const targetId = String($(this).attr("data-target-id") || "");
+        const current = pendingList();
+        const currentIndex = findPendingIndex(entry, current);
+        if (currentIndex < 0 || !targetId) return;
+        const pending = current[currentIndex];
+        const proposed = new Set(getProposedSupersedes(pending));
+        if (!proposed.has(targetId) || !getEntry(targetId)) return;
+        const approved = new Set(getApprovedSupersedes(pending));
+        if (approved.has(targetId)) approved.delete(targetId); else approved.add(targetId);
+        pending.approvedSupersedes = [...approved];
+        savePendingList(current);
+        renderHomeTab($pane);
+    });
     $(document).on("click"+NS,`#ml-pc-${i} .ml-co`,async()=>{
         const plist=pendingList();
         if(i<0||i>=plist.length)return;
@@ -494,6 +623,7 @@ function renderCard(entry,i,$pane) {
             if (prepared.tagFailed || prepared.embedFailed) {
                 toastr?.warning?.("The memory was committed, but optional preparation did not finish. You can Auto-Tag or Re-embed it later.", "Memory Loom");
             }
+            await maybeRunPostBatchChainScan();
         } catch(err) {
             if (created) {
                 console.warn("[ML] Post-processing committed memory stopped:", err);
@@ -513,7 +643,7 @@ function renderCard(entry,i,$pane) {
             }
         }
     });
-    $(document).on("click"+NS,`#ml-pc-${i} .ml-do`,async()=>{const ok=await popup("Discard this entry?");if(!ok)return;assertChat();const plist=pendingList();if(i<0||i>=plist.length)return;if(plist[i]!==entry)return;removePending(entry);renderHomeTab($pane)});
+    $(document).on("click"+NS,`#ml-pc-${i} .ml-do`,async()=>{const ok=await popup("Discard this entry?");if(!ok)return;assertChat();const plist=pendingList();if(i<0||i>=plist.length)return;if(plist[i]!==entry)return;removePending(entry);renderHomeTab($pane);await maybeRunPostBatchChainScan();});
     $(document).on("click"+NS,`#ml-pc-${i} .ml-rt`,()=>{$(`#ml-rg-${i}`).toggleClass("open")});
     // Edit entry — replace static prose with editable fields inline
     $(document).on("click"+NS,`#ml-pc-${i} .ml-ee`,()=>{
@@ -595,7 +725,7 @@ function renderCard(entry,i,$pane) {
         const newEntry = await regenerateEntry(plist[i], guidance);
         assertChat();
         if (findPendingIndex(entry) < 0 || JSON.stringify(entry) !== snapshot) return;
-        if (newEntry) { if (plist[i].updateTargetId) newEntry.updateTargetId = plist[i].updateTargetId; const current = pendingList(); const currentIndex = findPendingIndex(entry, current); if (currentIndex < 0) return; current[currentIndex] = newEntry; savePendingList(current); renderHomeTab($pane); toastr?.success?.("Entry regenerated."); }
+        if (newEntry) { if (plist[i].updateTargetId) newEntry.updateTargetId = plist[i].updateTargetId; if (plist[i].batchChainScanId) newEntry.batchChainScanId = plist[i].batchChainScanId; const current = pendingList(); const currentIndex = findPendingIndex(entry, current); if (currentIndex < 0) return; current[currentIndex] = newEntry; savePendingList(current); renderHomeTab($pane); toastr?.success?.("Entry regenerated."); }
         else { toastr?.error?.("Regeneration failed. Check LLM connection."); }
     });
     $(document).on("click"+NS,`#ml-pc-${i} .ml-rs`,async ()=>{

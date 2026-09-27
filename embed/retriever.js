@@ -13,14 +13,15 @@ import { captureChatGuard } from "../lib/chatGuard.js";
  */
 
 import { getRequestHeaders, chat, name1 } from "../../../../../script.js";
-import { textgen_types, textgenerationwebui_settings } from "../../../../textgen-settings.js";
 import { getSetting } from "../settings.js";
 import { getEntry } from "../data/entries.js";
 import { getEntries, getStickinessMap, saveStickinessMap, getCooldownsMap, saveCooldownsMap, getFolders } from "../data/storage.js";
-import { getCollectionId } from "./embedder.js";
+import { getCollectionId, prepareVectorRequestFields } from "./embedder.js";
 import { dlog, publishRetrievalTrace } from "../lib/debug.js";
 import { rerankCandidates } from "../llm/reranker.js";
 import { narrativeMessages } from "../lib/chatMessages.js";
+import { getChain, getOrderedChainEntries, entryBelongsToChainCharacter } from "../data/chains.js";
+import { isEffectivelySuppressed } from "../data/suppression.js";
 
 
 /** Build the provider settings object used for vector queries — shared with the recall tool. */
@@ -30,6 +31,8 @@ export function buildVectorSettings() {
         ollama_model:             getSetting("embedding.ollama_model", ""),
         ollama_use_alt_endpoint:  getSetting("embedding.ollama_use_alt_endpoint", false),
         ollama_alt_endpoint_url:  getSetting("embedding.ollama_alt_endpoint_url", ""),
+        koboldcpp_use_alt_endpoint: getSetting("embedding.koboldcpp_use_alt_endpoint", false),
+        koboldcpp_alt_endpoint_url: getSetting("embedding.koboldcpp_alt_endpoint_url", ""),
         vllm_model:               getSetting("embedding.vllm_model", ""),
         vllm_use_alt_endpoint:    getSetting("embedding.vllm_use_alt_endpoint", false),
         vllm_alt_endpoint_url:    getSetting("embedding.vllm_alt_endpoint_url", ""),
@@ -64,6 +67,7 @@ export async function runRetrievalPipeline(sidecarResult) {
         note: "",
         vectorHitCount: 0,
         lexicalAddedCount: 0,
+        chainExpansion: { enabled: false, seeds: 0, considered: 0, added: 0, maxAdditions: 0 },
         reranker: {
             enabled: false,
             attempted: false,
@@ -109,6 +113,7 @@ export async function runRetrievalPipeline(sidecarResult) {
             record.lexicalTerms = [...new Set([...record.lexicalTerms, ...candidate.lexicalTerms])].slice(0, 6);
         }
         if (Number.isFinite(candidate.score)) record.initialScore = candidate.score;
+        if (candidate.chainExpanded && !record.flags.includes("chain-expanded")) record.flags.push("chain-expanded");
         return record;
     };
 
@@ -172,12 +177,30 @@ export async function runRetrievalPipeline(sidecarResult) {
         return finish("completed", "Candidates matched, but none survived the retrieval filters.");
     }
 
-    // Optional LLM rerank: after vector/lexical retrieval and normal filters,
+    const initialFiltered = [...filtered];
+    filtered = expandChainCandidates(initialFiltered, queryText, recordById, trace.chainExpansion);
+
+    // Optional LLM rerank: after vector/lexical retrieval, one-hop chain
+    // expansion, and normal filters,
     // before category/global caps choose the final injection set. Disabled by
     // default because it adds one extra LLM call only when there are more
     // candidates than injection slots. Uses the Keyword sidecar profile.
     filtered = await rerankCandidates(filtered, sidecarResult, queryText, maxEntries, trace.reranker);
     assertChat();
+    // The reranker can await a remote model. Rebind every result to the live
+    // store afterwards so a memory suppressed/deleted during that wait cannot
+    // slip into the next prompt from this stale candidate snapshot.
+    const beforeRevalidation = [...filtered];
+    filtered = revalidateLiveCandidates(filtered);
+    const liveIds = new Set(filtered.map(candidate => candidate.entry.id));
+    for (const candidate of beforeRevalidation) {
+        if (liveIds.has(candidate.entry?.id)) continue;
+        const record = ensureRecord(candidate);
+        if (record) {
+            record.decision = "Filtered";
+            record.reason = "Memory was deleted or suppressed while retrieval was running.";
+        }
+    }
     filtered.forEach((candidate, index) => {
         const record = ensureRecord(candidate);
         if (!record) return;
@@ -230,6 +253,13 @@ export async function runRetrievalPipeline(sidecarResult) {
         : "No memory survived the final injection caps.", final);
 }
 
+export function revalidateLiveCandidates(candidates) {
+    return (candidates || []).map(candidate => {
+        const entry = getEntry(candidate?.entry?.id);
+        return entry && !isEffectivelySuppressed(entry) ? { ...candidate, entry } : null;
+    }).filter(Boolean);
+}
+
 function capitalize(value) {
     const text = String(value || "");
     return text ? text.charAt(0).toUpperCase() + text.slice(1) : "Memory";
@@ -246,46 +276,10 @@ export async function queryCollection(collectionId, searchText, topK, threshold,
             source: mlSettings.source,
         };
 
-        // Resolve model and URL per provider — mirrors getVectorsRequestBody() in embedder.js
-        switch (mlSettings.source) {
-            case 'openrouter':
-                body.model = mlSettings.openrouter_model;
-                break;
-            case 'ollama':
-                body.model = mlSettings.ollama_model;
-                // Same fallback chain as the embedder. Without it, queries 500'd
-                // for anyone not using Ollama as their ST TEXT-GEN backend —
-                // memories embedded fine but could never be retrieved.
-                body.apiUrl = (mlSettings.ollama_use_alt_endpoint && mlSettings.ollama_alt_endpoint_url)
-                    ? mlSettings.ollama_alt_endpoint_url
-                    : (textgenerationwebui_settings?.server_urls?.[textgen_types.OLLAMA]
-                        || mlSettings.ollama_alt_endpoint_url
-                        || 'http://localhost:11434');
-                break;
-            case 'vllm':
-                body.apiUrl = (mlSettings.vllm_use_alt_endpoint
-                    ? mlSettings.vllm_alt_endpoint_url
-                    : textgenerationwebui_settings.server_urls[textgen_types.VLLM])
-                    ?.replace(/\/$/, '')
-                    .replace(/\/v1\/embeddings$/, '')
-                    .replace(/\/embeddings$/, '');
-                body.model = mlSettings.vllm_model;
-                break;
-            case 'openai':
-                body.model = mlSettings.openai_model;
-                break;
-            case 'cohere':
-                body.model = mlSettings.cohere_model;
-                break;
-            case 'palm':
-                body.model = mlSettings.google_model;
-                break;
-            case 'mistral':
-                body.model = mlSettings.mistral_model;
-                break;
-            default:
-                break;
-        }
+        // Keep insert/delete/query provider preparation on one code path.
+        // KoboldCpp requires a pre-embedding call before ST's vector endpoint,
+        // and the returned model name scopes the on-disk vector index.
+        Object.assign(body, await prepareVectorRequestFields(mlSettings, [searchText]));
 
         const response = await fetch('/api/vector/query', {
             method: 'POST',
@@ -332,7 +326,7 @@ function normalizeText(value) {
         .replace(/[\u0300-\u036f]/g, "")
         .toLowerCase()
         .replace(/[’']/g, "")
-        .replace(/[^a-z0-9\s-]/g, " ")
+        .replace(/[^\p{L}\p{N}\s-]/gu, " ")
         .replace(/\s+/g, " ")
         .trim();
 }
@@ -373,7 +367,7 @@ function addLexicalFallbacks(candidates, sidecarResult, queryText) {
     const byId = new Map(candidates.map(c => [c.entry.id, c]));
     let added = 0;
     for (const entry of entries) {
-        if (!entry || entry.status === "archived" || entry.status === "superseded") continue;
+        if (!entry || isEffectivelySuppressed(entry)) continue;
         const hay = entrySearchText(entry);
         const title = normalizeText(entry.title);
         let lexicalScore = 0;
@@ -456,12 +450,16 @@ function mapHashesToEntries(results) {
 }
 
 
-function applyFilters(candidates, recordById = new Map()) {
+function applyFilters(candidates, recordById = new Map(), options = {}) {
     const stickyMap = getStickinessMap();
     const cooldownMap = getCooldownsMap();
     const decaySettings = getSetting("decay", {});
     const decayEnabled = decaySettings.enabled === true;
-    const threshold = Number(getSetting("vectorization.similarityThreshold", 0.75));
+    const configuredThreshold = Number(getSetting("vectorization.similarityThreshold", 0.75));
+    const threshold = Number.isFinite(Number(options.thresholdOverride))
+        ? Number(options.thresholdOverride)
+        : configuredThreshold;
+    const priorityBoost = options.priorityBoost !== false;
     const filtered = [];
 
     for (const candidate of candidates) {
@@ -477,10 +475,11 @@ function applyFilters(candidates, recordById = new Map()) {
             record.cooldownRemaining = cooldownRemaining;
         }
 
-        if (entry.status === "archived" || entry.status === "superseded") {
+        if (isEffectivelySuppressed(entry)) {
             if (record) {
                 record.decision = "Filtered";
-                record.reason = `Memory status is ${entry.status}; it is excluded from passive retrieval.`;
+                record.flags.push("suppressed");
+                record.reason = "Memory has an effective suppression reason and is excluded from ordinary retrieval.";
             }
             continue;
         }
@@ -506,27 +505,30 @@ function applyFilters(candidates, recordById = new Map()) {
         }
 
         if (entry.status === "pinned") {
+            const adjustedScore = priorityBoost ? 1.0 : score;
             if (record) {
-                record.adjustedScore = 1.0;
+                record.adjustedScore = adjustedScore;
                 record.flags.push("pinned");
                 record.decision = "Eligible";
-                record.reason = "Pinned memories bypass similarity, decay, and consolidation suppression.";
+                record.reason = priorityBoost
+                    ? "Pinned memory; priority was raised to 1.000."
+                    : "Pinned chain candidate retained its query-relative score.";
             }
-            filtered.push({ ...candidate, score: 1.0 });
+            filtered.push({ ...candidate, score: adjustedScore });
             continue;
         }
 
-        // Active core/important memories bypass decay and consolidation
-        // suppression. A starred source that the user explicitly suppresses is
-        // marked consolidated, which intentionally overrides the star so it can
-        // be retired without deleting it or removing its consolidation history.
+        // Effective suppression was already checked above. Consolidation itself is
+        // not suppression; important/core sources retain their normal boost.
         if (entry.important && entry.status !== "consolidated") {
-            const adjustedScore = Math.max(score, 0.95);
+            const adjustedScore = priorityBoost ? Math.max(score, 0.95) : score;
             if (record) {
                 record.adjustedScore = adjustedScore;
                 record.flags.push("important");
                 record.decision = "Eligible";
-                record.reason = "Active starred/important memory; priority was raised to at least 0.950 and decay/suppression were bypassed.";
+                record.reason = priorityBoost
+                    ? "Active starred/important memory; priority was raised to at least 0.950."
+                    : "Starred chain candidate retained its query-relative score.";
             }
             filtered.push({ ...candidate, score: adjustedScore });
             continue;
@@ -543,26 +545,30 @@ function applyFilters(candidates, recordById = new Map()) {
             }
         }
 
-        // Consolidated source memories stay retrievable but at reduced priority —
-        // the consolidation that replaced them carries the meaning now. They
-        // still surface for the recall tool and for close keyword matches.
+        // Consolidated source memories remain recallable. First decide whether
+        // the memory is relevant enough to be eligible; only then reduce its
+        // ranking priority. Applying the default 0.5 multiplier before the 0.75
+        // similarity threshold would make consolidated memories mathematically
+        // incapable of passing, which would be suppression by another name.
+        const eligibilityScore = adjustedScore;
+        let rankingScore = adjustedScore;
         if (entry.status === "consolidated") {
-            const multSetting = Number(getSetting("vectorization.consolidatedPriorityMultiplier", 0.5));
-            const mult = Number.isFinite(multSetting) && multSetting > 0 ? multSetting : 0.5;
-            adjustedScore *= mult;
-            if (record) record.flags.push("consolidated");
-            reasons.push(`consolidated-source priority ×${mult.toFixed(3)}`);
+            const rawMultiplier = Number(getSetting("vectorization.consolidatedPriorityMultiplier", 0.5));
+            const multiplier = Number.isFinite(rawMultiplier) ? Math.max(0.1, Math.min(1, rawMultiplier)) : 0.5;
+            rankingScore *= multiplier;
+            if (record) record.flags.push("consolidated-priority");
+            reasons.push(`consolidated priority ×${multiplier.toFixed(2)}`);
         }
 
-        if (record) record.adjustedScore = adjustedScore;
-        if (adjustedScore >= threshold) {
+        if (record) record.adjustedScore = rankingScore;
+        if (eligibilityScore >= threshold) {
             if (record) {
                 record.decision = "Eligible";
                 record.reason = reasons.length
-                    ? `Passed threshold ${threshold.toFixed(3)} after ${reasons.join(" and ")}.`
+                    ? `Passed threshold ${threshold.toFixed(3)}; ranking adjusted by ${reasons.join(" and ")}.`
                     : `Passed similarity threshold ${threshold.toFixed(3)}.`;
             }
-            filtered.push({ ...candidate, score: adjustedScore });
+            filtered.push({ ...candidate, score: rankingScore });
         } else if (record) {
             record.decision = "Filtered";
             record.reason = `${reasons.length ? `${reasons.join("; ")}; ` : ""}adjusted score ${adjustedScore.toFixed(3)} fell below threshold ${threshold.toFixed(3)}.`;
@@ -571,6 +577,84 @@ function applyFilters(candidates, recordById = new Map()) {
 
     filtered.sort((a, b) => b.score - a.score);
     return filtered;
+}
+
+function querySimilarity(queryText, entry) {
+    const query = new Set(normalizeText(queryText).split(" ").filter(word => word.length >= 3));
+    const memory = new Set(entrySearchText(entry).split(" ").filter(word => word.length >= 3));
+    if (!query.size || !memory.size) return 0;
+    let overlap = 0;
+    for (const token of query) if (memory.has(token)) overlap++;
+    if (!overlap) return 0;
+    // Query coverage is a better document-relevance signal than raw cosine for
+    // rich episodic prose: a long memory should not be punished merely for
+    // containing more detail. A lone overlap in a broad query remains weak.
+    const coverage = overlap / query.size;
+    const cosine = overlap / Math.sqrt(query.size * memory.size);
+    const loneBroadMatchPenalty = overlap === 1 && query.size >= 4 ? 0.6 : 1;
+    return ((coverage * 0.8) + (cosine * 0.2)) * loneBroadMatchPenalty;
+}
+
+function chainNeighbourIds(seed, chain) {
+    const ordered = getOrderedChainEntries(chain);
+    const index = ordered.findIndex(entry => entry.id === seed.id);
+    if (index < 0) return [];
+    const ids = [];
+    if (index > 0) ids.push(ordered[index - 1].id); // causal predecessor
+    if (ordered.length > 1) ids.push(ordered[ordered.length - 1].id); // current state
+    const turning = ordered.findLast(entry => entry.important || /(reversal|resolution|turning|recontext)/i.test([...(entry.tags || []), ...(entry.delta?.delta_type || [])].join(" ")));
+    if (turning) ids.push(turning.id);
+    return [...new Set(ids)].filter(id => id !== seed.id);
+}
+
+/** One-hop, locally scored expansion. Newly added candidates are never seeds. */
+export function expandChainCandidates(initialCandidates, queryText, recordById = new Map(), debugInfo = null) {
+    const cfg = getSetting("vectorization.chainExpansion", {}) || {};
+    const enabled = cfg.enabled !== false;
+    const maxAdditions = Math.min(2, Math.max(0, Number(cfg.maxAdditions ?? 2) || 0));
+    const poolLimit = Math.max(maxAdditions, Math.min(12, Number(cfg.candidatePool ?? 6) || 6));
+    const minimumSemantic = Math.max(0, Math.min(1, Number(cfg.minimumSemanticScore ?? 0.15)));
+    const relationshipBonus = Math.max(0, Math.min(0.25, Number(cfg.relationshipBonus ?? 0.08)));
+    const chronologyBonus = Math.max(0, Math.min(0.15, Number(cfg.chronologyBonus ?? 0.04)));
+    if (debugInfo) Object.assign(debugInfo, { enabled, seeds: initialCandidates.length, considered: 0, added: 0, maxAdditions });
+    if (!enabled || maxAdditions === 0 || !initialCandidates.length) return initialCandidates;
+
+    const directIds = new Set(initialCandidates.map(item => item.entry?.id).filter(Boolean));
+    const expanded = new Map();
+    for (const seedCandidate of initialCandidates) {
+        const seed = seedCandidate.entry;
+        for (const chainId of (seed?.chainIds || [])) {
+            const chain = getChain(chainId);
+            if (!chain || !entryBelongsToChainCharacter(seed, chain)) continue;
+            const ordered = getOrderedChainEntries(chain);
+            const latestId = ordered.at(-1)?.id;
+            for (const memoryId of chainNeighbourIds(seed, chain)) {
+                if (directIds.has(memoryId)) continue;
+                const entry = getEntry(memoryId);
+                if (!entry || isEffectivelySuppressed(entry) || !entryBelongsToChainCharacter(entry, chain)) continue;
+                if (debugInfo) debugInfo.considered++;
+                const semanticScore = querySimilarity(queryText, entry);
+                if (semanticScore < minimumSemantic) continue;
+                const score = Math.min(1, semanticScore + relationshipBonus + (memoryId === latestId ? chronologyBonus : 0));
+                const current = expanded.get(memoryId);
+                if (!current || score > current.score) expanded.set(memoryId, {
+                    entry, score, vectorScore: null, lexicalScore: semanticScore,
+                    lexicalTerms: [], chainExpanded: true, chainSeedId: seed.id, chainId,
+                });
+            }
+        }
+    }
+    const proposed = [...expanded.values()].sort((a, b) => b.score - a.score).slice(0, poolLimit);
+    // Semantic eligibility was already enforced above. Reuse the ordinary
+    // status/cooldown/decay checks, but do not compare this local relevance
+    // score to the embedding backend's differently-scaled global threshold.
+    const eligible = applyFilters(proposed, recordById, { thresholdOverride: 0, priorityBoost: false }).slice(0, maxAdditions);
+    for (const candidate of eligible) {
+        const record = recordById.get(candidate.entry.id);
+        if (record) record.flags.push("chain-expanded");
+    }
+    if (debugInfo) debugInfo.added = eligible.length;
+    return [...initialCandidates, ...eligible].sort((a, b) => b.score - a.score);
 }
 
 function calculateDecay(entry, score, settings) {

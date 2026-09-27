@@ -13,23 +13,65 @@ import { captureChatGuard } from "../lib/chatGuard.js";
  * Memory entries are shown on the Home tab for user review before commit.
  */
 
-import { makeRequest } from "./connections.js";
+import { makeRequest, getLastRequestDiagnostic } from "./connections.js";
 import { getSetting } from "../settings.js";
 import { chat, name1 } from "../../../../../script.js";
 import { getContext } from "../../../../extensions.js";
 import { getScene, getPreviousSceneSummaries, updateSceneSummary, updateSceneGeneration } from "../data/scenes.js";
 import { getPendingEntries, savePendingEntries } from "../data/storage.js";
 import { getAllEntries } from "../data/entries.js";
+import { getAllChains } from "../data/chains.js";
+import { isEffectivelySuppressed } from "../data/suppression.js";
 
 
 import { resolveCanonicalCharacter } from "../data/folders.js";
 import { isNarrativeMessage } from "../lib/chatMessages.js";
-/**
- * Max output tokens for writer/summary responses.
- */
-function getMaxResponseTokens() {
+/** General output budget for scene summaries and helper-style requests. */
+function getGeneralMaxResponseTokens() {
     const v = Number(getSetting("connections.maxResponseTokens", 8000));
     return (Number.isFinite(v) && v >= 500) ? v : 8000;
+}
+
+/**
+ * Character + world memory writing share a deliberately large completion
+ * budget. Reasoning-heavy models such as GLM 5.2 can consume a very large
+ * fraction of the completion on private deliberation before emitting the
+ * structured answer, so writer jobs must not share the smaller helper budget.
+ */
+function getMemoryWriterMaxResponseTokens() {
+    const v = Number(getSetting("connections.writerMaxResponseTokens", 25000));
+    return (Number.isFinite(v) && v >= 500) ? v : 25000;
+}
+
+function isReasoningStarvedDraft(response, entries, diagnostic) {
+    if (entries?.length) return false;
+    const visible = String(response || "").trim();
+    if (!visible) return false;
+
+    // [NO MEMORY] is a legitimate short final answer, never a truncation signal.
+    const normalized = visible.replace(/[\[\]*_`#]/g, "").trim().toLowerCase();
+    if (/^(no memory|no core memory|no entry|none)\b/.test(normalized) && normalized.length < 120) return false;
+
+    const reasoningChars = Number(diagnostic?.reasoningChars || 0);
+    const visibleChars = Number(diagnostic?.responseChars || visible.length);
+    if (!reasoningChars) return false;
+
+    // SillyTavern 1.18's Connection Manager intentionally returns extracted
+    // content/reasoning without finish_reason or token-usage metadata. We cannot
+    // assert "length" from the extension alone. What we CAN detect reliably is
+    // the failure shape from reasoning models: thousands of reasoning characters
+    // and only a tiny, unparsable visible fragment such as "**Title".
+    return visibleChars < 500 &&
+        reasoningChars >= Math.max(2000, visibleChars * 12) &&
+        diagnostic?.reasoningHeavy === true;
+}
+
+function buildReasoningStarvationRecoveryPrompt(originalUserPrompt) {
+    return `RECOVERY PASS — OUTPUT THE FINAL MEMORY BLOCKS IMMEDIATELY.
+
+Your previous attempt produced extensive private reasoning but only a tiny, unusable visible fragment. Do not re-analyze the scene, do not draft alternatives, and do not explain your choices. Use the scene and rules below only to emit the final required memory blocks. If no Core Memory qualifies, output exactly [NO MEMORY].
+
+${originalUserPrompt}`;
 }
 
 // ─── Scene Summary Generation ─────────────────────────────
@@ -44,10 +86,11 @@ function getMaxResponseTokens() {
  */
 export async function generateSceneSummary(sceneId) {
     const assertChat = captureChatGuard();
-    const profileName = getSetting("connections.sceneSummaryLLM", "") || getSetting("connections.memoryWriterLLM", "");
+    const profileName = getSetting("connections.sceneSummaryLLM", "")
+        || getSetting("connections.memoryWriterLLM", "");
     if (!profileName) {
-        console.warn("[ML] Memory Writer LLM not configured");
-        toastr?.warning?.("Memory Writer LLM not configured. Check Settings > Connections.");
+        console.warn("[ML] No scene-summary-capable LLM configured");
+        toastr?.warning?.("No Scene Summary or Memory Writer LLM configured. Check Settings > Connections.");
         return null;
     }
 
@@ -66,9 +109,10 @@ export async function generateSceneSummary(sceneId) {
     const userPrompt = buildSceneSummaryUserPrompt(sceneMessages, previousSummaries);
 
     console.log(`[ML] Writer: generating scene summary for ${sceneId}...`);
-    const summary = await makeRequest(profileName, systemPrompt, userPrompt, getMaxResponseTokens(), 0.7, {
+    const summary = await makeRequest(profileName, systemPrompt, userPrompt, getGeneralMaxResponseTokens(), 0.7, {
         requestLabel: "the scene summary",
     });
+    updateSceneGeneration(sceneId, { lastRequest: getLastRequestDiagnostic() });
 
     assertChat();
     if (summary) {
@@ -86,7 +130,7 @@ export async function generateSceneSummary(sceneId) {
  * @param {string} sceneId
  * @returns {Promise<object[]|null>} Array of pending entry objects, or null on failure
  */
-export async function generateMemoryEntries(sceneId) {
+export async function generateMemoryEntries(sceneId, options = {}) {
     const assertChat = captureChatGuard();
     const profileName = getSetting("connections.memoryWriterLLM", "");
     if (!profileName) return null;
@@ -96,22 +140,81 @@ export async function generateMemoryEntries(sceneId) {
 
     const sceneMessages = getSceneMessages(scene);
     const previousSummaries = getPreviousSceneSummaries(sceneId);
+    const memoryContext = selectWriterMemoryContext(sceneMessages);
 
     const systemPrompt = resolveMemoryEntryPrompt();
-    const userPrompt = buildMemoryEntryUserPrompt(scene.llmSummary, sceneMessages, previousSummaries);
+    const userPrompt = buildMemoryEntryUserPrompt(scene.llmSummary, sceneMessages, previousSummaries, memoryContext, { allowSupersession: !options.batchChainScanId });
 
     console.log(`[ML] Writer: generating memory entries for ${sceneId}...`);
-    let response = await makeRequest(profileName, systemPrompt, userPrompt, getMaxResponseTokens(), 0.85, {
+    let retryUsed = false;
+    let response = await makeRequest(profileName, systemPrompt, userPrompt, getMemoryWriterMaxResponseTokens(), 0.85, {
         requestLabel: "character memory generation",
     });
+    let requestDiagnostic = getLastRequestDiagnostic();
+    updateSceneGeneration(sceneId, { lastRequest: requestDiagnostic });
+
+    assertChat();
+    if (!response && ["empty", "reasoning_only"].includes(requestDiagnostic?.status)) {
+        // Empty/reasoning-only provider replies do not throw, so the transport
+        // retry loop cannot help. Give this high-value scene-close stage one
+        // deliberate second attempt after a short cooldown. A true API error has
+        // already exhausted the normal retry policy and is not doubled here.
+        retryUsed = true;
+        console.warn(`[ML] Writer: ${requestDiagnostic.status} response for ${sceneId}; retrying character memory generation once.`);
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        assertChat();
+        response = await makeRequest(profileName, systemPrompt, userPrompt, getMemoryWriterMaxResponseTokens(), 0.85, {
+            requestLabel: "character memory generation retry",
+            preferNoThink: requestDiagnostic.status === "reasoning_only",
+        });
+        requestDiagnostic = getLastRequestDiagnostic();
+        updateSceneGeneration(sceneId, { lastRequest: requestDiagnostic });
+    }
 
     assertChat();
     if (!response) {
-        console.warn("[ML] Writer: no response from LLM");
+        console.warn("[ML] Writer: no response from LLM", requestDiagnostic || "");
         return null;
     }
 
     let entries = parseWriterResponse(response, sceneId);
+
+    // A reasoning model can technically return non-empty visible content while
+    // still failing the structured task. The real GLM 5.2 failure that exposed
+    // this was a 7998-token reasoning trace followed by only "**Title" before
+    // the provider stopped. Connection Manager 1.18 strips finish_reason/usage,
+    // so detect the observable shape instead: tiny unparsable visible output +
+    // a very large extracted reasoning payload. Retry ONCE with the existing
+    // safe /no_think directive and an explicit "final blocks only" recovery cue.
+    if (!retryUsed && isReasoningStarvedDraft(response, entries, requestDiagnostic)) {
+        retryUsed = true;
+        console.warn(`[ML] Writer: reasoning-dominated incomplete visible output for ${sceneId}; retrying once with no-think recovery.`);
+        updateSceneGeneration(sceneId, {
+            lastRequest: {
+                ...(requestDiagnostic || {}),
+                status: "reasoning_starved_visible_answer",
+            },
+        });
+        await new Promise(resolve => setTimeout(resolve, 2500));
+        assertChat();
+
+        const recoveryPrompt = buildReasoningStarvationRecoveryPrompt(userPrompt);
+        response = await makeRequest(profileName, systemPrompt, recoveryPrompt, getMemoryWriterMaxResponseTokens(), 0.75, {
+            requestLabel: "character memory generation no-think recovery",
+            preferNoThink: true,
+        });
+        requestDiagnostic = getLastRequestDiagnostic();
+        updateSceneGeneration(sceneId, { lastRequest: requestDiagnostic });
+
+        assertChat();
+        if (!response) {
+            console.warn("[ML] Writer: no-think recovery returned no visible answer", requestDiagnostic || "");
+            return null;
+        }
+        entries = parseWriterResponse(response, sceneId);
+    }
+
+    entries = sanitizeWriterSupersessionProposals(entries, { allowSupersession: !options.batchChainScanId });
 
     // Prompting alone is not reliable across writer models. If the draft contains
     // a long verbatim run from the current scene or its generated reference note,
@@ -122,7 +225,7 @@ export async function generateMemoryEntries(sceneId) {
         assertChat();
 
         const repairPrompt = buildAntiCopyRepairPrompt(response, sceneMessages, previousSummaries);
-        const repaired = await makeRequest(profileName, systemPrompt, repairPrompt, getMaxResponseTokens(), 0.9, {
+        const repaired = await makeRequest(profileName, systemPrompt, repairPrompt, getMemoryWriterMaxResponseTokens(), 0.9, {
             requestLabel: "memory anti-copy rewrite",
         });
 
@@ -141,14 +244,28 @@ export async function generateMemoryEntries(sceneId) {
         }
     }
 
+    entries = sanitizeWriterSupersessionProposals(entries, { allowSupersession: !options.batchChainScanId });
+
     if (entries && entries.length > 0) {
+        if (options.batchChainScanId) {
+            for (const entry of entries) entry.batchChainScanId = String(options.batchChainScanId);
+        }
         // Append to existing pending entries (don't overwrite during batch scan)
         const existing = getPendingEntries() || [];
         savePendingEntries([...existing, ...entries]);
         console.log(`[ML] Writer: ${entries.length} entries generated, pending review`);
-    } else if (response && response.trim().length > 20) {
-        // Response had content but nothing parsed — likely a format issue, not [NO MEMORY]
-        console.warn(`[ML] Writer: response received but no entries parsed for ${sceneId}. Raw response:`, response.slice(0, 200));
+    } else if (entries === null && response) {
+        // Visible text existed but did not contain a complete parseable memory
+        // block. Persist this distinction so Home/export diagnostics do not call
+        // it a generic transport failure.
+        requestDiagnostic = {
+            ...(requestDiagnostic || {}),
+            status: "unparseable_visible_answer",
+            responseChars: String(response).trim().length,
+            responsePreview: String(response).trim().slice(0, 160),
+        };
+        updateSceneGeneration(sceneId, { lastRequest: requestDiagnostic });
+        console.warn(`[ML] Writer: response received but no complete entries parsed for ${sceneId}. Raw response:`, response.slice(0, 200));
     }
 
     return entries;
@@ -168,6 +285,43 @@ function hasSceneEntries(sceneId, category) {
     const all = [...(getAllEntries() || []), ...(Array.isArray(pending) ? pending : Object.values(pending))];
     return all.some(entry => entry?.sceneId === sceneId &&
         (category === "world" ? entry.category === "world" : entry.category !== "world"));
+}
+
+function requestFailureMessage(baseMessage, sceneId = null) {
+    const persisted = sceneId ? getScene(sceneId)?.generation?.lastRequest : null;
+    const live = getLastRequestDiagnostic();
+    // Prefer a persisted writer-level parse diagnostic over a transport-level
+    // "success" record; otherwise use the live Connection Manager diagnostic.
+    const diagnostic = (persisted?.status && persisted.status !== "success") ? persisted : live;
+    if (!diagnostic || !diagnostic.status) return baseMessage;
+    const profile = diagnostic.profileName ? ` "${diagnostic.profileName}"` : "";
+    if (diagnostic.status === "empty") {
+        return `${baseMessage}${profile} returned no visible answer.`;
+    }
+    if (diagnostic.status === "reasoning_only") {
+        return `${baseMessage}${profile} returned reasoning but no final answer.`;
+    }
+    if (diagnostic.status === "reasoning_starved_visible_answer") {
+        return `${baseMessage}${profile} returned extensive reasoning but only an incomplete visible answer.`;
+    }
+    if (diagnostic.status === "unparseable_visible_answer") {
+        const preview = diagnostic.responsePreview ? ` Visible output began: ${JSON.stringify(diagnostic.responsePreview)}.` : "";
+        return `${baseMessage}${profile} returned visible text but no complete memory block could be parsed.${preview}`;
+    }
+    if (diagnostic.status === "configuration_error") {
+        const detail = Array.isArray(diagnostic.error) ? diagnostic.error.find(item => item?.message)?.message : "Connection profile configuration error.";
+        return `${baseMessage}${profile} ${detail || "Connection profile configuration error."}`;
+    }
+    if (diagnostic.status === "error") {
+        const chain = Array.isArray(diagnostic.error) ? diagnostic.error : [];
+        // Connection Manager often wraps the useful backend failure inside
+        // Error("API request failed", { cause }). Prefer the deepest concrete
+        // cause so Home shows something actionable instead of the wrapper.
+        const detail = [...chain].reverse().find(item => item?.message) || chain[0];
+        const status = detail?.status ? `HTTP ${detail.status}: ` : "";
+        return `${baseMessage}${profile} request error: ${status}${detail?.message || "Unknown provider error."}`;
+    }
+    return baseMessage;
 }
 
 function writerFailure(sceneId, stage, message, entries = [], worldEntries = []) {
@@ -194,73 +348,125 @@ async function executeWriterFlow(sceneId, options = {}) {
     const retry = options.retry === true;
     updateSceneGeneration(sceneId, { status: "running", error: "" });
     let generation = getScene(sceneId)?.generation || {};
-    let madeRequest = false;
     let entries = [];
     let worldEntries = [];
+    const failures = [];
 
-    const summaryAlreadyComplete = !!scene.llmSummary && (generation.summary === "complete" || retry);
-    let summary = scene.llmSummary || "";
+    const ensureSameChat = () => {
+        assertChat();
+        if (getContext().chatId !== flowChatId) {
+            const err = new Error("Chat changed during generation.");
+            err.name = "MLStaleChatError";
+            throw err;
+        }
+    };
+
+    // A retry must skip ONLY stages that are explicitly recorded as complete.
+    // Older logic used `retry && hasSceneEntries(...)`, which meant one already-
+    // accepted memory could make Memory Loom skip the entire writer stage even
+    // when that stage had actually failed. That produced the maddening symptom
+    // of pressing Retry and seeing no Memory Writer request in the backend log.
+    const legacyStageComplete = (stage, category) => {
+        if (!retry) return false;
+        if (generation?.[stage] !== undefined && generation?.[stage] !== null) return false;
+        return hasSceneEntries(sceneId, category);
+    };
+
+    // ── Scene summary ───────────────────────────────────────────────
+    const summaryAlreadyComplete = generation.summary === "complete" && !!scene.llmSummary;
     if (!summaryAlreadyComplete) {
-        updateSceneGeneration(sceneId, { summary: "running" });
-        summary = await generateSceneSummary(sceneId);
-        madeRequest = true;
+        updateSceneGeneration(sceneId, { summary: "running", summaryError: "" });
+        const summary = await generateSceneSummary(sceneId);
+        ensureSameChat();
+        if (summary) {
+            updateSceneGeneration(sceneId, { summary: "complete", summaryError: "" });
+        } else {
+            const message = requestFailureMessage("Scene summary generation failed.", sceneId);
+            updateSceneGeneration(sceneId, { summary: "failed", summaryError: message });
+            failures.push({ stage: "summary", message });
+        }
+        // The summary is useful metadata, but it is NOT a prerequisite for
+        // character/world memory generation. Both downstream writers are grounded
+        // directly in the source scene. A flaky summary model must never zero out
+        // the user's memory output or prevent the Memory Writer from being called.
+        await new Promise(r => setTimeout(r, 2500));
     }
-    assertChat();
-    if (getContext().chatId !== flowChatId) {
-        console.warn("[ML] Writer flow aborted — chat changed during generation.");
-        return { ok: false, partial: false, stage: "cancelled", error: "Chat changed during generation.", entries, worldEntries, sceneId };
-    }
-    if (!summary) {
-        return writerFailure(sceneId, "summary", "Scene summary generation failed.", entries, worldEntries);
-    }
-    updateSceneGeneration(sceneId, { summary: "complete" });
 
-    // Space the two calls out — token-per-minute throttles (GLM Cloud) trip on
-    // back-to-back large requests even when the request count is low.
-    if (madeRequest) await new Promise(r => setTimeout(r, 2500));
-
-    assertChat();
+    // ── Character memories ─────────────────────────────────────────
     scene = getScene(sceneId);
     generation = scene?.generation || {};
-    const memoriesAlreadyComplete = generation.memories === "complete" || (retry && hasSceneEntries(sceneId, "character"));
+    const memoriesAlreadyComplete = generation.memories === "complete" || legacyStageComplete("memories", "character");
     if (!memoriesAlreadyComplete) {
-        updateSceneGeneration(sceneId, { memories: "running" });
+        updateSceneGeneration(sceneId, { memories: "running", memoriesError: "" });
         entries = await generateMemoryEntries(sceneId);
-        madeRequest = true;
+        ensureSameChat();
+        if (entries === null) {
+            const message = requestFailureMessage("Character memory generation failed.", sceneId);
+            updateSceneGeneration(sceneId, { memories: "failed", memoriesError: message });
+            failures.push({ stage: "memories", message });
+        } else {
+            updateSceneGeneration(sceneId, { memories: "complete", memoriesError: "" });
+        }
+        await new Promise(r => setTimeout(r, 2500));
     }
-    if (getContext().chatId !== flowChatId) {
-        console.warn("[ML] Writer flow aborted — chat changed during generation.");
-        return { ok: false, partial: true, stage: "cancelled", error: "Chat changed during generation.", entries, worldEntries, sceneId };
-    }
-    if (entries === null) {
-        return writerFailure(sceneId, "memories", "Character memory generation failed.", [], worldEntries);
-    }
-    updateSceneGeneration(sceneId, { memories: "complete" });
 
-    // World memories — separate, stricter pass. Usually produces nothing.
-    // Spaced out like the other calls for rate-limit safety.
+    // ── World memories ─────────────────────────────────────────────
+    scene = getScene(sceneId);
+    generation = scene?.generation || {};
     if (getSetting("worldMemory.enabled", true)) {
-        if (madeRequest) await new Promise(r => setTimeout(r, 2500));
-        try {
-            const { generateWorldMemories } = await import("./worldWriter.js");
-            assertChat();
-            generation = getScene(sceneId)?.generation || {};
-            const worldAlreadyComplete = generation.world === "complete" || (retry && hasSceneEntries(sceneId, "world"));
-            if (!worldAlreadyComplete) {
-                updateSceneGeneration(sceneId, { world: "running" });
+        const worldAlreadyComplete = generation.world === "complete" || legacyStageComplete("world", "world");
+        if (!worldAlreadyComplete) {
+            updateSceneGeneration(sceneId, { world: "running", worldError: "" });
+            try {
+                const { generateWorldMemories } = await import("./worldWriter.js");
+                ensureSameChat();
                 worldEntries = await generateWorldMemories(sceneId);
+                ensureSameChat();
                 if (worldEntries === null) {
-                    return writerFailure(sceneId, "world", "World memory generation failed.", entries, []);
+                    const message = requestFailureMessage("World memory generation failed.", sceneId);
+                    updateSceneGeneration(sceneId, { world: "failed", worldError: message });
+                    failures.push({ stage: "world", message });
+                } else {
+                    updateSceneGeneration(sceneId, { world: "complete", worldError: "" });
                 }
+            } catch (e) {
+                if (e?.name === "MLStaleChatError") throw e;
+                console.error("[ML] World memory generation failed:", e);
+                const message = requestFailureMessage("World memory generation failed.", sceneId);
+                updateSceneGeneration(sceneId, { world: "failed", worldError: message });
+                failures.push({ stage: "world", message });
             }
-            updateSceneGeneration(sceneId, { world: "complete" });
-        } catch (e) {
-            if (e?.name === "MLStaleChatError") throw e;
-            console.error("[ML] World memory generation failed:", e);
-            return writerFailure(sceneId, "world", "World memory generation failed.", entries, []);
         }
     } else {
-        updateSceneGeneration(sceneId, { world: "skipped" });
+        updateSceneGeneration(sceneId, { world: "skipped", worldError: "" });
+    }
+
+    // Include pre-existing failed stages that were skipped because another stage
+    // was the one retried. This keeps the overall scene status truthful.
+    generation = getScene(sceneId)?.generation || {};
+    for (const [stage, field] of [["summary", "summaryError"], ["memories", "memoriesError"], ["world", "worldError"]]) {
+        if (generation[stage] === "failed" && !failures.some(item => item.stage === stage)) {
+            failures.push({ stage, message: generation[field] || `${stage} generation failed.` });
+        }
+    }
+
+    if (failures.length > 0) {
+        const successfulStage = [generation.summary, generation.memories, generation.world]
+            .some(value => value === "complete" || value === "skipped");
+        const error = failures.map(item => item.message).filter(Boolean).join(" ");
+        updateSceneGeneration(sceneId, {
+            status: successfulStage ? "partial" : "failed",
+            error,
+        });
+        return {
+            ok: false,
+            partial: successfulStage,
+            stage: failures[0].stage,
+            error,
+            entries,
+            worldEntries,
+            sceneId,
+        };
     }
 
     updateSceneGeneration(sceneId, { status: "complete", error: "" });
@@ -356,12 +562,12 @@ export async function regenerateEntry(entry, guidance = "") {
     const systemPrompt = resolveMemoryEntryPrompt();
     const userPrompt = buildRegenerationPrompt(entry, guidance);
 
-    const response = await makeRequest(profileName, systemPrompt, userPrompt, getMaxResponseTokens(), 0.8, {
+    const response = await makeRequest(profileName, systemPrompt, userPrompt, getMemoryWriterMaxResponseTokens(), 0.8, {
         requestLabel: "memory regeneration",
     });
     if (!response) return null;
 
-    const entries = parseWriterResponse(response, entry.sceneId);
+    const entries = sanitizeWriterSupersessionProposals(parseWriterResponse(response, entry.sceneId), { allowSupersession: !entry.batchChainScanId });
     return entries?.[0] || null;
 }
 
@@ -373,7 +579,10 @@ function buildSceneGroundingRules() {
 - Treat explicit narration, dialogue, and stated motives as higher-confidence evidence than dramatic tone, genre convention, or the apparent effectiveness of an action.
 - Preserve the difference between what objectively happened and what a character merely believed, feared, suspected, or inferred.
 - Do not invent motives, hidden competence, strategy, romance, composure, or emotional certainty that the source does not establish.
-- Preserve uncertainty and mixed motives when the scene is uncertain.`;
+- Preserve uncertainty and mixed motives when the scene is uncertain.
+- Preserve material FAILURES, wrong turns, breakdowns, injuries, aborted attempts, and mistakes even when the scene later recovers or succeeds. Later success does not erase an earlier failure; report both in causal order when both mattered.
+- Preserve causal direction. Do not rewrite a psychological trigger as dangerous power, a trauma response as tactical control, or an accidental success as deliberate mastery unless the source explicitly establishes that cause.
+- Track WHO is actually acting or thinking in each section. Do not assume the player character is present merely because the chat belongs to them or because a location header lacks a name. Resolve pronouns from explicit nearby names; if identity is uncertain, say so instead of guessing.`;
 }
 
 function buildMemoryGroundingRules() {
@@ -382,22 +591,31 @@ function buildMemoryGroundingRules() {
 - Keep subjective belief separate from objective fact. If the Primary Character thinks another person planned something, write that they suspected, believed, or became convinced of it unless the source actually confirms the plan.
 - Never state another character's unstated inner feelings, motives, or realizations as objective truth. The Primary Character may infer them from behavior and may be wrong.
 - Explicit narration and stated motives still govern objective scene facts. Do not rewrite panic as tactical brilliance, desperation as dominance, confusion as insight, or reactive survival as calculated control unless the source supports it.
+- Preserve FAILURES and setbacks as first-class memory material. If a character fails, dissociates, panics, chooses the wrong approach, gets hurt, misjudges something, or has to recover before later succeeding, do not collapse that sequence into a clean triumph arc. The later success does not retroactively erase the failure.
+- Preserve causal direction. If trauma or a chosen emotional anchor triggers the breakdown while power merely spikes alongside it, do not turn that into "the power was destroying them" unless the source actually says so. Likewise, do not turn a mistake into hidden mastery because the eventual outcome was impressive.
+- When the failure itself changes what the Primary Character understands, fears, respects, or plans to do next, it may be THE pressure point of the memory even if the scene later ends well.
 - Do NOT flatten the Primary Character's own psychology in the name of caution. Their remembered shame, desire, jealousy, tenderness, anger, fascination, dread, rationalization, denial, associations, and private contradictions are valid material when supported by their viewpoint, behavior, established characterization, or a plausible subjective reading of what they perceived.
 - Preserve uncertainty when uncertainty itself matters: "he couldn't decide whether..." is better than falsely resolving the character's conflict.`;
 }
 
 function buildDefaultSceneSummaryPrompt() {
-    return `[MLv5] Write a factual scene reference note. Start with:
+    return `[MLv6] Write a factual scene reference note. Start with:
 
 Title: [3-6 word evocative title]
 
-Then 2-3 paragraphs reporting what happened, in the exact order it occurred. Include key dialogue when it drives the scene. Report only events actually present in the scene text — do not rearrange the sequence, fuse separate moments, or add details that are not there. Past tense, plain prose. No bullets, no bold, no "Scene Context:" prefix.`;
+Then report what happened in the exact order it occurred. Use enough paragraphs to preserve the scene's major beats: normally 3-6, and more for an unusually long multi-location scene when needed. Do not let the final location or final beat overwrite the scene's central throughline. Include key dialogue when it drives the scene. Explicitly preserve consequential failures, wrong turns, breakdowns, recoveries, and later successes as separate beats when they all occurred. Report only events actually present in the scene text — do not rearrange the sequence, fuse separate moments, or add details that are not there. Track the acting/POV character carefully in each section. Past tense, plain prose. No bullets, no bold, no "Scene Context:" prefix.`;
 }
 
 function buildDefaultMemoryEntryPrompt() {
     return `[MLv5] CORE MEMORY WRITER — THIS IS NOT A SCENE SUMMARY.
 
 Pause and review the scene. Create a Core Memory from what the Primary Character would actually RETAIN: the emotionally defining beat, the details that snagged in their attention, the private interpretation they carried away, and the way the moment changed or complicated how they understood someone, themselves, or the situation.
+
+DECISION DISCIPLINE — IMPORTANT:
+- Make ONE selection pass over the scene, choose the qualifying memory/memories, then write them.
+- Do not repeatedly reconsider the same candidate, repeatedly debate split-vs-merge, or loop over the same chain decision.
+- When a chain/supersession decision is uncertain, use the conservative default (- none / blank) and move on.
+- Spend the completion on psychologically mature final memories, not repeated meta-deliberation about what you might write.
 
 TRANSFORMATION REQUIREMENT — ABSOLUTE:
 - Do NOT retell the scene from beginning to end. Do NOT walk through every action in chronological order.
@@ -423,8 +641,27 @@ Use this exact format:
 **Before**:
 **After**:
 **Delta**:
+**Chain Actions**:
+- none
+**Supersedes**:
 
-Every field must be filled in except Key Character. Primary Character is the full name of the NPC this memory belongs to — never blank, never "Unknown", never {{user}}. If no present NPC can own the memory, do not write the entry. Key Character lists OTHER characters who are actively present and participating in the remembered moment. A person merely being thought about is not a Key Character. In Content, use a character's full name at most once, when it reads naturally; afterward use their given name or pronouns so the prose does not become robotic.
+Every field through Delta must be filled in except Key Character. Chain and Supersedes fields are optional metadata. Primary Character is the full name of the NPC this memory belongs to — never blank, never "Unknown", never {{user}}. If no present NPC can own the memory, do not write the entry. Key Character lists OTHER characters who are actively present and participating in the remembered moment. A person merely being thought about is not a Key Character. In Content, use a character's full name at most once, when it reads naturally; afterward use their given name or pronouns so the prose does not become robotic.
+
+CHAINING / SUPERSESSION — CONSERVATIVE:
+- Default Chain Actions to one line: - none. Shared characters or topics are never enough.
+- Chain Actions is PLURAL. A single new memory may advance zero, one, or multiple DISTINCT developmental threads. Do not force the memory to choose only one valid chain.
+- For each justified action, write ONE line under Chain Actions using exactly one of these shapes:
+  - append | Chain ID: <existing chain id> | Revised Chain Description: <optional updated progression> | Revised Chain Label: <optional updated label>
+  - create | Chain Memory IDs: <existing memory id(s), comma-separated> | Chain Label: <specific thread> | Chain Description: <concrete progression>
+- Chains are PRIMARY-CHARACTER-SPECIFIC. Append/create only with memories owned by the SAME Primary Character as this new memory. A Key Character or merely mentioned person does not count. Never combine different characters' viewpoints into one thematic/story chain.
+- Existing chain membership NEVER makes a memory unavailable. The same memory may participate in multiple different chains for the same Primary Character when it genuinely advances multiple distinct threads. Do not duplicate the same thread; reuse of the memory itself is allowed.
+- Use append with a valid Chain ID only when this memory is a clear successive stage of that exact developmental thread for the same Primary Character.
+- Existing-chain descriptions are LIVING MAPS of the thread. When an appended memory merely reinforces an already-described stage, omit Revised Chain Description and Revised Chain Label. When it meaningfully escalates, reverses, complicates, resolves, or recontextualizes the thread, supply a concise Revised Chain Description that preserves the earlier progression and incorporates the new stage. Do NOT turn the description into a scene recap or a list of every memory.
+- Revised Chain Label is rarer: provide it only when the old label has become materially too narrow or misleading. Otherwise leave it blank/omit it.
+- Use create with at least one valid existing Chain Memory ID only when those same-character memories form establishment → development/escalation/reversal/complication/resolution/recontextualization.
+- Multiple actions must represent genuinely different developmental threads, not alternate labels for the same idea. Many memories should still have - none.
+- Chaining never replaces, merges, or suppresses an earlier episodic memory.
+- Supersedes is a PROPOSAL ONLY. It never executes automatically and it is never a substitute for writing a valid Core Memory. Generate every justified Core Memory first; only then, if an older memory is genuinely erroneous/duplicate/invalid and represents essentially the same information, you may propose its ID. Ordinary evolution, earlier developmental stages, childhood memories, imported/manual memories, consolidation sources, chain milestones, and merely overlapping episodes must NOT be superseded.
 
 Write in THIRD PERSON LIMITED, past tense — never first person and never second person. The narration is limited to the Primary Character's knowledge and subjectivity.
 
@@ -466,7 +703,8 @@ function buildSceneSummaryUserPrompt(messages, previousSummaries) {
 }
 
 
-function buildMemoryEntryUserPrompt(_sceneSummary, messages, previousSummaries) {
+function buildMemoryEntryUserPrompt(_sceneSummary, messages, previousSummaries, memoryContext = [], options = {}) {
+    const allowSupersession = options.allowSupersession !== false;
     // Do not feed the freshly generated chronological scene summary back into
     // the memory writer. Models were treating it as ready-made prose to remix.
     // The raw scene is evidence; older summaries are continuity context only.
@@ -476,6 +714,27 @@ function buildMemoryEntryUserPrompt(_sceneSummary, messages, previousSummaries) 
         previousSummaries.slice(-3).forEach((item, i) => {
             prompt += `Earlier ${i + 1}: ${String(item).substring(0, 200)}...\n`;
         });
+    }
+    if (memoryContext.length > 0) {
+        prompt += "\nRELEVANT EXISTING MEMORIES (reference IDs only for optional chaining/supersession; do not copy their prose):\n";
+        for (const item of memoryContext) {
+            prompt += `- ID ${item.id} | ${item.title} | ${item.datetime || "undated"} | chains: ${item.chains.length ? item.chains.map(chain => `${chain.id} (${chain.label})`).join(", ") : "none"} | ${item.summary}\n`;
+        }
+        const relevantChains = new Map();
+        for (const item of memoryContext) for (const chain of (item.chains || [])) if (chain?.id && !relevantChains.has(chain.id)) relevantChains.set(chain.id, chain);
+        if (relevantChains.size > 0) {
+            prompt += "\nRELEVANT EXISTING CHAINS (current metadata; use this to judge whether an append should also evolve the chain description):\n";
+            for (const chain of relevantChains.values()) {
+                prompt += `- Chain ${chain.id} | Primary Character: ${chain.primaryCharacter || "unknown"} | Label: ${chain.label || "Developmental thread"} | Description: ${chain.description || "(no description yet)"}\n`;
+            }
+            prompt += "If an appended memory substantially changes the shape of an existing thread, return Revised Chain Description on that append action. Preserve the old arc and add the new stage compactly. If it only reinforces what is already described, do not rewrite the description. Revised Chain Label is optional and should be used only when the existing label has become genuinely too narrow or misleading.\n";
+        }
+        prompt += "Default to Chain Actions: - none and Supersedes: blank unless the strict criteria in your instructions are unmistakably met. Existing chain membership does not make a memory unavailable: the same memory may support another genuinely distinct chain for the same Primary Character.\n";
+    }
+    if (allowSupersession) {
+        prompt += "\nSUPPRESSION SAFETY: Supersedes is only a proposal for separate user review. It never replaces generation of a valid Core Memory. Never use it for ordinary development, childhood history, imported/manual memories, consolidation sources, or chain milestones.";
+    } else {
+        prompt += "\nBATCH-SCAN SAFETY: Supersedes MUST be blank. This retrofit pass is additive/reconstructive only and may not retire, replace, or suppress any existing memory. Generate every valid Core Memory normally.";
     }
     prompt += "\nCreate the Core Memory now. Do not summarize the scene; select the pressure point and transform it through the Primary Character's subjectivity.";
 
@@ -494,6 +753,150 @@ function buildMemoryEntryUserPrompt(_sceneSummary, messages, previousSummaries) 
         prompt += ` FINAL RULE, overriding everything else: never create a memory whose Primary Character is ${banned.join(" or ")}. This governs ONLY the Primary Character field — inside a memory's Content, refer to them freely and by full name like any other character; never avoid or dance around their names. They are valid Key Characters. If a defining moment belongs solely to them — with no NPC present — that is not a memory: SKIP it and output nothing for it. Do NOT write an entry with an empty, placeholder, "Unknown", or explanatory Primary Character. The Primary Character field must contain a real NPC name or the entry must not exist.`;
     }
     return prompt;
+}
+
+function contextTokens(text) {
+    return new Set(String(text || "").toLowerCase().replace(/[^\p{L}\p{N}\s-]/gu, " ").split(/\s+/).filter(word => word.length >= 4));
+}
+
+/** Small local pre-writer retrieval: no recursive traversal and no LLM call. */
+export function selectWriterMemoryContext(messages, limit = 6) {
+    const query = contextTokens(messages);
+    if (!query.size) return [];
+    const chains = new Map((getAllChains() || []).map(chain => [chain.id, chain]));
+    return (getAllEntries() || [])
+        .filter(entry => entry && ["active", "consolidation", "consolidated", "pinned"].includes(entry.status) && !isEffectivelySuppressed(entry))
+        .map(entry => {
+            const hay = contextTokens([entry.title, entry.content, entry.primaryCharacter, ...(entry.primaryCharacters || []), ...(entry.keyCharacters || []), ...(entry.tags || [])].join(" "));
+            let overlap = 0;
+            for (const token of query) if (hay.has(token)) overlap++;
+            const score = overlap / Math.max(1, Math.sqrt(query.size * Math.max(1, hay.size)));
+            return { entry, score };
+        })
+        .filter(item => item.score > 0)
+        .sort((a, b) => b.score - a.score || Number(b.entry.createdAt || 0) - Number(a.entry.createdAt || 0))
+        .slice(0, Math.max(1, limit))
+        .map(({ entry }) => ({
+            id: entry.id,
+            title: entry.title || "Untitled",
+            datetime: entry.datetime || "",
+            summary: String(entry.content || "").replace(/\s+/g, " ").slice(0, 260),
+            chains: (entry.chainIds || []).map(id => chains.get(id)).filter(Boolean).map(chain => ({
+                id: chain.id,
+                label: chain.label,
+                description: chain.description || "",
+                primaryCharacter: chain.primaryCharacter || "",
+                primaryCharacterKey: chain.primaryCharacterKey || "",
+                memoryIds: chain.memoryIds || [],
+            })),
+        }));
+}
+
+/**
+ * Writer supersession is proposal-only and deliberately narrow. The writer may
+ * only propose retiring an ordinary active LLM-generated episodic memory owned
+ * by the same Primary Character. Imported/manual memories, consolidation
+ * sources, starred memories, and existing chain milestones are protected from
+ * automatic proposal noise; users can still suppress those manually.
+ */
+export function sanitizeWriterSupersessionProposals(entries, { allowSupersession = true } = {}) {
+    if (!Array.isArray(entries)) return entries;
+    if (!allowSupersession) {
+        for (const entry of entries) entry.supersedes = [];
+        return entries;
+    }
+    const existing = new Map((getAllEntries() || []).filter(Boolean).map(entry => [entry.id, entry]));
+    for (const entry of entries) {
+        const owners = new Set((entry.primaryCharacters?.length ? entry.primaryCharacters : [entry.primaryCharacter]).filter(Boolean).map(name => String(name).trim().toLowerCase()));
+        const safe = [];
+        for (const id of [...new Set(Array.isArray(entry.supersedes) ? entry.supersedes.filter(Boolean) : [])]) {
+            const target = existing.get(id);
+            if (!target || target.category !== "character") continue;
+            const targetOwners = (target.primaryCharacters?.length ? target.primaryCharacters : [target.primaryCharacter]).filter(Boolean).map(name => String(name).trim().toLowerCase());
+            if (!targetOwners.length || !targetOwners.every(name => owners.has(name))) continue;
+            if (target.source !== "llm_generated") continue;
+            if (target.status !== "active") continue;
+            if (target.important || target.excludeFromConsolidation || target.consolidatedSourceOf || target.consolidationId) continue;
+            if (Array.isArray(target.chainIds) && target.chainIds.length) continue;
+            if (isEffectivelySuppressed(target)) continue;
+            safe.push(id);
+        }
+        entry.supersedes = safe;
+    }
+    return entries;
+}
+
+function normalizeWriterChainAction(raw) {
+    const direct = raw?.chainAction || raw?.chain_action;
+    const source = direct && typeof direct === "object" ? direct : raw || {};
+    const action = String(source.action || direct || source["Chain Action"] || "none").trim().toLowerCase();
+    if (!["append", "create"].includes(action)) return { action: "none" };
+    const description = String(source.description || source.chainDescription || source["Chain Description"] || "").trim();
+    const label = String(source.label || source.chainLabel || source["Chain Label"] || "Developmental thread").trim();
+    return {
+        action,
+        chainId: String(source.chainId || source.chain_id || source["Chain ID"] || "").trim() || null,
+        memoryIds: normalizeStringList(source.memoryIds || source.memory_ids || source.chainMemoryIds || source["Chain Memory IDs"] || []),
+        label,
+        description,
+        revisedLabel: String(source.revisedLabel || source.revised_label || source.revisedChainLabel || source["Revised Chain Label"] || "").trim(),
+        revisedDescription: String(source.revisedDescription || source.revised_description || source.revisedChainDescription || source["Revised Chain Description"] || (action === "append" ? description : "")).trim(),
+    };
+}
+
+function normalizeWriterChainActions(raw) {
+    const source = raw?.chainActions ?? raw?.chain_actions ?? raw?.["Chain Actions"];
+    let items = [];
+    if (Array.isArray(source)) items = source;
+    else if (source && typeof source === "object") items = [source];
+    else if (typeof source === "string" && source.trim()) {
+        try {
+            const parsed = JSON.parse(source);
+            items = Array.isArray(parsed) ? parsed : [parsed];
+        } catch {
+            items = source.split(/\n|;/).map(parseWriterChainActionLine).filter(Boolean);
+        }
+    }
+
+    // Backward compatibility with v0.1.29 and older writer/custom prompts.
+    if (!items.length) {
+        const legacy = normalizeWriterChainAction(raw);
+        if (legacy.action !== "none") items = [legacy];
+    }
+
+    const normalized = items
+        .map(item => typeof item === "string" ? parseWriterChainActionLine(item) : item)
+        .filter(Boolean)
+        .map(item => normalizeWriterChainAction(item))
+        .filter(item => item.action !== "none");
+    const seen = new Set();
+    return normalized.filter(item => {
+        const key = JSON.stringify([item.action, item.chainId || "", [...(item.memoryIds || [])].sort(), item.label || "", item.description || "", item.revisedLabel || "", item.revisedDescription || ""]);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+}
+
+function parseWriterChainActionLine(line) {
+    const text = String(line || "").trim().replace(/^[-*\d.)\s]+/, "");
+    if (!text || /^none\b/i.test(text)) return null;
+    const actionMatch = text.match(/^(append|create)\b/i);
+    if (!actionMatch) return null;
+    const action = actionMatch[1].toLowerCase();
+    const read = label => {
+        const re = new RegExp(`${label}\\s*:\\s*([^|]+)`, "i");
+        return text.match(re)?.[1]?.trim() || "";
+    };
+    return {
+        action,
+        chainId: read("Chain ID"),
+        memoryIds: read("Chain Memory IDs"),
+        label: read("Chain Label"),
+        description: read("Chain Description"),
+        revisedLabel: read("Revised Chain Label"),
+        revisedDescription: read("Revised Chain Description"),
+    };
 }
 
 export function resolveMemoryEntryPrompt() {
@@ -522,13 +925,21 @@ function substituteUserMacro(text) {
 }
 
 function buildRegenerationPrompt(entry, guidance) {
-    let prompt = "Regenerate this memory entry:\n\n";
-    prompt += `Title: ${entry.title}\n`;
-    prompt += `Content: ${entry.content}\n`;
-    if (guidance) {
-        prompt += `\nUser guidance: ${guidance}\n`;
+    let prompt = "Regenerate this memory entry. The prior draft may contain factual or causal mistakes; SOURCE SCENE below is authoritative. Do not merely polish or paraphrase the old draft. Re-evaluate the remembered pressure point from the source evidence.\n\n";
+    prompt += `PRIOR DRAFT TO REPLACE:\nTitle: ${entry.title}\nContent: ${entry.content}\n`;
+
+    const scene = entry?.sceneId ? getScene(entry.sceneId) : null;
+    if (scene) {
+        const sceneMessages = getSceneMessages(scene);
+        if (sceneMessages) {
+            prompt += `\nSOURCE SCENE — AUTHORITATIVE EVIDENCE:\n${sceneMessages}\n`;
+        }
     }
-    prompt += "\nWrite the Core Memory entry using the exact format from your instructions. Usually ONE entry — only if something genuinely pivotal happened.";
+
+    if (guidance) {
+        prompt += `\nUSER CORRECTION / GUIDANCE — PRIORITIZE THIS WHEN CONSISTENT WITH THE SOURCE:\n${guidance}\n`;
+    }
+    prompt += "\nWrite the corrected Core Memory entry using the exact format from your instructions. Preserve material failures, mistakes, breakdowns, recoveries, and causal direction. Usually ONE entry — only if something genuinely pivotal happened.";
     return prompt;
 }
 
@@ -591,34 +1002,40 @@ function normalizePrimaries(raw) {
 }
 
 /**
- * Get the text of messages within a scene's range.
+ * Get the complete narrative text of messages within a scene's range.
+ *
+ * IMPORTANT: Memory Loom must not silently shorten, sample, summarize, or
+ * excerpt source RP messages before they reach the scene summarizer or memory
+ * writers. These messages are the authoritative evidence for attribution,
+ * chronology, dialogue, failures, motives, and causal detail. If a selected
+ * model cannot fit a scene, the request should fail transparently rather than
+ * mutating the evidence behind the user's back.
+ *
  * @param {object} scene
  * @returns {string}
  */
 export function getSceneMessages(scene, includeHidden = false) {
     if (!chat || !Array.isArray(chat)) return "";
     const end = scene.messageEnd ?? (chat.length - 1);
-    let msgs = chat.slice(scene.messageStart, end + 1);
-    // Utility/tool/tracker/summary records are never narrative evidence, even
-    // for world scans. includeHidden is retained for API compatibility only.
+    let msgs = chat.slice(scene.messageStart, end + 1).map((msg, offset) => ({
+        ...msg,
+        _mlMessageIndex: Number(scene.messageStart || 0) + offset,
+    }));
+
+    // `is_system: true` is also SillyTavern's hidden-message flag. The shared
+    // narrative classifier distinguishes hidden RP from real utility/tool/system
+    // records, so historical context management cannot erase evidence from a
+    // Memory Loom scene. includeHidden is retained for API compatibility.
     msgs = msgs.filter(isNarrativeMessage);
 
-    // Total budget so one request can never explode past provider token limits.
-    // Normal scenes (under ~12k chars total) pass through with full prose.
-    // Longer scenes get a proportionally reduced per-message cap (never below 600).
-    const TOTAL_BUDGET = 12000;
-    let perMsgCap = 4000;
-    const fullTotal = msgs.reduce((s, m) => s + Math.min((m.mes || "").length, perMsgCap), 0);
-    if (fullTotal > TOTAL_BUDGET && msgs.length > 0) {
-        perMsgCap = Math.max(600, Math.floor(TOTAL_BUDGET / msgs.length));
-    }
-
-    return msgs.map(msg => {
-        const text = String(msg.mes || "").substring(0, perMsgCap);
-        if (msg.is_user) {
-            return `[${name1 || "User"}, the human player, writes:]\n${text}`;
-        }
-        return text;
+    return msgs.map((msg, localIndex) => {
+        const sourceIndex = Number.isFinite(Number(msg?._mlMessageIndex))
+            ? Number(msg._mlMessageIndex)
+            : localIndex;
+        const prefix = msg?.is_user
+            ? `[Message ${sourceIndex}] [${name1 || "User"}, human player]:\n`
+            : `[Message ${sourceIndex}] [Roleplay narration / NPCs]:\n`;
+        return prefix + String(msg?.mes || "");
     }).join("\n\n");
 }
 
@@ -773,6 +1190,8 @@ function parseWriterResponse(response, sceneId) {
             },
             source: "llm_generated",
             sceneId: sceneId,
+            chainActions: normalizeWriterChainActions(e),
+            supersedes: normalizeStringList(e.supersedes || e.Supersedes),
         })).map(e => {
             // Split joint primaries, resolve canonical names, drop banned/unknown
             // names individually ("Alex Morgan" → "Morgan Alex")
@@ -813,22 +1232,34 @@ function parseMarkdownMemory(text, sceneId) {
         var block = blocks[i];
         var lines = block.split("\n");
         var title = "", date = "", primary = "", keyChar = "", contentLines = [];
-        var inContent = false;
+        var chainAction = "none", chainId = "", chainMemoryIds = "", chainLabel = "", chainDescription = "", supersedes = "";
+        var chainActionLines = [];
+        var inContent = false, inChainActions = false;
         
         for (var j = 0; j < lines.length; j++) {
             var line = lines[j].trim();
             // Tolerate **Title**:, **Title:**, __Title__:, and plain Title:.
             // Restrict labels so a colon in prose does not end Content early.
-            var headerMatch = line.match(/^\s*(?:\*\*|__)?\s*(Title|Date(?:\/Time)?|Content|Primary Character|Key Characters?|Before|After|Delta|Delta Type)\s*(?:(?:\*\*|__)\s*:\s*|:\s*(?:\*\*|__)?\s*)(.*)$/i);
+            var headerMatch = line.match(/^\s*(?:\*\*|__)?\s*(Title|Date(?:\/Time)?|Content|Primary Character|Key Characters?|Before|After|Delta|Delta Type|Chain Actions?|Chain ID|Chain Memory IDs|Chain Label|Chain Description|Supersedes)\s*(?:(?:\*\*|__)\s*:\s*|:\s*(?:\*\*|__)?\s*)(.*)$/i);
             if (headerMatch) {
                 var fieldName = headerMatch[1].trim().toLowerCase();
                 var fieldVal = headerMatch[2].trim();
+                inChainActions = false;
                 if (fieldName === "title") { title = fieldVal; inContent = false; }
                 else if (fieldName === "date" || fieldName === "date/time") { date = fieldVal; inContent = false; }
                 else if (fieldName === "content") { contentLines = [fieldVal]; inContent = true; }
                 else if (fieldName.indexOf("primary") !== -1) { primary = fieldVal; inContent = false; }
                 else if (fieldName.indexOf("key") !== -1) { keyChar = fieldVal; inContent = false; }
+                else if (fieldName === "chain actions") { if (fieldVal) chainActionLines.push(fieldVal); inContent = false; inChainActions = true; }
+                else if (fieldName === "chain action") { chainAction = fieldVal; inContent = false; }
+                else if (fieldName === "chain id") { chainId = fieldVal; inContent = false; }
+                else if (fieldName === "chain memory ids") { chainMemoryIds = fieldVal; inContent = false; }
+                else if (fieldName === "chain label") { chainLabel = fieldVal; inContent = false; }
+                else if (fieldName === "chain description") { chainDescription = fieldVal; inContent = false; }
+                else if (fieldName === "supersedes") { supersedes = fieldVal; inContent = false; }
                 else { inContent = false; }
+            } else if (inChainActions && line.length > 0) {
+                chainActionLines.push(line);
             } else if (inContent && line.length > 0) {
                 // Continuation of content field
                 contentLines.push(line);
@@ -884,7 +1315,11 @@ function parseMarkdownMemory(text, sceneId) {
                 low_delta_flag: false
             },
             source: "llm_generated",
-            sceneId: sceneId
+            sceneId: sceneId,
+            chainActions: chainActionLines.length
+                ? normalizeWriterChainActions({ chainActions: chainActionLines })
+                : normalizeWriterChainActions({ action: chainAction, chainId, memoryIds: chainMemoryIds, label: chainLabel, description: chainDescription }),
+            supersedes: normalizeStringList(supersedes)
         });
     }
     if (results.length > 0) console.log("[ML] Writer: parsed " + results.length + " entries from markdown");

@@ -910,6 +910,15 @@
     flex-shrink: 0;
 }
 
+.ml-mem-entry-badges {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+    flex-wrap: wrap;
+    flex-shrink: 0;
+}
+
 .ml-status-synthesis {
     border: 1px solid #c9a227;
     color: #e8cf7a;
@@ -939,6 +948,12 @@
     color: #555;
     background: #222;
     text-decoration: line-through;
+}
+
+.ml-status-suppressed {
+    border: 1px solid #8f4d55;
+    color: #f0a0aa;
+    background: #2c1e21;
 }
 
 /* ─── Delta Flag (low-delta warning) ─────────────────────── */
@@ -2358,4 +2373,262 @@ body.ml-disabled .ml-scene-btn {
     .ml-retrieval-decision { white-space: normal; }
     .ml-retrieval-trace-line { flex-direction: column; gap: 2px; }
     .ml-retrieval-trace-line strong { text-align: left; }
+}
+
+/* ─── Library: Create / Edit Chains manager ─────────────── */
+.ml-modal-chain-manager {
+    width: 820px;
+    max-width: 96vw;
+}
+
+.ml-chain-manager-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.ml-chain-manager-heading-copy {
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
+.ml-chain-manager-head-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 7px;
+    flex: 0 0 auto;
+}
+
+.ml-chain-manager-head-actions .ml-btn {
+    min-height: 30px;
+}
+
+.ml-chain-manager-grid {
+    display: grid;
+    grid-template-columns: minmax(210px, 0.72fr) minmax(0, 1.8fr);
+    gap: 14px;
+    min-height: 420px;
+}
+
+.ml-chain-manager-list-pane,
+.ml-chain-manager-editor-pane {
+    border: 1px solid #424242;
+    border-radius: 5px;
+    background: #252525;
+    padding: 11px;
+    min-width: 0;
+}
+
+.ml-chain-manager-list {
+    margin-top: 7px;
+    max-height: 570px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.ml-chain-manager-owner-group {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: #8f8f8f;
+    padding: 9px 6px 3px;
+}
+
+.ml-chain-manager-item {
+    width: 100%;
+    border: 1px solid #3f3f3f;
+    border-radius: 4px;
+    background: #2e2e2e;
+    color: #d6d2ca;
+    text-align: left;
+    padding: 8px 9px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.ml-chain-manager-item:hover,
+.ml-chain-manager-item.active {
+    border-color: #777;
+    background: #383838;
+}
+
+.ml-chain-manager-item-title {
+    font-size: 12px;
+    line-height: 1.35;
+}
+
+.ml-chain-manager-item-meta,
+.ml-chain-manager-none,
+.ml-chain-manager-empty,
+.ml-chain-manager-memory-date,
+.ml-chain-manager-membership,
+.ml-chain-manager-memory-preview {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    color: #929292;
+}
+
+.ml-chain-manager-empty,
+.ml-chain-manager-none {
+    padding: 14px 8px;
+    line-height: 1.6;
+}
+
+.ml-chain-manager-description {
+    min-height: 76px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-style: normal;
+    font-size: 12px;
+}
+
+.ml-chain-manager-editor-pane .ml-field-hdr {
+    align-items: center;
+}
+
+.ml-chain-manager-editor-pane .editor_maximize {
+    margin-left: auto;
+    display: inline-block;
+    font-size: 14px;
+    vertical-align: middle;
+    opacity: 0.85;
+    filter: grayscale(1);
+    cursor: pointer;
+    transition: all var(--animation-duration-2x, 0.3s) ease-in-out;
+}
+
+.ml-chain-manager-memory-head {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 10px;
+    margin: 12px 0 7px;
+}
+
+.ml-chain-manager-search {
+    max-width: 280px;
+}
+
+.ml-chain-manager-memories {
+    border: 1px solid #3f3f3f;
+    border-radius: 4px;
+    max-height: 360px;
+    overflow-y: auto;
+    background: #202020;
+}
+
+.ml-chain-manager-memory-row {
+    padding: 9px 10px;
+    border-bottom: 1px solid #343434;
+}
+
+.ml-chain-manager-memory-row:last-child {
+    border-bottom: none;
+}
+
+.ml-chain-manager-memory-select {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    cursor: pointer;
+    font-size: 12px;
+    color: #ddd8d0;
+}
+
+.ml-chain-manager-memory-select input {
+    margin-top: 3px;
+    flex: 0 0 auto;
+}
+
+.ml-chain-manager-memory-select > span {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.ml-chain-manager-membership {
+    color: #b4a56f;
+}
+
+.ml-chain-manager-memory-preview {
+    margin: 7px 0 0 24px;
+    line-height: 1.55;
+}
+
+.ml-chain-manager-memory-preview summary {
+    cursor: pointer;
+    color: #aaa;
+}
+
+.ml-chain-manager-memory-preview > div {
+    margin-top: 6px;
+    white-space: pre-wrap;
+    color: #aaa;
+}
+
+.ml-chain-manager-delta {
+    padding-top: 5px;
+    color: #b9b9b9 !important;
+}
+
+.ml-chain-manager-actions {
+    margin-top: 12px;
+}
+
+#ml-popout .ml-modal-chain-manager {
+    width: 100%;
+}
+
+#ml-popout .ml-chain-manager-grid {
+    grid-template-columns: 1fr;
+}
+
+@media (max-width: 760px) {
+    .ml-chain-manager-grid {
+        grid-template-columns: 1fr;
+    }
+    .ml-chain-manager-list {
+        max-height: 220px;
+    }
+    .ml-chain-manager-memory-head {
+        align-items: stretch;
+        flex-direction: column;
+    }
+    .ml-chain-manager-search {
+        max-width: none;
+    }
+    .ml-chain-manager-head {
+        flex-direction: row;
+        align-items: flex-start;
+    }
+    .ml-chain-manager-head-actions {
+        flex-direction: column;
+        align-items: stretch;
+        min-width: 92px;
+    }
+    .ml-chain-manager-head-actions .ml-btn {
+        justify-content: center;
+        width: 100%;
+    }
+}
+
+@media (max-width: 420px) {
+    .ml-chain-manager-head {
+        gap: 8px;
+    }
+    .ml-chain-manager-head-actions {
+        min-width: 82px;
+    }
+    .ml-chain-manager-head-actions .ml-btn {
+        padding-left: 8px;
+        padding-right: 8px;
+        font-size: 10px;
+    }
 }

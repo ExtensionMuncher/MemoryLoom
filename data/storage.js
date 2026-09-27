@@ -111,6 +111,10 @@ function ensureChatNamespace() {
             folders: [],           // All folders (top-level and subfolders)
             scenes: [],            // All scene records
             consolidations: {},    // All consolidation entries, keyed by consolidation ID
+            chains: {},            // Developmental memory chains, keyed by chain ID
+            pendingChainProposals: [], // Preview-only historical chain scan results
+            chainBatches: [],      // Reversible applied proposal batches
+            postBatchChainScans: [], // Batch scans waiting for their pending character memories to be resolved
             pendingEntries: null,  // Pending review entries from the memory writer (null = none)
             messageCounter: 0,     // Live narrative-message count at the last sidecar scan/baseline
             sidecarPauseCadence: null, // Frozen {liveCount, baseline} while the sidecar is paused
@@ -137,6 +141,22 @@ export function getChatData() {
  */
 export function persistChatData() {
     saveChat();
+}
+
+/** Clear every per-chat Memory Loom collection while preserving global settings. */
+export function clearCurrentChatData() {
+    const data = getChatData();
+    const removedEntries = Object.values(data.entries || {}).map(entry => structuredClone(entry));
+    const clean = {
+        entries: {}, folders: [], scenes: [], consolidations: {}, chains: {},
+        pendingChainProposals: [], chainBatches: [], postBatchChainScans: [], pendingEntries: null,
+        messageCounter: 0, sidecarPauseCadence: null, lastSidecarRun: null,
+        openSceneId: null, stickiness: {}, cooldowns: {}, worldScale: "",
+    };
+    for (const key of Object.keys(data)) delete data[key];
+    Object.assign(data, clean);
+    saveChat();
+    return removedEntries;
 }
 
 // ─── Entries (committed memory entries) ───────────────────
@@ -250,6 +270,81 @@ export function saveConsolidations(consolidations) {
     ensureChatNamespace();
     chat_metadata[NAMESPACE].consolidations = consolidations;
     saveChat();
+}
+
+// ─── Memory chains ────────────────────────────────────────
+
+export function getChains() {
+    ensureChatNamespace();
+    if (!chat_metadata[NAMESPACE].chains || Array.isArray(chat_metadata[NAMESPACE].chains)) {
+        const raw = chat_metadata[NAMESPACE].chains || [];
+        chat_metadata[NAMESPACE].chains = Object.fromEntries(raw.filter(item => item?.id).map(item => [item.id, item]));
+    }
+    return chat_metadata[NAMESPACE].chains;
+}
+
+export function saveChains(chains) {
+    ensureChatNamespace();
+    chat_metadata[NAMESPACE].chains = chains && typeof chains === "object" && !Array.isArray(chains) ? chains : {};
+    saveChat();
+}
+
+export function getPendingChainProposals() {
+    ensureChatNamespace();
+    const value = chat_metadata[NAMESPACE].pendingChainProposals;
+    return Array.isArray(value) ? value.filter(Boolean) : [];
+}
+
+export function savePendingChainProposals(proposals) {
+    ensureChatNamespace();
+    chat_metadata[NAMESPACE].pendingChainProposals = Array.isArray(proposals) ? proposals.filter(Boolean) : [];
+    saveChat();
+}
+
+export function getChainBatches() {
+    ensureChatNamespace();
+    const value = chat_metadata[NAMESPACE].chainBatches;
+    return Array.isArray(value) ? value.filter(Boolean) : [];
+}
+
+export function saveChainBatches(batches) {
+    ensureChatNamespace();
+    chat_metadata[NAMESPACE].chainBatches = Array.isArray(batches) ? batches.filter(Boolean) : [];
+    saveChat();
+}
+
+
+export function getPostBatchChainScans() {
+    ensureChatNamespace();
+    const value = chat_metadata[NAMESPACE].postBatchChainScans;
+    return Array.isArray(value) ? value.filter(Boolean) : [];
+}
+
+export function savePostBatchChainScans(scans) {
+    ensureChatNamespace();
+    chat_metadata[NAMESPACE].postBatchChainScans = Array.isArray(scans) ? scans.filter(Boolean) : [];
+    saveChat();
+}
+
+export function queuePostBatchChainScan(scan) {
+    if (!scan?.id) return false;
+    const scans = getPostBatchChainScans();
+    if (scans.some(item => item.id === scan.id)) return false;
+    scans.push({
+        id: String(scan.id),
+        createdAt: Number(scan.createdAt || Date.now()),
+        label: String(scan.label || "Batch scan"),
+    });
+    savePostBatchChainScans(scans.slice(-20));
+    return true;
+}
+
+export function removePostBatchChainScan(scanId) {
+    const scans = getPostBatchChainScans();
+    const next = scans.filter(item => item.id !== scanId);
+    if (next.length === scans.length) return false;
+    savePostBatchChainScans(next);
+    return true;
 }
 
 // ─── Pending Entries ──────────────────────────────────────
@@ -506,11 +601,12 @@ export function getDefaultSettings() {
         // NOT API keys. The user selects which of their existing
         // ST connection profiles to use for each ML role.
         connections: {
-            memoryWriterLLM: "",       // Generates entries on scene close
+            memoryWriterLLM: "",       // Generates both character/episodic and setting/world memories
             sceneSummaryLLM: "",       // Optional separate scene-summary profile
             consolidationLLM: "",      // Generates arc/sub-arc consolidation summaries
             sidecarLLM: "",            // Extracts themes from context every N messages
-            maxResponseTokens: 8000,    // Shared writer/summary/world output budget
+            writerMaxResponseTokens: 25000, // Shared character + world writer output budget
+            maxResponseTokens: 8000,    // General summary/helper output budget
             noThink: false,             // Legacy blanket fallback
             noThinkHard: false,         // Legacy blanket hard fallback
             noThinkProfiles: {},        // Per-profile soft suppression, keyed by UUID
@@ -521,12 +617,15 @@ export function getDefaultSettings() {
         // Field names mirror VectFox/ST vector API exactly so getVectorsRequestBody()
         // works without translation. Do NOT rename these fields.
         embedding: {
-            source: "transformers",         // Provider: transformers, ollama, vllm, openai, cohere, palm, openrouter, mistral
+            source: "transformers",         // Provider: transformers, koboldcpp, ollama, vllm, openai, cohere, palm, openrouter, mistral
             // Ollama
             ollama_model: "",
             ollama_use_alt_endpoint: false,
             ollama_alt_endpoint_url: "",
             ollama_keep: false,
+            // KoboldCpp — uses ST's configured Text Completion URL unless alt endpoint is enabled
+            koboldcpp_use_alt_endpoint: false,
+            koboldcpp_alt_endpoint_url: "",
             // vLLM
             vllm_model: "",
             vllm_use_alt_endpoint: false,
@@ -579,6 +678,15 @@ export function getDefaultSettings() {
                 maxResponseTokens: 450,
                 timeoutMs: 12000,      // Reranker is optional; skip quickly if the sidecar model stalls
             },
+            chainExpansion: {
+                enabled: true,         // Local, one-hop expansion after normal retrieval
+                maxAdditions: 2,       // Hard cap per retrieval cycle
+                candidatePool: 6,      // Small neighbour pool scored against the same query
+                relationshipBonus: 0.08,
+                chronologyBonus: 0.04,
+                minimumSemanticScore: 0.15,
+            },
+            consolidatedPriorityMultiplier: 0.5, // Ranking demotion after a consolidated source passes semantic eligibility
             defaultStickiness: 0,      // Messages to stay injected after firing (0 = no stickiness)
             defaultCooldown: 0,        // Messages before entry can fire again (0 = no cooldown)
         },

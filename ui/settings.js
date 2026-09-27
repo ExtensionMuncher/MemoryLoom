@@ -16,10 +16,15 @@ import { captureChatGuard } from "../lib/chatGuard.js";
  */
 
 import { getSetting, setSetting } from "../settings.js";
-import { persistSettings } from "../data/storage.js";
+import { persistSettings, getPendingChainProposals, runChatTransaction, queuePostBatchChainScan } from "../data/storage.js";
+import {
+    getAllChains, getOrderedChainEntries, setChainProposalApproval,
+    applyApprovedChainProposals, undoLastChainBatch, validateChains,
+    rebuildChainMembership, removeMemoryFromChain, deleteChain,
+} from "../data/chains.js";
 import { resolveMemoryEntryPrompt, resolveSceneSummaryPrompt } from "../llm/writer.js";
 import { getAllEntries } from "../data/entries.js";
-import { reEmbedEntry } from "../embed/embedder.js";
+import { reEmbedEntry, deleteEntryVector } from "../embed/embedder.js";
 import { getContext } from "../../../../extensions.js";
 import { getLastRetrievalTrace, clearLastRetrievalTrace } from "../lib/debug.js";
 import { isNarrativeMessage } from "../lib/chatMessages.js";
@@ -254,6 +259,114 @@ function renderDebug($pane) {
         runBatchScan($btn, rangeStart, rangeEnd, "Scan world", true);
     });
 
+    // ── Memory Chaining ──────────────────────────────────
+    const $chainTools = $(`
+        <details class="ml-retrieval-trace-block ml-chain-tools">
+            <summary>
+                <div style="min-width:0">
+                    <div class="ml-setting-label">Memory Chaining</div>
+                    <div class="ml-setting-sub">Preview rare developmental links across active and consolidated memories · scanning never applies changes automatically</div>
+                </div>
+                <span class="ml-retrieval-trace-chevron" aria-hidden="true">▾</span>
+            </summary>
+            <div class="ml-btn-row" style="margin:10px 0;flex-wrap:wrap">
+                <button class="ml-btn" id="ml-chain-scan">Scan for Memory Chains</button>
+                <button class="ml-btn" id="ml-chain-preview">Preview Chain Proposals</button>
+                <button class="ml-btn" id="ml-chain-apply">Apply Approved Chains</button>
+                <button class="ml-btn" id="ml-chain-undo">Undo Last Chain Batch</button>
+                <button class="ml-btn" id="ml-chain-validate">Validate Chains</button>
+                <button class="ml-btn" id="ml-chain-rebuild">Rebuild Chain Membership</button>
+            </div>
+            <div id="ml-chain-proposals" style="display:none;margin:8px 0"></div>
+            <div class="ml-setting-row" style="align-items:flex-end;flex-wrap:wrap">
+                <label style="flex:1;min-width:180px"><span class="ml-setting-sub">Chain</span><select id="ml-chain-select" class="ml-setting-select" style="width:100%"></select></label>
+                <label style="flex:1;min-width:180px"><span class="ml-setting-sub">Memory</span><select id="ml-chain-memory-select" class="ml-setting-select" style="width:100%"></select></label>
+                <button class="ml-btn" id="ml-chain-show">Show Chain</button>
+                <button class="ml-btn" id="ml-chain-remove">Remove From Chain</button>
+                <button class="ml-btn-danger" id="ml-chain-delete">Delete Chain</button>
+            </div>
+        </details>
+    `);
+    $body.append($chainTools);
+
+    const refreshChainTools = () => {
+        const chains = getAllChains();
+        const selectedBefore = $chainTools.find("#ml-chain-select").val();
+        const $select = $chainTools.find("#ml-chain-select").empty();
+        if (!chains.length) $select.append(`<option value="">No chains</option>`);
+        for (const chain of chains) $select.append(`<option value="${escapeHtml(chain.id)}">${escapeHtml(chain.label)} (${chain.memoryIds?.length || 0})</option>`);
+        if (selectedBefore && chains.some(chain => chain.id === selectedBefore)) $select.val(selectedBefore);
+        const selected = $select.val();
+        const $memory = $chainTools.find("#ml-chain-memory-select").empty();
+        for (const entry of getOrderedChainEntries(selected)) $memory.append(`<option value="${escapeHtml(entry.id)}">${escapeHtml(entry.title || entry.id)}</option>`);
+        const proposals = getPendingChainProposals();
+        const entriesById = new Map(getAllEntries().map(entry => [entry.id, entry]));
+        const $preview = $chainTools.find("#ml-chain-proposals").empty();
+        if (!proposals.length) $preview.append(`<div class="ml-setting-sub">No pending proposals.</div>`);
+        for (const proposal of proposals) {
+            const proposedEntries = (proposal.memoryIds || []).map(id => entriesById.get(id)).filter(Boolean);
+            const memoryRows = proposedEntries.map((entry, index) => {
+                const owners = (entry.primaryCharacters?.length ? entry.primaryCharacters : [entry.primaryCharacter]).filter(Boolean).join(", ") || "Unknown";
+                const excerpt = String(entry.content || "").replace(/\s+/g, " ").trim();
+                const delta = String(entry.delta?.delta || "").replace(/\s+/g, " ").trim();
+                return `<details style="margin:6px 0 6px 18px">
+                    <summary style="cursor:pointer"><b>${index + 1}. ${escapeHtml(entry.title || entry.id)}</b> · ${escapeHtml(entry.datetime || "Undated")} · Primary: ${escapeHtml(owners)}</summary>
+                    <div class="ml-setting-sub" style="margin:6px 0 0 18px;white-space:normal">${escapeHtml(excerpt || "No content")}</div>
+                    ${delta ? `<div class="ml-setting-sub" style="margin:5px 0 0 18px"><b>Delta:</b> ${escapeHtml(delta)}</div>` : ""}
+                </details>`;
+            }).join("");
+            $preview.append(`<div style="margin:9px 0;padding:8px;border:1px solid var(--SmartThemeBorderColor);border-radius:6px">
+                <label class="checkbox_label" style="display:block;margin:0">
+                    <input type="checkbox" class="ml-chain-approve" data-id="${escapeHtml(proposal.id)}" ${proposal.approved ? "checked" : ""}>
+                    <b>${escapeHtml(proposal.label)}</b> · ${proposal.memoryIds.length} memories
+                </label>
+                <div class="ml-setting-sub" style="margin:4px 0"><b>Primary Character:</b> ${escapeHtml(proposal.primaryCharacter || "Unknown")}</div>
+                <div class="ml-setting-sub">${escapeHtml(proposal.description)}</div>
+                <details style="margin-top:7px">
+                    <summary style="cursor:pointer"><b>Review the ${proposal.memoryIds.length} memories before approval</b></summary>
+                    ${memoryRows || `<div class="ml-setting-sub" style="margin:6px 0 0 18px">No referenced memories are currently available.</div>`}
+                </details>
+            </div>`);
+        }
+    };
+    refreshChainTools();
+    $chainTools.find("#ml-chain-select").on("change", refreshChainTools);
+    $chainTools.on("change", ".ml-chain-approve", function () { setChainProposalApproval($(this).data("id"), this.checked); });
+    $chainTools.find("#ml-chain-preview").on("click", () => { refreshChainTools(); $chainTools.find("#ml-chain-proposals").toggle(); });
+    $chainTools.find("#ml-chain-scan").on("click", async function () {
+        const $btn = $(this).prop("disabled", true).text("Scanning…");
+        try {
+            const { scanForMemoryChains } = await import("../llm/chainScanner.js");
+            const proposals = await scanForMemoryChains();
+            refreshChainTools(); $chainTools.find("#ml-chain-proposals").show();
+            toastr?.success?.(`Found ${proposals.length} chain proposal${proposals.length === 1 ? "" : "s"}. Review and approve before applying.`, "Memory Loom");
+        } catch (error) { console.error("[ML] Chain scan failed:", error); toastr?.error?.(error.message || "Chain scan failed.", "Memory Loom"); }
+        finally { $btn.prop("disabled", false).text("Scan for Memory Chains"); }
+    });
+    $chainTools.find("#ml-chain-apply").on("click", () => {
+        try { const result = applyApprovedChainProposals(); refreshChainTools(); toastr?.success?.(`Applied ${result.applied} approved chain${result.applied === 1 ? "" : "s"}.`, "Memory Loom"); }
+        catch (error) { toastr?.warning?.(error.message, "Memory Loom"); }
+    });
+    $chainTools.find("#ml-chain-undo").on("click", () => { const done = undoLastChainBatch(); refreshChainTools(); toastr?.[done ? "success" : "info"]?.(done ? "Last chain batch undone." : "No chain batch to undo.", "Memory Loom"); });
+    $chainTools.find("#ml-chain-validate").on("click", () => { const result = validateChains(); toastr?.[result.valid ? "success" : "warning"]?.(result.valid ? "All chains are valid." : `${result.issues.length} chain issue(s) found.`, "Memory Loom"); });
+    $chainTools.find("#ml-chain-rebuild").on("click", () => { const result = runChatTransaction(() => rebuildChainMembership()); refreshChainTools(); toastr?.success?.(`Rebuilt ${result.links} membership links across ${result.chains} chains.`, "Memory Loom"); });
+    $chainTools.find("#ml-chain-show").on("click", () => {
+        const entries = getOrderedChainEntries($chainTools.find("#ml-chain-select").val());
+        const text = entries.map((entry, index) => `${index + 1}. ${entry.datetime || "Undated"} — ${entry.title}`).join("\n") || "No chain selected.";
+        window.alert(text);
+    });
+    $chainTools.find("#ml-chain-remove").on("click", () => {
+        const chainId = $chainTools.find("#ml-chain-select").val(), memoryId = $chainTools.find("#ml-chain-memory-select").val();
+        if (!chainId || !memoryId) return;
+        try { runChatTransaction(() => removeMemoryFromChain(chainId, memoryId)); refreshChainTools(); toastr?.success?.("Memory removed from chain.", "Memory Loom"); }
+        catch (error) { toastr?.warning?.(error.message, "Memory Loom"); }
+    });
+    $chainTools.find("#ml-chain-delete").on("click", () => {
+        const chainId = $chainTools.find("#ml-chain-select").val();
+        if (!chainId || !window.confirm("Delete this chain? Memories will remain intact.")) return;
+        runChatTransaction(() => deleteChain(chainId)); refreshChainTools(); toastr?.success?.("Chain deleted. Memories were retained.", "Memory Loom");
+    });
+
     // ── Set to default ───────────────────────────────────
     $body.append(`
         <div class="ml-setting-row" style="border-bottom:none">
@@ -478,10 +591,11 @@ function renderConnections($pane) {
         </select>`;
     }
 
-    $body.append(settingRow("Memory writer LLM", "Generates entries on scene close", selectFor("memoryWriterLLM")));
-    $body.append(settingRow("Scene summary LLM", "Writes scene reference notes · falls back to memory writer if unset", selectFor("sceneSummaryLLM")));
+    $body.append(settingRow("Memory writer LLM", "Generates character/episodic and setting/world memories", selectFor("memoryWriterLLM")));
+    $body.append(settingRow("Scene summary LLM", "Writes scene reference notes · falls back to Memory writer if unset", selectFor("sceneSummaryLLM")));
     $body.append(settingRow("Consolidation LLM", "Generates arc and sub-arc consolidation summaries", selectFor("consolidationLLM")));
     $body.append(settingRow("Keyword sidecar LLM", "Extracts themes from context every N messages", selectFor("sidecarLLM")));
+    $body.append(`<div class="ml-setting-sub" style="margin:2px 0 8px">Connection profiles are provided by SillyTavern's Connection Manager. KoboldCpp Text Completion profiles are supported directly; Memory Loom passes the selected profile UUID back to ST.</div>`);
 
     // No-think helpers/labels (defined before the dropdown loop so its change
     // handler can reference them).
@@ -607,9 +721,21 @@ function renderScanning($pane) {
         $(document).trigger("ml:refresh-sidecar-cadence");
     });
 
-    // Max response tokens for each writer/summary/world call.
+    // Both memory-writing passes need the same large budget. GLM 5.2 can spend
+    // many thousands of completion tokens reasoning before emitting either
+    // character memories or world-memory blocks. Keep summaries/helpers separate.
+    const writerMaxTok = getSetting("connections.writerMaxResponseTokens", 25000);
+    $body.append(settingRow("Memory writer max tokens", "Character + world memory generation output budget · default 25k",
+        `<input type="number" class="ml-setting-select" id="ml-setting-writerMaxResponseTokens" value="${Number(writerMaxTok) || 25000}" min="500" max="32000" step="500" style="width:90px;text-align:center">`
+    ));
+    $body.find("#ml-setting-writerMaxResponseTokens").on("change", function () {
+        let v = Number($(this).val());
+        if (!Number.isFinite(v) || v < 500) { v = 25000; $(this).val(v); }
+        setSetting("connections.writerMaxResponseTokens", v);
+    });
+
     const maxTok = getSetting("connections.maxResponseTokens", 8000);
-    $body.append(settingRow("Max response tokens", "Output budget per writer, summary, or world-memory call",
+    $body.append(settingRow("General max response tokens", "Scene summary, auto-tag, and helper output budget",
         `<input type="number" class="ml-setting-select" id="ml-setting-maxResponseTokens" value="${Number(maxTok) || 8000}" min="500" max="32000" step="500" style="width:90px;text-align:center">`
     ));
     $body.find("#ml-setting-maxResponseTokens").on("change", function () {
@@ -779,7 +905,7 @@ function renderConsolidation($pane) {
     // Max response tokens for consolidation
     const ctok = getSetting("consolidation.maxResponseTokens", 30000);
     $body.append(settingRow("Max response tokens", "Budget per consolidation call — a consolidation emits a large structured object; too low truncates it (default 30000)",
-        `<input type="number" id="ml-setting-consolidationTokens" value="${Number(ctok) || 30000}" min="1000" max="100000" step="1000" style="width:90px;text-align:center">`
+        `<input type="number" id="ml-setting-consolidationTokens" value="${Number(ctok) || 30000}" min="1000" max="120000" step="1000" style="width:90px;text-align:center">`
     ));
     $body.find("#ml-setting-consolidationTokens").on("change", function () {
         let v = parseInt($(this).val());
@@ -943,6 +1069,25 @@ function buildEmbedProviderHtml(source) {
         case 'transformers':
             return '<div class="ml-setting-row"><div class="ml-setting-sub" style="padding:4px 0">No configuration needed — ST handles Transformers embeddings locally.</div></div>';
 
+        case 'koboldcpp': {
+            const useAlt = sv('embedding.koboldcpp_use_alt_endpoint', false);
+            return `
+                <div class="ml-setting-row">
+                    <div>
+                        <div class="ml-setting-label">KoboldCpp endpoint</div>
+                        <div class="ml-setting-sub">Uses the KoboldCpp URL from ST Text Completion settings by default · requires KoboldCpp 1.87+ with an embedding model loaded</div>
+                    </div>
+                </div>
+                <div class="ml-setting-row">
+                    <div><div class="ml-setting-label">Use alt endpoint</div><div class="ml-setting-sub">Override ST's configured KoboldCpp Text Completion URL for Memory Loom embeddings only</div></div>
+                    <label class="ml-toggle"><input type="checkbox" id="ml-koboldcpp-use-alt"${useAlt?' checked':''}><span class="ml-slider"></span></label>
+                </div>
+                <div id="ml-koboldcpp-alt-url-row" class="ml-setting-row" style="display:${useAlt?'flex':'none'}">
+                    <div><div class="ml-setting-label">KoboldCpp URL</div><div class="ml-setting-sub">Example: http://127.0.0.1:5001</div></div>
+                    <input type="text" id="ml-koboldcpp-alt-url" class="ml-setting-select" value="${escapeHtml(sv('embedding.koboldcpp_alt_endpoint_url',''))}" placeholder="http://127.0.0.1:5001">
+                </div>`;
+        }
+
         case 'ollama': {
             const useAlt = sv('embedding.ollama_use_alt_endpoint', false);
             return `
@@ -1015,6 +1160,11 @@ function buildEmbedProviderHtml(source) {
 }
 
 function wireEmbedEvents($c) {
+    $c.find('#ml-koboldcpp-use-alt').on('change', function(){
+        const v=$(this).prop('checked'); setSetting('embedding.koboldcpp_use_alt_endpoint',v);
+        $c.find('#ml-koboldcpp-alt-url-row').css('display',v?'flex':'none');
+    });
+    $c.find('#ml-koboldcpp-alt-url').on('change input', function(){ setSetting('embedding.koboldcpp_alt_endpoint_url',$(this).val().trim()); });
     $c.find('#ml-ollama-model').on('change input', function(){ setSetting('embedding.ollama_model', $(this).val().trim()); });
     $c.find('#ml-ollama-use-alt').on('change', function(){
         const v=$(this).prop('checked'); setSetting('embedding.ollama_use_alt_endpoint',v);
@@ -1039,6 +1189,7 @@ function renderVectorization($pane) {
 
     const SOURCES = [
         { v:'transformers', l:'Local (Transformers)' },
+        { v:'koboldcpp',    l:'KoboldCpp' },
         { v:'ollama',       l:'Ollama' },
         { v:'vllm',         l:'vLLM' },
         { v:'openai',       l:'OpenAI' },
@@ -1371,29 +1522,16 @@ function renderData($pane) {
         const ctx = getContext();
         const { callGenericPopup, POPUP_TYPE } = ctx;
         const confirmed = await callGenericPopup(
-            "This will permanently delete ALL Memory Loom data for this chat (entries, folders, scenes, consolidations). Global settings will be preserved.",
+            "This will permanently delete ALL Memory Loom data for this chat (entries, folders, scenes, consolidations, chains, and pending proposals). Global settings will be preserved.",
             POPUP_TYPE.CONFIRM,
             ""
         );
         if (!confirmed) return;
-        const { getChatData } = await import("../data/storage.js");
-        const chatData = getChatData();
-        chatData.entries = {};
-        chatData.folders = [];
-        chatData.scenes = [];
-        chatData.consolidations = {};
-        chatData.pendingEntries = null;
-        chatData.openSceneId = null;
-        chatData.messageCounter = 0;
-        chatData.sidecarPauseCadence = null;
-        chatData.stickiness = {};
-        chatData.cooldowns = {};
-        const { saveEntries, saveFolders, saveScenes, saveConsolidations, savePendingEntries, saveOpenSceneId } = await import("../data/storage.js");
-        saveEntries({});
-        saveScenes([]);
-        saveConsolidations({});
-        savePendingEntries(null);
-        saveOpenSceneId(null);
+        const { clearCurrentChatData } = await import("../data/storage.js");
+        const removedEntries = clearCurrentChatData();
+        await Promise.allSettled(removedEntries.map(entry => deleteEntryVector(entry)));
+        const { removeInjection } = await import("../inject/promptInjector.js");
+        removeInjection();
         // Re-init default folders
         const { initDefaultFolders } = await import("../data/folders.js");
         initDefaultFolders();
@@ -1496,6 +1634,8 @@ function renderData($pane) {
             const { importAllData } = await import("../settings.js");
             const ok = await importAllData(text, { settingsMode, dataMode });
             if (ok) {
+                const { removeInjection } = await import("../inject/promptInjector.js");
+                removeInjection();
                 const { reconcileFolderEntryCounts } = await import("../data/folders.js");
                 reconcileFolderEntryCounts();
                 toastr?.success?.("Data imported.", "Memory Loom");
@@ -1575,6 +1715,7 @@ async function runBatchScan($btn, rangeStart, rangeEnd, idleLabel, worldOnly = f
 
         const isSelective = rangeStart !== null || rangeEnd !== null;
         const scanLabel = worldOnly ? "World scan" : (isSelective ? "Selective scan" : "Batch scan");
+        const batchChainScanId = worldOnly ? null : `ml_batch_chain_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         toastr?.info?.(isSelective
             ? `${scanLabel} started — messages #${rangeStart}–#${rangeEnd}...`
             : `${scanLabel} started — analyzing chat history...`, "Memory Loom");
@@ -1600,11 +1741,12 @@ async function runBatchScan($btn, rangeStart, rangeEnd, idleLabel, worldOnly = f
             } catch (e) { console.warn("[ML] Pane refresh failed:", e); }
         };
 
-        let processed = 0, totalEntries = 0;
+        let processed = 0, totalEntries = 0, aborted = false;
         for (let i = 0; i < chunks.length; i++) {
             if (getContext().chatId !== scanChatId) {
                 console.warn("[ML] Scan aborted — chat changed mid-scan.");
                 toastr?.warning?.("Scan stopped: chat was switched.", "Memory Loom");
+                aborted = true;
                 break;
             }
             const chunk = chunks[i];
@@ -1654,7 +1796,7 @@ async function runBatchScan($btn, rangeStart, rangeEnd, idleLabel, worldOnly = f
                 let chunkCount = 0;
                 if (!worldOnly) {
                     assertChat();
-                    const entries = await generateMemoryEntries(closed.id);
+                    const entries = await generateMemoryEntries(closed.id, { batchChainScanId });
                     assertChat();
                     if (!entries) throw new Error("Memory generation failed");
                     if (entries?.length) chunkCount += entries.length;
@@ -1692,6 +1834,24 @@ async function runBatchScan($btn, rangeStart, rangeEnd, idleLabel, worldOnly = f
             // Pause between chunks — each chunk fires multiple LLM calls with large
             // payloads, and providers like GLM Cloud rate-limit aggressively on bursts.
             await new Promise(r => setTimeout(r, 3000));
+        }
+
+        // Dead-last character-chain reconciliation. Batch-generated memories do
+        // not receive durable IDs until the user commits them, so queue the
+        // historical/debug chain pass now and let Home run it automatically
+        // after every character memory from this batch has been committed or
+        // discarded. This prevents a fake end-of-batch scan that cannot see the
+        // newly generated corpus.
+        if (!worldOnly && !aborted && processed === chunks.length && batchChainScanId) {
+            queuePostBatchChainScan({ id: batchChainScanId, label: scanLabel });
+            const { runReadyPostBatchChainScans } = await import("../llm/chainScanner.js");
+            const chainResult = await runReadyPostBatchChainScans();
+            if (chainResult?.ran) {
+                const count = chainResult.proposals?.length || 0;
+                toastr?.success?.(`Final chain reconciliation complete — ${count} proposal${count === 1 ? "" : "s"} ready for review.`, "Memory Loom", { timeOut: 5000 });
+            } else {
+                toastr?.info?.("Final chain reconciliation queued — it will run automatically after this batch's pending character memories are committed or discarded.", "Memory Loom", { timeOut: 6500 });
+            }
         }
 
         toastr?.success?.(

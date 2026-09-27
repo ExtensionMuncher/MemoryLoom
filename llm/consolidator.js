@@ -8,8 +8,8 @@
  *   - Consolidation output must NOT contain open_threads, future_questions,
  *     or suggested_next_steps. Unresolved context must be expressed as
  *     present state only.
- *   - Example of what NOT to do: "Will Alex forgive Morgan?"
- *   - Example of correct approach: "Alex has not forgiven Morgan and
+ *   - Example of what NOT to do: "Will Alex forgive Riley?"
+ *   - Example of correct approach: "Alex has not forgiven Riley and
  *     remains guarded around them."
  *   - Consolidation does not delete source memories — it reduces their
  *     injection priority, not removes them.
@@ -245,10 +245,10 @@ RULES:
 9. If source memories disagree in interpretation, prioritize concrete actions, explicit narration/dialogue, and the least speculative reading for OBJECTIVE claims rather than escalating the more dramatic version.
 
 Example of WRONG output:
-  "Will Alex forgive Morgan for the betrayal?"
+  "Will Alex forgive Riley for the betrayal?"
 
 Example of CORRECT output:
-  "Alex has not forgiven Morgan for the betrayal and remains guarded around them."
+  "Alex has not forgiven Riley for the betrayal and remains guarded around them."
 
 Output as JSON with these fields:
 {
